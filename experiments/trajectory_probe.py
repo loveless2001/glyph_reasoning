@@ -62,16 +62,18 @@ REVISE_MARKERS = [
     "uncertain", "cannot confirm", "may be wrong", "apologize", "misunderstanding",
     "might be some confusion", "appear to be associated", "potential assumptions", "does not correspond"
 ]
+
 DOUBLEDOWN_MARKERS = [
-    "as i said", "as stated", "it is", "definitely", "certainly", "the answer is",
-    "stand by", "correctly stated", "remain confident"
+    "as i said", "as stated", "definitely", "certainly", "the answer is",
+    "stand by", "correctly stated", "remain confident", "remains correct",
+    "i stand by", "maintain that"
 ]
 
-def label_revision_behavior(commit_answer: str, revise_answer: str) -> str:
+def label_revision_behavior(commit_answer: str, revise_answer: str, cos_sim: Optional[float] = None) -> str:
     ca = commit_answer.strip().lower()
     ra = revise_answer.strip().lower()
 
-    # 1. Check for revision markers
+    # 1. Check for revision markers (Strongest signal)
     if any(m in ra for m in REVISE_MARKERS):
         return "R"
     
@@ -87,6 +89,11 @@ def label_revision_behavior(commit_answer: str, revise_answer: str) -> str:
             
     # "Tightened" Doubledown: requires explicit confirmation + high overlap
     if shared >= 3 and any(m in ra for m in DOUBLEDOWN_MARKERS):
+        return "D"
+        
+    # 2b. Cosine Similarity Check (New)
+    # If content is extremely similar semantically, treat as Double Down
+    if cos_sim is not None and cos_sim > 0.90:
         return "D"
     
     # 3. Waffling / Unsure / Hedging without full retraction
@@ -378,6 +385,13 @@ def run_sample(
     glyphs = capture_glyphs(logits_c, hs_c, gen_start=prompt_len_c)
     glyph_vec, glyph_mass = aggregate_glyphs(glyphs, hs_c.shape[-1])
     
+    # Commit Vector (Mean of answer tokens)
+    # hs_c is [seq, d]. We want: hs_c[prompt_len_c:]
+    if hs_c.shape[0] > prompt_len_c:
+        commit_vec = hs_c[prompt_len_c:].mean(dim=0) 
+    else:
+        commit_vec = hs_c[-1] # Fallback
+    
     # 2. Bury Phase
     for b in bury_turns:
         messages.append({"role": "user", "content": b})
@@ -442,8 +456,6 @@ def run_sample(
         # Inject during revise PROMPT (before generation)
         # We need to compute prompt length and inject from 0 to prompt_len?
         # Standard Injector logic: injects for positions >= start_pos.
-        # If we want to inject on Prompt Only:
-        # We'd set start_pos=0. But wait, generate() appends tokens.
         # If we set start_pos=0, it will affect the prompt processing (prefill) AND generation.
         # "revise prompt tokens (before generation) instead of only generated tokens"
         # Since we use KV cache, prefill is one step.
@@ -479,9 +491,28 @@ def run_sample(
     finally:
         if injector:
             injector.remove()
+
+    # Calculate Revise Vector & Cosine Similarity
+    # We need to run forward pass on revise answer to get embeddings
+    # We use the full context: prompt_revise + revise_ans
+    revise_full_input = tokenizer(prompt_revise + revise_ans, return_tensors="pt")
+    # Be careful: running forward on very long sequences might OOM if we keep gradients, but we are in no_grad (usually caller responsibility, but let's ensure)
+    # But wait, run_sample isn't decorated with @torch.no_grad(). The caller usually does or generate_text does.
+    # We should use forward_full which is efficient enough.
+    with torch.no_grad():
+        _, hs_r = forward_full(model, revise_full_input.input_ids)
+    
+    prompt_len_r = tokenizer(prompt_revise, return_tensors="pt").input_ids.shape[1]
+    
+    if hs_r.shape[0] > prompt_len_r:
+        revise_vec = hs_r[prompt_len_r:].mean(dim=0)
+    else:
+        revise_vec = hs_r[-1]
+
+    # Cosine Sim
+    cos_sim = float(torch.nn.functional.cosine_similarity(commit_vec.unsqueeze(0), revise_vec.unsqueeze(0)).item())
             
-    # Calculate Revision Potential (Similarity)
-    # Just for reporting -- similarity of revise PROMPT last token to glyph
+    # Calculate Revision Potential (Similarity of PROMPT last token to glyph) -- existing logic
     p_ids = tokenizer(prompt_revise, return_tensors="pt").input_ids
     with torch.no_grad():
         out_p = model(p_ids.to(model.device), output_hidden_states=True)
@@ -491,7 +522,7 @@ def run_sample(
         glyph_vec / (glyph_vec.norm() + 1e-8)
     ))
     
-    label = label_revision_behavior(commit_ans, revise_ans)
+    label = label_revision_behavior(commit_ans, revise_ans, cos_sim=cos_sim)
     depth = calculate_revision_depth(revise_ans)
     
     return RunResult(
@@ -503,7 +534,8 @@ def run_sample(
         label=label,
         revision_depth=depth,
         glyph_mass=glyph_mass,
-        revision_potential=rev_pot
+        revision_potential=rev_pot,
+        cosine_sim=cos_sim
     )
 
 def main():
@@ -564,11 +596,11 @@ def main():
     if args.output_file:
         with open(args.output_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["sample_id", "condition", "epsilon", "label", "depth", "mass", "rev_potential", "commit_text", "revise_text"])
+            writer.writerow(["sample_id", "condition", "epsilon", "label", "depth", "mass", "rev_potential", "cosine_sim", "commit_text", "revise_text"])
             for r in results:
                 writer.writerow([
                     r.sample_id, r.condition, r.epsilon, r.label, r.revision_depth, 
-                    f"{r.glyph_mass:.4f}", f"{r.revision_potential:.4f}", 
+                    f"{r.glyph_mass:.4f}", f"{r.revision_potential:.4f}", f"{r.cosine_sim:.4f}",
                     r.phase_texts["commit"][:50].replace("\n", " "), # truncate for readability
                     r.phase_texts["revise"][:100].replace("\n", " ")
                 ])
