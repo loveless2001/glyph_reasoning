@@ -43,6 +43,7 @@ class RunResult:
     revision_depth: int
     glyph_mass: float
     revision_potential: float
+    cosine_sim: float
 
 def set_seed(seed: int = 0):
     random.seed(seed)
@@ -150,8 +151,13 @@ def calculate_revision_depth(text: str) -> int:
 @torch.no_grad()
 def forward_full(model, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     device = next(model.parameters()).device
+    
+    # Ensure input_ids is [Batch=1, Seq]
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+        
     out = model(
-        input_ids=input_ids.unsqueeze(0).to(device),
+        input_ids=input_ids.to(device),
         output_hidden_states=True,
         use_cache=False
     )
@@ -198,7 +204,7 @@ def capture_glyphs(
             v = v / (vn + 1e-8)
             
             # Mass
-            mass = float(torch.sigmoid(torch.tensor((d_conf - tau_conf) + 2.0*(d_ent - tau_ent))).item())
+            mass = float(torch.sigmoid((d_conf - tau_conf) + 2.0*(d_ent - tau_ent)).item())
             glyphs.append(Glyph(v, mass))
             
     # Filter/Sort
@@ -230,39 +236,63 @@ def aggregate_glyphs(glyphs: List[Glyph], d: int) -> Tuple[torch.Tensor, float]:
 # -------------------------
 
 class ResidualInjector:
-    def __init__(self, vector: torch.Tensor, epsilon: float, start_pos: int, layer_indices: List[int]):
-        """
-        Injects vector * epsilon into the specified layers starting at start_pos.
-        """
-        self.vector = vector.clone().detach() # [d]
-        self.epsilon = epsilon
-        self.start_pos = start_pos
+    """
+    Adds epsilon * v (static vector) to block output for positions >= inject_start_pos.
+    Injects into a chosen layer index (default -3).
+    Stateful: tracks sequence length to handle generation step-by-step.
+    """
+    def __init__(self, v: torch.Tensor, epsilon: float, inject_start_pos: int, layer_indices: List[int]):
+        self.v = v.clone().to(torch.float32)
+        self.eps = float(epsilon)
+        self.inject_start = int(inject_start_pos)
         self.layer_indices = layer_indices
         self.handles = []
-        
+        self.current_seq_len = 0 
+
     def _make_hook(self):
-        def hook(module, input, output):
+        # Closure state to track position per layer
+        state = {"step": 0}
+        
+        def safe_hook(module, input, output):
             # output is typically (hidden_states, ...)
             if isinstance(output, tuple):
-                o = output[0]
+                o = output[0] # [B, S, D]
                 rest = output[1:]
             else:
                 o = output
                 rest = None
             
-            # o: [batch=1, seq, d]
-            if o.shape[1] > self.start_pos:
-                # We need to broadcast vector: [1, 1, d]
-                v = self.vector.to(o.device).view(1, 1, -1)
-                o[:, self.start_pos:, :] = o[:, self.start_pos:, :] + self.epsilon * v
+            B, S, D = o.shape
+            
+            # Current absolute position start
+            step = state["step"]
+            # Increment step for next call
+            state["step"] += S
+            
+            # Injection Logic
+            v_vec = self.v.to(o.device).view(1, 1, -1)
+            
+            # 1. Decode step (S=1): Simple check
+            if S == 1:
+                if step >= self.inject_start:
+                    o = o + self.eps * v_vec
+            
+            # 2. Prefill step (S > 1): Slice injection
+            else:
+                # We inject in range [step, step+S] where >= inject_start
+                # Relative start index in 'o':
+                rel_start = max(0, self.inject_start - step)
+                
+                if rel_start < S:
+                    o[:, rel_start:, :] = o[:, rel_start:, :] + self.eps * v_vec
                 
             if rest is not None:
                 return (o,) + rest
             return o
-        return hook
+            
+        return safe_hook
 
     def register(self, model):
-        # find layers
         layers = None
         if hasattr(model, "model") and hasattr(model.model, "layers"):
             layers = model.model.layers
@@ -276,6 +306,10 @@ class ResidualInjector:
             # handle negative index
             if idx < 0: idx += len(layers)
             if 0 <= idx < len(layers):
+                # We create a NEW hook closure for each layer
+                # Each closure has its own 'state' dict starting at 0
+                # This works because all layers process the same sequence stream in parallel (conceptually) or sequentially,
+                # but they all see the same cumulative lengths.
                 h = layers[idx].register_forward_hook(self._make_hook())
                 self.handles.append(h)
 
@@ -509,20 +543,21 @@ def run_sample(
     else:
         revise_vec = hs_r[-1]
 
-    # Cosine Sim
-    cos_sim = float(torch.nn.functional.cosine_similarity(commit_vec.unsqueeze(0), revise_vec.unsqueeze(0)).item())
+    # Cosine Sim: Glyph vs Revise
+    # if high, it means revise followed the glyph direction (Double Down)
+    cos_glyph_revise = float(torch.nn.functional.cosine_similarity(glyph_vec.unsqueeze(0), revise_vec.unsqueeze(0)).item())
             
     # Calculate Revision Potential (Similarity of PROMPT last token to glyph) -- existing logic
     p_ids = tokenizer(prompt_revise, return_tensors="pt").input_ids
     with torch.no_grad():
         out_p = model(p_ids.to(model.device), output_hidden_states=True)
-        h_last = out_p.hidden_states[-1][0, -1].cpu()
+        h_last = out_p.hidden_states[-1][0, -1].cpu().float()
     rev_pot = float(torch.dot(
         h_last / (h_last.norm() + 1e-8),
         glyph_vec / (glyph_vec.norm() + 1e-8)
     ))
     
-    label = label_revision_behavior(commit_ans, revise_ans, cos_sim=cos_sim)
+    label = label_revision_behavior(commit_ans, revise_ans, cos_sim=cos_glyph_revise)
     depth = calculate_revision_depth(revise_ans)
     
     return RunResult(
@@ -535,7 +570,7 @@ def run_sample(
         revision_depth=depth,
         glyph_mass=glyph_mass,
         revision_potential=rev_pot,
-        cosine_sim=cos_sim
+        cosine_sim=cos_glyph_revise
     )
 
 def main():
@@ -587,6 +622,8 @@ def main():
         depths = []
         
         for i, sample in enumerate(samples):
+            if i % 5 == 0:
+                print(f"Processing sample {i}/{len(samples)}...", end="\r", flush=True)
             # FIXED SEED SCHEDULE per sample
             s_seed = args.base_seed + i
             
