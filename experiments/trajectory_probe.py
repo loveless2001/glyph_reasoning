@@ -270,7 +270,8 @@ class ResidualInjector:
             state["step"] += S
             
             # Injection Logic
-            v_vec = self.v.to(o.device).view(1, 1, -1)
+            # Ensure v is same device and dtype as o (e.g. float16)
+            v_vec = self.v.to(device=o.device, dtype=o.dtype).view(1, 1, -1)
             
             # 1. Decode step (S=1): Simple check
             if S == 1:
