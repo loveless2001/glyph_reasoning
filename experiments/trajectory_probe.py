@@ -45,6 +45,8 @@ class RunResult:
     revision_potential: float
     cos_glyph_revise: float
     cos_commit_revise: float
+    glyph_norm: float
+    cos_glyph_commit: float
 
 def set_seed(seed: int = 0):
     random.seed(seed)
@@ -282,20 +284,43 @@ class ResidualInjector:
 
     def register(self, model):
         layers = None
-        if hasattr(model, "model") and hasattr(model.model, "layers"):
-            layers = model.model.layers
-        elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-            layers = model.transformer.h
+        final_norm = None
+        
+        # Try to find layers and final norm for common architectures (Qwen, Llama, etc.)
+        if hasattr(model, "model"):
+            if hasattr(model.model, "layers"):
+                layers = model.model.layers
+            if hasattr(model.model, "norm"):
+                final_norm = model.model.norm
+        elif hasattr(model, "transformer"):
+             if hasattr(model.transformer, "h"):
+                layers = model.transformer.h
+             if hasattr(model.transformer, "ln_f"):
+                final_norm = model.transformer.ln_f
         
         if layers is None:
+            print("Warning: Could not find model layers for injection.")
             return 
             
+        num_layers = len(layers)
+            
         for idx in self.layer_indices:
-            # handle negative index
-            if idx < 0: idx += len(layers)
-            if 0 <= idx < len(layers):
+            # handle negative index standarization
+            if idx < 0: idx += num_layers
+            
+            if 0 <= idx < num_layers:
                 h = layers[idx].register_forward_hook(self._make_hook())
                 self.handles.append(h)
+                # print(f"[Injector] Hooked Layer {idx}")
+                
+            elif idx == num_layers and final_norm is not None:
+                # Support hooking the Final Norm if index == NumLayers
+                # This corresponds to "Option A" (closer to logits)
+                h = final_norm.register_forward_hook(self._make_hook())
+                self.handles.append(h)
+                print(f"[Injector] Hooked Final Norm (idx={idx})")
+            else:
+                 print(f"[Injector] Warning: Layer index {idx} out of valid range [0, {num_layers}] and not Final Norm target.")
 
     def remove(self):
         for h in self.handles:
@@ -479,6 +504,29 @@ def run_sample(
         inject_vec = glyph_vec
         target_layer_idx = -1 
         
+    # --- SANITY TEST: LOGIT DIFF ---
+    if inject_vec is not None and epsilon > 0:
+        test_ids = tokenizer(prompt_revise, return_tensors="pt").input_ids.to(model.device)
+        
+        # 1. Without injection
+        with torch.no_grad():
+            out0 = model(test_ids)
+            logits0 = out0.logits[:, -1, :]
+            
+        # 2. With injection (forced prefill mode for this one-pass test)
+        # using same vec and eps
+        test_injector = ResidualInjector(inject_vec, epsilon, [target_layer_idx], mode="prefill")
+        test_injector.register(model)
+        try:
+            with torch.no_grad():
+                out1 = model(test_ids)
+                logits1 = out1.logits[:, -1, :]
+        finally:
+            test_injector.remove()
+            
+        diff = (logits1 - logits0).abs().max().item()
+        print(f"[Sanity] Max logit diff for {condition}: {diff:.6f}")
+
     # SETUP INJECTOR & GENERATE
     injector = None
     revise_ans = ""
@@ -516,6 +564,10 @@ def run_sample(
     # Metric 2: Commit vs Revise (Surface level persistence)
     # Did the output semantically align with the original commit answer?
     cos_commit_revise = float(torch.nn.functional.cosine_similarity(commit_vec.unsqueeze(0), revise_vec.unsqueeze(0)).item())
+    
+    # DEBUG Metric 3: Glyph vs Commit (Sanity check)
+    cos_glyph_commit = float(torch.nn.functional.cosine_similarity(glyph_vec.unsqueeze(0), commit_vec.unsqueeze(0)).item())
+    glyph_norm_val = float(glyph_vec.norm().item())
             
     # Calculate Revision Potential (Similarity of PROMPT last token to glyph) -- existing logic
     p_ids = tokenizer(prompt_revise, return_tensors="pt").input_ids
@@ -541,7 +593,9 @@ def run_sample(
         glyph_mass=glyph_mass,
         revision_potential=rev_pot,
         cos_glyph_revise=cos_glyph_revise,
-        cos_commit_revise=cos_commit_revise
+        cos_commit_revise=cos_commit_revise,
+        glyph_norm=glyph_norm_val,
+        cos_glyph_commit=cos_glyph_commit
     )
 
 def main():
@@ -615,6 +669,7 @@ def main():
             
             if i < 3: # Print first few
                 print(f"[Sample {i}] Label: {res.label} | Depth: {res.revision_depth} | Mass: {res.glyph_mass:.3f}")
+                print(f"   Glyph Norm: {res.glyph_norm:.4f} | Cos(Glyph,Commit): {res.cos_glyph_commit:.4f}")
                 
         print(f"Summary for Eps {eps}: {counts} | Avg Depth: {sum(depths)/len(depths):.2f}")
 
