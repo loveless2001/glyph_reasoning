@@ -7,3 +7,4 @@ matplotlib
 sentencepiece
 einops
 protobuf
+datasets
