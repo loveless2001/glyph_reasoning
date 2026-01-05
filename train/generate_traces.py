@@ -44,23 +44,36 @@ model.eval()
 with open(INPUT_FILE) as f:
     tasks = [json.loads(line) for line in f]
 
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"
+
+BATCH_SIZE = 8
+
 kept = 0
 dropped = 0
 
-with open(OUTPUT_FILE, "w") as out:
-    for task in tqdm(tasks):
-        prompt = glyph_prompt(task["question"])
-        inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
-
-        with torch.no_grad():
-            output = model.generate(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False
-            )
-
-        decoded = tokenizer.decode(output[0], skip_special_tokens=True)
-
+def process_batch(batch_tasks):
+    global kept, dropped
+    prompts = [glyph_prompt(t["question"]) for t in batch_tasks]
+    
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id
+        )
+        
+    # Decode
+    input_lens = inputs.input_ids.shape[1]
+    generated_tokens = outputs[:, input_lens:]
+    decoded_texts = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+    
+    batch_records = []
+    
+    for task, decoded in zip(batch_tasks, decoded_texts):
         # ===== Filters =====
         if not valid_glyph_structure(decoded):
             dropped += 1
@@ -82,9 +95,17 @@ with open(OUTPUT_FILE, "w") as out:
                 {"role": "assistant", "content": decoded}
             ]
         }
-
-        out.write(json.dumps(record) + "\n")
+        batch_records.append(json.dumps(record))
         kept += 1
+        
+    return batch_records
+
+with open(OUTPUT_FILE, "w") as out:
+    for i in tqdm(range(0, len(tasks), BATCH_SIZE)):
+        batch = tasks[i : i + BATCH_SIZE]
+        records = process_batch(batch)
+        for r in records:
+            out.write(r + "\n")
 
 print(f"\nDone.")
 print(f"Kept: {kept}")
