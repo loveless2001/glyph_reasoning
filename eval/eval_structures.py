@@ -123,16 +123,47 @@ def evaluate_model(model_name, tasks):
     
     return results
 
-def main():
     parser = argparse.ArgumentParser(description="Evaluate multiple Qwen models on structure prompts")
     parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS, help="List of models to evaluate")
     parser.add_argument("--output", default="eval_results.csv", help="Output CSV file path")
+    parser.add_argument("--data", default="tasks.json", help="Input data file (json or jsonl)")
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of tasks")
     args = parser.parse_args()
 
     # Load tasks
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(script_dir, "tasks.json")) as f:
-        tasks = json.load(f)
+    
+    # Resolve absolute path for data if needed, or check local dir
+    data_path = args.data
+    if not os.path.isabs(data_path):
+        data_path = os.path.join(script_dir, data_path)
+    
+    if not os.path.exists(data_path):
+        # Fallback to check relative to CWD if script_dir fail
+        if os.path.exists(args.data):
+             data_path = args.data
+        else:
+            # Fallback for unified_dataset path if user passes relative path from project root
+            project_root = os.path.dirname(os.path.dirname(script_dir)) # assuming eval/eval_structures.py
+            possible_path = os.path.join(os.getcwd(), args.data)
+            if os.path.exists(possible_path):
+                data_path = possible_path
+
+    print(f"Loading tasks from: {data_path}")
+    tasks = []
+    if data_path.endswith(".jsonl"):
+        with open(data_path, "r") as f:
+            for line in f:
+                if line.strip():
+                    tasks.append(json.loads(line))
+    else:
+        with open(data_path, "r") as f:
+            tasks = json.load(f)
+
+    if args.limit:
+        tasks = tasks[:args.limit]
+    
+    print(f"Evaluated on {len(tasks)} tasks.")
 
     all_results = {}
 

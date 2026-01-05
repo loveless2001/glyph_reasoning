@@ -42,7 +42,7 @@ model.eval()
 # Load tasks
 # =====================
 with open(INPUT_FILE) as f:
-    tasks = json.load(f)
+    tasks = [json.loads(line) for line in f]
 
 kept = 0
 dropped = 0

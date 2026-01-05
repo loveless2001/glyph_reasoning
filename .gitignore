@@ -158,3 +158,5 @@ Thumbs.db
 experiments/results.txt
 experiments/results_cleaned.txt
 experiments/*.png
+*.csv
+*.png
