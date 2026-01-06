@@ -6,6 +6,7 @@ from transformers import (
     AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
+    DataCollatorForSeq2Seq,
 )
 from peft import LoraConfig, get_peft_model, TaskType
 
@@ -27,6 +28,7 @@ def main():
     # Load tokenizer & model
     # --------------------
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer.pad_token = tokenizer.eos_token # Ensure pad token is set
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
@@ -56,12 +58,13 @@ def main():
             example["messages"],
             tokenize=False
         )
+        # Dynamic padding via collator
         inputs = tokenizer(
             text,
             truncation=True,
             max_length=2048
         )
-        inputs["labels"] = inputs["input_ids"]
+        inputs["labels"] = inputs["input_ids"].copy()
         return inputs
 
     dataset = dataset.map(tokenize, remove_columns=dataset.column_names)
@@ -84,6 +87,8 @@ def main():
         lr_scheduler_type="cosine",
         warmup_steps=20,
         remove_unused_columns=False, # Important for PEFT sometimes
+        gradient_checkpointing=True if not args.use_lora else False, # Checkpointing helps full FT
+        group_by_length=True,
     )
 
     # --------------------
@@ -94,6 +99,7 @@ def main():
         args=training_args,
         train_dataset=dataset,
         tokenizer=tokenizer,
+        data_collator=DataCollatorForSeq2Seq(tokenizer, padding=True, pad_to_multiple_of=8),
     )
 
     trainer.train()

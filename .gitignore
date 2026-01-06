@@ -160,3 +160,4 @@ experiments/results_cleaned.txt
 experiments/*.png
 *.csv
 *.png
+.runpod*
