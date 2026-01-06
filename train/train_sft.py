@@ -8,6 +8,7 @@ from transformers import (
     Trainer,
     DataCollatorForSeq2Seq,
 )
+from transformers.trainer_utils import get_last_checkpoint
 
 # --------------------
 # Environment & Paths
@@ -69,14 +70,14 @@ args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=1,
     gradient_accumulation_steps=16,
-    learning_rate=2e-5,          # 🔑 Adjusted LR
+    learning_rate=2e-5,          
     num_train_epochs=1,
     bf16=True,                   
     fp16=False,
-    logging_steps=5,             # 🔑 More frequent logging to catch NaNs early
+    logging_steps=5,             
     logging_first_step=True,
     save_steps=100,
-    save_total_limit=1,          # 🔑 Limit checkpoints to save disk
+    save_total_limit=1,          
     report_to="none",
     optim="adamw_torch",
     lr_scheduler_type="cosine",
@@ -98,6 +99,14 @@ trainer = Trainer(
 )
 
 print("🚀 Starting training...")
-trainer.train()
+
+# Check for existing checkpoint
+last_checkpoint = get_last_checkpoint(OUTPUT_DIR)
+if last_checkpoint:
+    print(f"🔄 Resuming from checkpoint: {last_checkpoint}")
+    trainer.train(resume_from_checkpoint=last_checkpoint)
+else:
+    trainer.train()
+
 trainer.save_model(OUTPUT_DIR)
 print(f"✅ Model saved to {OUTPUT_DIR}")

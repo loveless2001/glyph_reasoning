@@ -9,3 +9,4 @@ einops
 protobuf
 datasets
 peft
+lm_eval
