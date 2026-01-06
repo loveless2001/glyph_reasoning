@@ -44,7 +44,7 @@ def evaluate_model(model_name, tasks):
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             device_map="auto"
         )
         model.eval()
@@ -123,41 +123,25 @@ def evaluate_model(model_name, tasks):
     
     return results
 
+def main():
     parser = argparse.ArgumentParser(description="Evaluate multiple Qwen models on structure prompts")
     parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS, help="List of models to evaluate")
-    parser.add_argument("--output", default="eval_results.csv", help="Output CSV file path")
-    parser.add_argument("--data", default="tasks.json", help="Input data file (json or jsonl)")
+    parser.add_argument("--output", default="eval/eval_results.csv", help="Output CSV file path")
+    parser.add_argument("--data", default="data/tasks.json", help="Input data file (json or jsonl)")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of tasks")
+    parser.add_argument("--clear_cache", action="store_true", help="Delete model weights from disk after evaluation")
     args = parser.parse_args()
 
     # Load tasks
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # Resolve absolute path for data if needed, or check local dir
-    data_path = args.data
-    if not os.path.isabs(data_path):
-        data_path = os.path.join(script_dir, data_path)
-    
-    if not os.path.exists(data_path):
-        # Fallback to check relative to CWD if script_dir fail
-        if os.path.exists(args.data):
-             data_path = args.data
-        else:
-            # Fallback for unified_dataset path if user passes relative path from project root
-            project_root = os.path.dirname(os.path.dirname(script_dir)) # assuming eval/eval_structures.py
-            possible_path = os.path.join(os.getcwd(), args.data)
-            if os.path.exists(possible_path):
-                data_path = possible_path
-
-    print(f"Loading tasks from: {data_path}")
+    print(f"Loading tasks from: {args.data}")
     tasks = []
-    if data_path.endswith(".jsonl"):
-        with open(data_path, "r") as f:
+    if args.data.endswith(".jsonl"):
+        with open(args.data, "r") as f:
             for line in f:
                 if line.strip():
                     tasks.append(json.loads(line))
     else:
-        with open(data_path, "r") as f:
+        with open(args.data, "r") as f:
             tasks = json.load(f)
 
     if args.limit:
@@ -171,6 +155,22 @@ def evaluate_model(model_name, tasks):
         model_results = evaluate_model(model_name, tasks)
         if model_results:
             all_results[model_name] = model_results
+        
+        if args.clear_cache:
+            print(f"🧹 Clearing disk cache for {model_name}...")
+            # This is a bit aggressive but effective for tight quotas
+            try:
+                from huggingface_hub import scan_cache_dir
+                cache_info = scan_cache_dir()
+                for repo in cache_info.repos:
+                    if repo.repo_id == model_name:
+                        for revision in repo.revisions:
+                            print(f"  Removing {repo.repo_id} ({revision.commit_hash[:7]})")
+                            # huggingface_hub v0.16.4+
+                            delete_strategy = cache_info.delete_revisions(revision.commit_hash)
+                            delete_strategy.execute()
+            except Exception as e:
+                print(f"  Warning: Could not clear disk cache automatically: {e}")
 
     # Save to CSV
     if all_results:

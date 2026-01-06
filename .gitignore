@@ -161,3 +161,4 @@ experiments/*.png
 *.csv
 *.png
 .runpod*
+/checkpoints
