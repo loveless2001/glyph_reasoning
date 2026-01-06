@@ -8,7 +8,7 @@ from transformers import (
 )
 
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
-DATA_FILE = "data/glyph_traces_filtered.jsonl"   # output of unify_datasets.py
+DATA_FILE = "data/sft_final.jsonl"   # output of unify_datasets.py
 OUTPUT_DIR = "checkpoints/qwen2.5-glyph-sft"
 
 # --------------------
@@ -32,11 +32,14 @@ def tokenize(example):
         example["messages"],
         tokenize=False
     )
-    return tokenizer(
+    inputs = tokenizer(
         text,
         truncation=True,
         max_length=2048
     )
+    inputs["labels"] = inputs["input_ids"]
+    return inputs
+
 
 dataset = dataset.map(tokenize, remove_columns=dataset.column_names)
 

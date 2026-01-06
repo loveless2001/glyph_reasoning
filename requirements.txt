@@ -8,3 +8,4 @@ sentencepiece
 einops
 protobuf
 datasets
+peft
