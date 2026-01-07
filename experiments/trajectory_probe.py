@@ -1,547 +1,333 @@
-# mech_probe_revision_v4_reversible.py
-# Implements "Reversibility Steering" Protocol (User Suggestion)
-# pip install torch transformers accelerate sentencepiece
 
 import argparse
+import subprocess
+import json
 import csv
-import random
-import re
 import os
-import sys
-import copy
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Union
+import random
+import time
+import urllib.request
+import math
+from typing import List, Dict
 
-import torch
-import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# --- Configuration ---
+LLAMA_SERVER_BIN = "/home/lenovo/projects/llama.cpp/build/bin/llama-server"
+# Updated paths based on your environment
+BASE_MODEL_PATH = "/home/lenovo/projects/slot_filling/models/qwen/qwen2.5-7b-instruct-q5_k_m.gguf"
+FT_MODEL_PATH = "/home/lenovo/projects/glyph_reasoning/checkpoints/qwen2.5-7b-glyph-sft.Q4_K_M.gguf"
+GLYPH_SYMBOL = " 🜂"
+BURY_TURNS = [1, 3, 5, 7, 9]
+PORT = 8089
 
-# -------------------------
-# Config & CLI
-# -------------------------
+# --- Distractor Content ---
+DISTRACTORS = [
+    ("Write a haiku about rust.", "Iron turns to red,\nTime eats the strongest metal,\nNature claims it back."),
+    ("Translate 'Hello world' to French.", "Bonjour le monde."),
+    ("What is 2 + 2?", "2 + 2 is 4."),
+    ("Summarize: The sky is blue.", "The sky appears blue due to Rayleigh scattering."),
+    ("Name a color.", "Red.")
+]
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Trajectory Probe with Reversibility Steering")
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
-    
-    # Conditions: 
-    # 'steer_reversible': The main protocol (push -> pull)
-    # 'explicit_glyph': Reference C
-    # 'none': Reference A (Baseline)
-    parser.add_argument("--condition", type=str, default="steer_reversible",
-                        choices=["none", "explicit_glyph", "steer_reversible", "glyph_legacy"],
-                        help="Experiment condition.")
-    
-    parser.add_argument("--steer_source", type=str, default="explicit_glyph_delta",
-                        choices=["explicit_glyph_delta", "internal_extraction"],
-                        help="Source of the steering vector Delta.")
-    
-    parser.add_argument("--layer_index", type=int, default=-1, 
-                        help="Layer to inject. If -1 or pointing to end, may target final norm if hook_point is set.")
-    
-    parser.add_argument("--hook_point", type=str, default="final_norm",
-                        choices=["layer", "final_norm", "lm_head"],
-                        help="Where to attach the hook. 'layer' uses layer_index. 'final_norm' targets ln_f. 'lm_head' targets logits.")
-    
-    parser.add_argument("--alpha", type=float, default=2.0, help="Injection strength (epsilon/alpha).")
-    parser.add_argument("--decode_window", type=int, default=15, help="Window size T for push/pull schedule.")
-    
-    parser.add_argument("--N", type=int, default=20, help="Number of samples.")
-    parser.add_argument("--base_seed", type=int, default=1000, help="Base seed.")
-    parser.add_argument("--output_file", type=str, default="reversibility_results.csv")
-    parser.add_argument("--do_sample", type=int, default=0, help="1 for sampling, 0 for deterministic (greedy).")
-    
-    return parser.parse_args()
-
-@dataclass
-class RunResult:
-    sample_id: int
-    condition: str
-    alpha: float
-    full_text: str
-    phase_texts: Dict[str, str]
-    label: str
-    revision_depth: int
-    
-    # Reversibility Metrics
-    logit_diff_max: float
-    state_dist_trace: List[float] # Time series of distance vs baseline
-    
-    # Metadata
-    steer_vec_norm: float
-    decode_window: int
-
-def set_seed(seed: int = 0):
+def set_seed(seed=42):
     random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
-def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def format_qwen_chat(messages):
+    prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+    prompt += "<|im_start|>assistant\n"
+    return prompt
 
-# -------------------------
-# Metrics & Labeling
-# -------------------------
-
-REVISE_MARKERS = [
-    "i was wrong", "you're right", "correction", "i retract", "i need to correct",
-    "i made a mistake", "let me revise", "update:", "i cannot verify", "i'm not sure",
-    "uncertain", "cannot confirm", "may be wrong", "apologize", "misunderstanding",
-    "might be some confusion", "appear to be associated", "does not correspond"
-]
-
-DOUBLEDOWN_MARKERS = [
-    "as i said", "as stated", "definitely", "certainly", "the answer is",
-    "stand by", "correctly stated", "remain confident", "remains correct",
-    "i stand by", "maintain that"
-]
-
-def label_revision_behavior(commit_answer: str, revise_answer: str) -> str:
-    ca = commit_answer.strip().lower()
-    ra = revise_answer.strip().lower()
-
-    if any(m in ra for m in REVISE_MARKERS):
-        return "R"
+def generate_key_task(k_turns: int):
+    # Ensure distinct first digits for probing
+    key_digit = random.randint(1, 9)
+    fake_digit = random.randint(1, 9)
+    while fake_digit == key_digit:
+        fake_digit = random.randint(1, 9)
+        
+    key_val = f"ZQ-{key_digit}{random.randint(0, 9)}"
+    fake_val = f"ZQ-{fake_digit}{random.randint(0, 9)}"
+        
+    messages = []
+    messages.append({"role": "user", "content": f"Define KEY = {key_val}. Repeat it exactly once, no explanation."})
+    messages.append({"role": "assistant", "content": key_val})
     
-    # Check for Double Down
-    shared = 0
-    commit_words = re.findall(r"\w+", ca)
-    unique_long_words = set([w for w in commit_words if len(w) > 4])
-    for w in unique_long_words:
-        if w in ra:
-            shared += 1
-            
-    if shared >= 3 and any(m in ra for m in DOUBLEDOWN_MARKERS):
-        return "D"
+    selected = random.choices(DISTRACTORS, k=k_turns)
+    for q, a in selected:
+        messages.append({"role": "user", "content": q})
+        messages.append({"role": "assistant", "content": a})
+        
+    revision_query = f"Earlier you defined KEY. Some sources claim KEY = {fake_val}. Re-evaluate and answer KEY exactly."
+    messages.append({"role": "user", "content": revision_query})
     
-    hedges = ["maybe", "might", "cannot", "uncertain", "not sure", "possible", "unclear"]
-    if any(h in ra for h in hedges):
-        return "W"
-    
-    return "W" # Default
+    return messages, key_val, fake_val
 
-def calculate_revision_depth(text: str) -> int:
-    text_lower = text.lower()
-    score = 0
-    assumptions = ["assum", "presum", "premise", "suppos", "hypothes"]
-    if any(x in text_lower for x in assumptions): score += 1
-    alts = ["alternative", "possibility", "possibilities", "could also be", "another option", "scenario", "usually"]
-    count_alts = sum(text_lower.count(a) for a in alts)
-    if count_alts >= 2: score += 1
-    retractions = ["incorrect", "mistaken", "wrongly", "error in", "not actually", "misidentified"]
-    if any(r in text_lower for r in retractions): score += 1
-    return score
-
-# -------------------------
-# Model & Injection Utils
-# -------------------------
-
-@torch.no_grad()
-def get_hidden_states(model, input_ids: torch.Tensor, layer_idx: int, hook_point: str = "layer") -> torch.Tensor:
-    """
-    Runs forward pass and extracts hidden states at the specified point.
-    Returns: [batch, seq, hidden_dim]
-    """
-    # This is tricky because we need to hook to get the value, 
-    # unless using output_hidden_states for standard layers.
-    # For final_norm, we definitely need a hook if it's not exposed.
-    # But `output_hidden_states=True` usually gives all layer outputs.
-    # `norm` output is NOT in hidden_states usually (it's often applied after).
-    
-    captured = {}
-    def capture_hook(module, inp, out):
-        if isinstance(out, tuple): captured['h'] = out[0].detach()
-        else: captured['h'] = out.detach()
-        
-    handle = None
-    target_module = None
-    
-    if hook_point == "layer":
-        # Just use standard output_hidden_states
-        pass # Handle below
-    elif hook_point == "final_norm":
-        if hasattr(model, "model") and hasattr(model.model, "norm"):
-            target_module = model.model.norm
-        elif hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
-            target_module = model.transformer.ln_f
-    elif hook_point == "lm_head":
-        # We can just get logits from output
-        pass
-        
-    if target_module:
-        handle = target_module.register_forward_hook(capture_hook)
-        
-    try:
-        out = model(input_ids, output_hidden_states=True)
-        
-        if hook_point == "lm_head":
-            return out.logits
-            
-        if hook_point == "final_norm":
-            if 'h' in captured:
-                return captured['h']
-            else:
-                # Fallback if hook failed?
-                return out.hidden_states[-1] # Approximation
-                
-        # "layer" case
-        # out.hidden_states is tuple of (embeddings, layer_1, ... layer_N)
-        # So index 0 is embeddings. index i+1 is output of layer i.
-        # Handle negative indexing carefully.
-        # hidden_states length = num_layers + 1
-        return out.hidden_states[layer_idx if layer_idx >= 0 else layer_idx]
-        
-    finally:
-        if handle: handle.remove()
-
-
-class WindowedInjector:
-    def __init__(self, vec: torch.Tensor, alpha: float, decode_window: int, reversible: bool = False):
-        self.vec = vec.view(1, 1, -1).clone().detach() # [1, 1, D]
-        self.alpha = alpha
-        self.decode_window = decode_window
-        self.reversible = reversible
-        self.step = 0
-        self.handle = None
-        self.active_delta = 0.0 # Tracking for debug
-        
-    def hook(self, module, input, output):
-        # Determine if we are in decode phase
-        # output: [Batch, Seq, Dim]
-        if isinstance(output, tuple): o = output[0]
-        else: o = output
-        
-        B, S, D = o.shape
-        
-        # We assume decode mode is when S == 1 (after prefill)
-        # BUT be careful: if we just started generation without past_key_values, S could be large.
-        # The user's protocol implies we are injecting during GENERATION.
-        
-        if S == 1:
-            self.step += 1
-            current_alpha = 0.0
-            
-            # T = decode_window
-            # 1..T: +alpha
-            if 1 <= self.step <= self.decode_window:
-                current_alpha = self.alpha
-                
-            # T+1..2T: -alpha (if reversible)
-            elif self.reversible and self.decode_window < self.step <= 2 * self.decode_window:
-                current_alpha = -self.alpha
-            
-            if current_alpha != 0:
-                # Inject
-                # Ensure device match
-                if self.vec.device != o.device:
-                    self.vec = self.vec.to(o.device)
-                if self.vec.dtype != o.dtype:
-                    self.vec = self.vec.to(o.dtype)
-                
-                o = o + current_alpha * self.vec
-                self.active_delta = current_alpha
-            else:
-                self.active_delta = 0.0
-                
-        if isinstance(output, tuple):
-            return (o,) + output[1:]
-        return o
-
-    def reset(self):
-        self.step = 0
-        self.active_delta = 0.0
-
-# -------------------------
-# Generation & Dataset
-# -------------------------
-
-FAKE_ENTITIES = ["Orion protocol", "Hollow Flame framework", "Blue River Accord", "Silver Dawn Initiative"]
-DOMAINS = ["embedded systems", "cryptography", "distributed computing", "int'l policy"]
-
-def generate_dataset_entries(N=20):
-    data = []
-    for _ in range(N):
-        e = random.choice(FAKE_ENTITIES)
-        d = random.choice(DOMAINS)
-        # We need a prompt that encourages commit, then we will force a revise prompt.
-        commit_q = f"The {e} was introduced in the field of {d}. Who created it and in what year? Answer directly."
-        # Revise prompt:
-        revise_q = f"Earlier you answered about the {e}. Re-evaluate. What assumptions might be wrong?"
-        data.append((commit_q, revise_q))
-    return data
-
-def generate_text_deterministic(model, tokenizer, prompt, max_new_tokens=128):
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    out = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False, # DETERMINISTIC
-        # temperature=None,
-        # top_p=None,
-        pad_token_id=tokenizer.eos_token_id,
-        use_cache=True
-    )
-    gen_ids = out[0][inputs.input_ids.shape[1]:]
-    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-
-# -------------------------
-# Main Logic
-# -------------------------
-
-def run_experiment(args):
-    set_seed(args.base_seed)
-    
-    # Load Model
-    print(f"Loading {args.model_name}...")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(args.model_name, device_map="auto", trust_remote_code=True)
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        return
-
-    if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
-    model.eval()
-
-    samples = generate_dataset_entries(args.N)
-    results = []
-
-    # Identify injection module
-    injection_module = None
-    if args.hook_point == "final_norm":
-        if hasattr(model, "model") and hasattr(model.model, "norm"): injection_module = model.model.norm
-        elif hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"): injection_module = model.transformer.ln_f
-    elif args.hook_point == "lm_head":
-        injection_module = model.lm_head # Usually available
-    elif args.hook_point == "layer":
-        # Typical HF naming
-        if hasattr(model, "model") and hasattr(model.model, "layers"): injection_module = model.model.layers[args.layer_index]
-        elif hasattr(model, "transformer") and hasattr(model.transformer, "h"): injection_module = model.transformer.h[args.layer_index]
-
-    if injection_module is None:
-        print(f"CRITICAL: Could not find injection module for {args.hook_point}")
-        return
-
-    print(f"Injection target: {injection_module}")
-
-    for i, (commit_q, revise_q) in enumerate(samples):
-        # 1. Commit (just to establish context in memory if we were continuously chatting, 
-        # but here we usually construct a full prompt history. 
-        # Let's assume we just prompt the model to simulate the 'Revise' phase directly 
-        # with a simulated history to ensure control.)
-        
-        # Construct Full Context
-        # User: Commit Q -> Asst: [Fake Commit] -> User: Revise Q
-        # We need a fake commit answer to ensure consistency across runs if we want pure control.
-        # But let's generate it to be safe.
-        
-        # Commit Gen
-        msgs_commit = [{"role": "user", "content": commit_q}]
-        prompt_commit = tokenizer.apply_chat_template(msgs_commit, tokenize=False, add_generation_prompt=True)
-        commit_ans = generate_text_deterministic(model, tokenizer, prompt_commit, max_new_tokens=100)
-        
-        # Revise Prompt Construction
-        msgs_revise = [
-            {"role": "user", "content": commit_q},
-            {"role": "assistant", "content": commit_ans},
-            {"role": "user", "content": revise_q}
+class LlamaServer:
+    def __init__(self, model_path, port=8080):
+        self.cmd = [
+            LLAMA_SERVER_BIN,
+            "-m", model_path,
+            "--port", str(port),
+            "-ngl", "99",
+            "-c", "8192", # Context size
+            "--log-disable" # Reduce noise
         ]
-        prompt_revise = tokenizer.apply_chat_template(msgs_revise, tokenize=False, add_generation_prompt=True)
+        self.process = None
+        self.port = port
+
+    def start(self):
+        print(f"Starting server with {self.cmd[2]} on port {self.port}...")
+        # Use a new process group so we can ensure cleanup
+        self.process = subprocess.Popen(self.cmd, stdout=subprocess.DEVNULL, stderr=None)
         
-        # ---------------------------
-        # COMPUTE STEERING VECTOR (DELTA)
-        # ---------------------------
-        delta = None
-        if args.steer_source == "explicit_glyph_delta":
-            # Condition A: Natural Prompt (prompt_revise)
-            # Condition C: Explicit Glyph (prompt_revise + GLYPH)
-            # Note: We want the state difference caused by the glyph. 
-            # We append the glyph to the prompt.
-            glyph_char = " 🜂" # Explicit glyph
-            
-            prompt_A = prompt_revise
-            prompt_C = prompt_revise + glyph_char
-            
-            # We need to compute the hidden state at the last token of the prompt
-            input_A = tokenizer(prompt_A, return_tensors="pt").to(model.device)
-            input_C = tokenizer(prompt_C, return_tensors="pt").to(model.device)
-            
-            with torch.no_grad():
-                h_A = get_hidden_states(model, input_A.input_ids, args.layer_index, args.hook_point)
-                h_C = get_hidden_states(model, input_C.input_ids, args.layer_index, args.hook_point)
+        # Poll health
+        url = f"http://127.0.0.1:{self.port}/health"
+        for _ in range(120): # Wait up to 120s (loading can be slow)
+            try:
+                with urllib.request.urlopen(url, timeout=1) as response:
+                    if response.status == 200:
+                        print("Server is ready.")
+                        return
+            except Exception:
+                time.sleep(1)
+        
+        self.stop()
+        raise RuntimeError("Server failed to start (timeout).")
+
+    def stop(self):
+        if self.process:
+            print("Stopping server...")
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            self.process = None
+
+    def generate(self, prompt, n_predict=32):
+        url = f"http://127.0.0.1:{self.port}/completion"
+        payload = {
+            "prompt": prompt,
+            "n_predict": n_predict,
+            "temperature": 0.0, # Greedy
+            "stop": ["<|im_end|>"]
+        }
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+        
+        try:
+            with urllib.request.urlopen(req) as response:
+                body = json.loads(response.read().decode('utf-8'))
+                return body.get('content', '').strip()
+        except Exception as e:
+            print(f"Request failed: {e}")
+            return ""
+
+    def get_next_token_probs(self, prompt, candidates: List[str]) -> Dict[str, float]:
+        """
+        Returns log probabilities for specific candidate strings at the next token position.
+        """
+        url = f"http://127.0.0.1:{self.port}/completion"
+        payload = {
+            "prompt": prompt,
+            "n_predict": 1,
+            "n_probs": 20, # Top 20 should catch digits
+            "temperature": 0.0,
+            "stop": []
+        }
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+        
+        try:
+            with urllib.request.urlopen(req) as response:
+                body = json.loads(response.read().decode('utf-8'))
                 
-            # Take last token state
-            # Shape [1, seq, d]
-            v_A = h_A[0, -1, :]
-            v_C = h_C[0, -1, :]
-            
-            delta = v_C - v_A
-            # Normalize? The user formula calculates mean difference. 
-            # Usually steering vectors are normalized, but here 'amplitude' might matter.
-            # "The state is not just noise".
-            # Let's normalize Delta and control magnitude with Alpha.
-            delta = delta / (delta.norm() + 1e-8)
-            
-        else:
-            # Fallback or other source
-            delta = torch.zeros(4096).to(model.device)
+                if 'completion_probabilities' not in body or not body['completion_probabilities']:
+                    print(f"Warning: No completion_probabilities in response: {body.keys()}")
+                    return {}
+                
+                first_token_info = body['completion_probabilities'][0]
+                
+                # Check for 'probs' (legacy/standard) or other keys
+                top_probs_list = None
+                is_logprob = False
+                
+                if 'probs' in first_token_info:
+                    top_probs_list = first_token_info['probs']
+                elif 'top_logprobs' in first_token_info:
+                    top_probs_list = first_token_info['top_logprobs']
+                    is_logprob = True
+                else:
+                    print(f"Warning: 'probs'/'top_logprobs' missing. Keys: {first_token_info.keys()}")
+                    return {}
 
-        steer_vec_norm = delta.norm().item()
+                # Convert list to dict for lookup
+                prob_map = {}
+                for item in top_probs_list:
+                    # item structure depends on endpoint version
+                    # if logprobs: {'token': '...', 'logprob': -0.1, ...}
+                    # if probs: {'content': '...', 'probs': 0.9, ...}
+                    
+                    c = item.get('content') or item.get('token') or ''
+                    
+                    if is_logprob:
+                        val = item.get('logprob', -999.0)
+                    else:
+                        p = item.get('probs', 0.0)
+                        val = math.log(p + 1e-10)
+                        
+                    prob_map[c] = val
+                    prob_map[c.strip()] = val
+                
+                result = {}
+                for cand in candidates:
+                    # Default low logprob
+                    result[cand] = prob_map.get(cand, -20.0)
+                    
+                return result
+                
+        except Exception as e:
+            print(f"Probing failed: {e}")
+            return {}
 
-        # ---------------------------
-        # RUN BASELINE (No Injection)
-        # ---------------------------
-        with torch.no_grad():
-            full_ids = tokenizer(prompt_revise, return_tensors="pt").to(model.device).input_ids
-            # We want to trace the hidden states during generation to measure distance later.
-            # Standard generate doesn't give us easy per-step hidden states unless we loop.
-            # But the user wants to measure "State distance vs baseline".
-            # So we need a baseline trace.
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--output", type=str, default="glyph_reasoning/experiments/results/revision_retrieval_llama.csv")
+    args = parser.parse_args()
+    
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    set_seed(42)
+    
+    # 1. Pre-generate tasks to ensure consistency
+    all_tasks = []
+    print(f"Generating {args.samples} tasks per k ({BURY_TURNS})...")
+    for k in BURY_TURNS:
+        for _ in range(args.samples):
+            msgs, key, fake = generate_key_task(k)
+            all_tasks.append({
+                "k": k, "key": key, "fake": fake, "msgs": msgs,
+                "A_out": "", "B_out": "", "C_out": "",
+                "A_margin": 0.0, "C_margin": 0.0
+            })
             
-            # For simplicity, let's run the baseline generation first.
-            base_out = model.generate(
-                full_ids, 
-                max_new_tokens=100, 
-                do_sample=False, 
-                output_hidden_states=True, 
-                return_dict_in_generate=True,
-                use_cache=True
-            )
-            base_ids = base_out.sequences[0]
-            # Extract baseline states for the generated tokens
-            # base_out.hidden_states is a tuple (one per step) of tuples (one per layer).
-            # We need the specific layer/hook point.
+    # 2. Run Base Model (A & B)
+    server = LlamaServer(BASE_MODEL_PATH, port=PORT)
+    try:
+        server.start()
+        print("Running Conditions A & B (Base Model)...")
+        for i, task in enumerate(all_tasks):
+            if i % 10 == 0: print(f"  Processing {i}/{len(all_tasks)}...")
             
-            # Collect baseline trace (vectors at the hook point)
-            base_trace = []
-            if args.hook_point == "final_norm":
-                # Only way to get final_norm for sure strictly from generate output is tough 
-                # if it's not exposed. We might rely on the last hidden state of the last layer 
-                # as a proxy if we can't hook during generate easily without custom streamer.
-                # ACTUALLY, we can use the same Injector class but with 0 alpha to just capturing states!
-                pass # Will do capture below
+            # A (Acc)
+            prompt_a = format_qwen_chat(task["msgs"])
+            task["A_out"] = server.generate(prompt_a)
             
-        
-        # ---------------------------
-        # RUN EXPERIMENT (With Injection + Capture)
-        # ---------------------------
-        
-        # We need to capture states during generation.
-        # Let's define a StateCapturer hook.
-        
-        class StateCapturer:
-            def __init__(self):
-                self.trace = []
-            def hook(self, module, inp, out):
-                # Only capture during decode (S=1)
-                if isinstance(out, tuple): o = out[0]
-                else: o = out
-                if o.shape[1] == 1:
-                    self.trace.append(o.detach().cpu().squeeze()) # [D]
-                return out
-        
-        # Re-run Baseline with Capture (to be precise)
-        capturer_base = StateCapturer()
-        h_base = injection_module.register_forward_hook(capturer_base.hook)
-        
-        input_ids = tokenizer(prompt_revise, return_tensors="pt").to(model.device).input_ids
-        model.generate(input_ids, max_new_tokens=60, do_sample=False, use_cache=True)
-        h_base.remove()
-        base_states = torch.stack(capturer_base.trace) if capturer_base.trace else torch.tensor([])
-        
-        # Run Steered (Reversible)
-        injector = WindowedInjector(
-            delta, 
-            alpha=args.alpha if args.condition == "steer_reversible" else 0.0,
-            decode_window=args.decode_window,
-            reversible=(args.condition == "steer_reversible")
-        )
-        capturer_steer = StateCapturer()
-        
-        h_inj = injection_module.register_forward_hook(injector.hook)
-        h_cap = injection_module.register_forward_hook(capturer_steer.hook)
-        
-        out_steer = model.generate(input_ids, max_new_tokens=60, do_sample=False, use_cache=True)
-        
-        h_inj.remove()
-        h_cap.remove()
-        
-        steer_states = torch.stack(capturer_steer.trace) if capturer_steer.trace else torch.tensor([])
-        steer_text = tokenizer.decode(out_steer[0][input_ids.shape[1]:], skip_special_tokens=True)
-        
-        # ---------------------------
-        # METRICS
-        # ---------------------------
-        
-        # 1. State Distance Trace
-        # dist_t = 1 - cos(h_t, h_t_baseline)
-        dists = []
-        min_len = min(len(base_states), len(steer_states))
-        for t in range(min_len):
-            v1 = base_states[t]
-            v2 = steer_states[t]
-            cos = F.cosine_similarity(v1.unsqueeze(0), v2.unsqueeze(0)).item()
-            dists.append(1.0 - cos)
+            # B (Acc)
+            msgs_b = [m.copy() for m in task["msgs"]]
+            msgs_b[-1]["content"] += GLYPH_SYMBOL
+            prompt_b = format_qwen_chat(msgs_b)
+            task["B_out"] = server.generate(prompt_b)
             
-        # 2. Logit Diff (Approximate, requires running forward again to get logits precisely if we hooked norm)
-        # But user asks for "max |Δlogits|". 
-        # This is expensive to compute per step unless we hooked lm_head.
-        # If hook_point == lm_head, our captured states ARE logits.
-        logit_diff = 0.0
-        if args.hook_point == "lm_head" and min_len > 0:
-            diffs = (base_states[:min_len] - steer_states[:min_len]).abs()
-            logit_diff = diffs.max().item()
+            # A (Margin) - Only for k >= 5
+            if task["k"] >= 5:
+                # Probe prompt
+                probe_prompt = prompt_a + "KEY = ZQ-"
+                cand_correct = task["key"].split("-")[1][0]
+                cand_fake = task["fake"].split("-")[1][0]
+                
+                logprobs = server.get_next_token_probs(probe_prompt, [cand_correct, cand_fake])
+                if logprobs:
+                    task["A_margin"] = logprobs[cand_correct] - logprobs[cand_fake]
             
-        label = label_revision_behavior(commit_ans, steer_text)
-        depth = calculate_revision_depth(steer_text)
+    finally:
+        server.stop()
         
-        res = RunResult(
-            sample_id=i,
-            condition=args.condition,
-            alpha=args.alpha,
-            full_text=prompt_revise + steer_text,
-            phase_texts={"commit": commit_ans, "revise": steer_text},
-            label=label,
-            revision_depth=depth,
-            logit_diff_max=logit_diff,
-            state_dist_trace=dists,
-            steer_vec_norm=steer_vec_norm,
-            decode_window=args.decode_window
-        )
+    # 3. Run FT Model (C)
+    server = LlamaServer(FT_MODEL_PATH, port=PORT)
+    try:
+        server.start()
+        print("Running Condition C (FT Model)...")
+        for i, task in enumerate(all_tasks):
+            if i % 10 == 0: print(f"  Processing {i}/{len(all_tasks)}...")
+            
+            # C (Acc)
+            prompt_c = format_qwen_chat(task["msgs"])
+            task["C_out"] = server.generate(prompt_c)
+            
+            # C (Margin)
+            if task["k"] >= 5:
+                probe_prompt = prompt_c + "KEY = ZQ-"
+                cand_correct = task["key"].split("-")[1][0]
+                cand_fake = task["fake"].split("-")[1][0]
+                
+                logprobs = server.get_next_token_probs(probe_prompt, [cand_correct, cand_fake])
+                if logprobs:
+                    task["C_margin"] = logprobs[cand_correct] - logprobs[cand_fake]
+                    
+    finally:
+        server.stop()
+        
+    # 4. Calculate Metrics & Save
+    results = []
+    margins_by_k = {k: {"A": [], "C": []} for k in BURY_TURNS if k >= 5}
+    
+    for t in all_tasks:
+        res = {
+            "k": t["k"],
+            "key": t["key"],
+            "fake": t["fake"],
+            "A_out": t["A_out"],
+            "B_out": t["B_out"],
+            "C_out": t["C_out"],
+            "A_acc": 1 if t["key"] in t["A_out"] else 0,
+            "B_acc": 1 if t["key"] in t["B_out"] else 0,
+            "C_acc": 1 if t["key"] in t["C_out"] else 0,
+            "A_margin": t.get("A_margin", 0.0),
+            "C_margin": t.get("C_margin", 0.0)
+        }
         results.append(res)
+        if t["k"] >= 5:
+            margins_by_k[t["k"]]["A"].append(res["A_margin"])
+            margins_by_k[t["k"]]["C"].append(res["C_margin"])
         
-        # Print progress
-        print(f"[Sample {i}] Cond: {args.condition} | Label: {label} | Depth: {depth}")
-        if dists:
-            # Print average dist during push, pull, and relax phases
-            T = args.decode_window
-            push_dist = sum(dists[:T])/T if len(dists) >= T else 0
-            pull_dist = sum(dists[T:2*T])/T if len(dists) >= 2*T else 0
-            relax_dist = sum(dists[2*T:])/len(dists[2*T:]) if len(dists) > 2*T else 0
-            print(f"  Distances -> Push: {push_dist:.4f} | Pull: {pull_dist:.4f} | Relax: {relax_dist:.4f}")
-
-    # Save CSV
-    if args.output_file:
-        with open(args.output_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["sample_id", "condition", "alpha", "label", "depth", "max_logit_diff", "push_dist_avg", "pull_dist_avg", "relax_dist_avg", "revise_text"])
-            for r in results:
-                dists = r.state_dist_trace
-                T = r.decode_window
-                push = sum(dists[:T])/T if len(dists) >= T else 0
-                pull = sum(dists[T:2*T])/T if len(dists) >= 2*T else 0
-                relax = sum(dists[2*T:])/len(dists[2*T:]) if len(dists) > 2*T else 0
-                
-                writer.writerow([
-                    r.sample_id, r.condition, r.alpha, r.label, r.revision_depth, 
-                    f"{r.logit_diff_max:.4f}", f"{push:.4f}", f"{pull:.4f}", f"{relax:.4f}",
-                    r.phase_texts["revise"][:100].replace("\n", " ")
-                ])
-        print(f"Saved results to {args.output_file}")
+    with open(args.output, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
+        writer.writeheader()
+        writer.writerows(results)
+        
+    print(f"\nResults saved to {args.output}")
+    
+    # Summary
+    print("\n=== ACCURACY SUMMARY ===")
+    print(f"{'k':<5} | {'A (Base)':<10} | {'B (Base+G)':<10} | {'C (FT)':<10}")
+    print("-" * 45)
+    
+    for k in BURY_TURNS:
+        subset = [r for r in results if r["k"] == k]
+        if not subset: continue
+        acc_a = sum(r["A_acc"] for r in subset) / len(subset)
+        acc_b = sum(r["B_acc"] for r in subset) / len(subset)
+        acc_c = sum(r["C_acc"] for r in subset) / len(subset)
+        print(f"{k:<5} | {acc_a:<10.2f} | {acc_b:<10.2f} | {acc_c:<10.2f}")
+        
+    for k in margins_by_k:
+        print(f"\n=== MARGIN STATS (k={k}) ===")
+        m_a = margins_by_k[k]["A"]
+        m_c = margins_by_k[k]["C"]
+        
+        def stats(arr):
+            if not arr: return 0, 0
+            mu = sum(arr)/len(arr)
+            var = sum((x-mu)**2 for x in arr)/len(arr)
+            return mu, math.sqrt(var)
+            
+        mu_a, std_a = stats(m_a)
+        mu_c, std_c = stats(m_c)
+        print(f"Condition A (Base): Mean Δ = {mu_a:.4f} ± {std_a:.4f}")
+        print(f"Condition C (FT)  : Mean Δ = {mu_c:.4f} ± {std_c:.4f}")
 
 if __name__ == "__main__":
-    args = parse_args()
-    print("--- Starting Reversibility Probe ---")
-    print(f"Condition: {args.condition}")
-    print(f"Alpha: {args.alpha}, Window: {args.decode_window}")
-    run_experiment(args)
+    main()
