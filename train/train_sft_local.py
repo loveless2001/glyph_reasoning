@@ -61,6 +61,9 @@ def main():
         )
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
+        
+        # FIX: Enable input gradients for LoRA + Gradient Checkpointing
+        model.enable_input_require_grads()
 
     # --------------------
     # Dataset
