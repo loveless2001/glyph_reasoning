@@ -12,8 +12,8 @@ from prompts import xml_prompt, natural_prompt, glyph_prompt
 DEFAULT_MODELS = [
     "Qwen/Qwen2.5-0.5B-Instruct",
     "Qwen/Qwen2.5-1.5B-Instruct",
-    "Qwen/Qwen2.5-3B-Instruct",
-    "Qwen/Qwen2.5-7B-Instruct"
+    #"Qwen/Qwen2.5-3B-Instruct",
+    #"Qwen/Qwen2.5-7B-Instruct"
 ]
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -129,6 +129,7 @@ def main():
     parser.add_argument("--output", default="eval/eval_results.csv", help="Output CSV file path")
     parser.add_argument("--data", default="data/tasks.json", help="Input data file (json or jsonl)")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of tasks")
+    parser.add_argument("--shuffle", action="store_true", help="Shuffle tasks before limiting")
     parser.add_argument("--clear_cache", action="store_true", help="Delete model weights from disk after evaluation")
     args = parser.parse_args()
 
@@ -144,6 +145,11 @@ def main():
         with open(args.data, "r") as f:
             tasks = json.load(f)
 
+    if args.shuffle:
+        import random
+        random.seed(42) # Set seed for some reproducibility, though user can request dynamic seed if needed
+        random.shuffle(tasks)
+
     if args.limit:
         tasks = tasks[:args.limit]
     
@@ -151,10 +157,40 @@ def main():
 
     all_results = {}
 
+    # Function to save results
+    def save_results(current_results):
+        if not current_results:
+            return
+        import csv
+        print(f"\nSaving results to {args.output}...")
+        try:
+            with open(args.output, "w", newline="") as f:
+                writer = csv.writer(f)
+                headers = ["Model", "Mode", "Accuracy", "Structure Violation Rate", 
+                           "Avg Reasoning Tokens", "Avg Answer Tokens", "Avg Total Tokens"]
+                writer.writerow(headers)
+
+                for m_name, modes in current_results.items():
+                    for mode, stats in modes.items():
+                        writer.writerow([
+                            m_name,
+                            mode,
+                            f"{stats['accuracy']:.4f}",
+                            f"{stats['structure_violation_rate']:.4f}",
+                            f"{stats['avg_reasoning_tokens']:.2f}",
+                            f"{stats['avg_answer_tokens']:.2f}",
+                            f"{stats['avg_total_tokens']:.2f}"
+                        ])
+            print("Save successful.")
+        except Exception as e:
+            print(f"Error saving CSV: {e}")
+
     for model_name in args.models:
         model_results = evaluate_model(model_name, tasks)
         if model_results:
             all_results[model_name] = model_results
+            # Save incrementally
+            save_results(all_results)
         
         if args.clear_cache:
             print(f"🧹 Clearing disk cache for {model_name}...")
@@ -171,32 +207,6 @@ def main():
                             delete_strategy.execute()
             except Exception as e:
                 print(f"  Warning: Could not clear disk cache automatically: {e}")
-
-    # Save to CSV
-    if all_results:
-        import csv
-        print(f"\nSaving results to {args.output}...")
-        try:
-            with open(args.output, "w", newline="") as f:
-                writer = csv.writer(f)
-                headers = ["Model", "Mode", "Accuracy", "Structure Violation Rate", 
-                           "Avg Reasoning Tokens", "Avg Answer Tokens", "Avg Total Tokens"]
-                writer.writerow(headers)
-
-                for model_name, modes in all_results.items():
-                    for mode, stats in modes.items():
-                        writer.writerow([
-                            model_name,
-                            mode,
-                            f"{stats['accuracy']:.4f}",
-                            f"{stats['structure_violation_rate']:.4f}",
-                            f"{stats['avg_reasoning_tokens']:.2f}",
-                            f"{stats['avg_answer_tokens']:.2f}",
-                            f"{stats['avg_total_tokens']:.2f}"
-                        ])
-            print("Save successful.")
-        except Exception as e:
-            print(f"Error saving CSV: {e}")
 
     print("\n=== FINAL RESULTS ===")
     for model_name, modes in all_results.items():
