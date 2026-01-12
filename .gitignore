@@ -162,3 +162,4 @@ experiments/*.png
 *.png
 .runpod*
 /checkpoints
+*.json

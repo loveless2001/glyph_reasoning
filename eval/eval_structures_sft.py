@@ -11,7 +11,8 @@ from prompts import xml_prompt, natural_prompt, glyph_prompt
 
 # Default models to test
 DEFAULT_MODELS = [
-    "/home/lenovo/projects/revision_learning/checkpoints/qwen2.5-0.5b-glyph-sft"
+    "qwen/qwen2.5-7b-instruct",
+    "loveless/qwen2.5-7b-glyph-sft"
 ]
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

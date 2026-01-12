@@ -12,12 +12,12 @@ from prompts import xml_prompt, natural_prompt, glyph_prompt
 DEFAULT_MODELS = [
     "Qwen/Qwen2.5-0.5B-Instruct",
     "Qwen/Qwen2.5-1.5B-Instruct",
-    #"Qwen/Qwen2.5-3B-Instruct",
-    #"Qwen/Qwen2.5-7B-Instruct"
+    "Qwen/Qwen2.5-3B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct"
 ]
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_NEW_TOKENS = 512
+MAX_NEW_TOKENS = 1024
 
 PROMPTS = {
     "xml": xml_prompt,

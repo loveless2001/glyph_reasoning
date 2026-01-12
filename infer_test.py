@@ -2,8 +2,8 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
-model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-adapter_path = "checkpoints/qwen2.5-0.5b-glyph-sft"
+model_name = "Qwen/Qwen2.5-7B-Instruct"
+adapter_path = "checkpoints/qwen2.5-7b-glyph-sft"
 
 print(f"Loading base model: {model_name}")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
