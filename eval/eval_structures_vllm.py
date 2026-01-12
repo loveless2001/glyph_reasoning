@@ -4,8 +4,10 @@ import torch
 import os
 import gc
 import argparse
+import time
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
+from vllm import LLM, SamplingParams
 from prompts import xml_prompt, natural_prompt, glyph_prompt
 
 # Default models to test
@@ -16,7 +18,6 @@ DEFAULT_MODELS = [
     #"Qwen/Qwen2.5-7B-Instruct"
 ]
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_NEW_TOKENS = 1024
 
 PROMPTS = {
@@ -38,27 +39,29 @@ def structure_violation(text, mode):
         return not all(g in text for g in ["🜞", "🜆", "🜂", "🜃"])
     return True
 
-def evaluate_model(model_name, tasks):
-    print(f"\nLoading model: {model_name}...")
+def evaluate_model_vllm(model_name, tasks, gpu_memory_utilization=0.9, max_model_len=8192):
+    print(f"\n🚀 Loading model with vLLM: {model_name}...")
     try:
+        # Load tokenizer for chat template application
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         
-        # Check for Flash Attention availability
-        attn_impl = "eager"
-        try:
-            import flash_attn
-            attn_impl = "flash_attention_2"
-            print("⚡ Using Flash Attention 2")
-        except ImportError:
-            print("⚠️ Flash Attention not found, using default attention (slower)")
-
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            attn_implementation=attn_impl
+        # Initialize vLLM
+        # tensor_parallel_size=1 for single GPU.
+        # gpu_memory_utilization can be adjusted if OOM.
+        llm = LLM(
+            model=model_name,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            trust_remote_code=True
         )
-        model.eval()
+        
+        sampling_params = SamplingParams(
+            temperature=0,
+            max_tokens=MAX_NEW_TOKENS,
+            stop_token_ids=[tokenizer.eos_token_id]
+        )
+        
     except Exception as e:
         print(f"Failed to load {model_name}: {e}")
         return None
@@ -66,12 +69,33 @@ def evaluate_model(model_name, tasks):
     results = {}
 
     for mode, prompt_fn in PROMPTS.items():
+        print(f"Preparing prompts for mode: {mode}...")
+        
+        # Pre-calculate prompts
+        prompts = []
+        for task in tasks:
+            raw_prompt = prompt_fn(task["question"])
+            messages = [{"role": "user", "content": raw_prompt}]
+            try:
+                full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except:
+                full_prompt = raw_prompt
+            prompts.append(full_prompt)
+
+        # Generate in batch
+        print(f"⚡ Generating {len(prompts)} responses...")
+        start_time = time.time()
+        outputs = llm.generate(prompts, sampling_params)
+        end_time = time.time()
+        duration = end_time - start_time
+        print(f"Done in {duration:.2f}s ({len(prompts)/duration:.2f} it/s)")
+
+        # Process results
         correct = 0
         violations = 0
         total_reasoning_tokens = 0
         total_answer_tokens = 0
-
-        # Define markers for each mode
+        
         marker_map = {
             "glyph": "🜃",
             "xml": "<takeaway>",
@@ -79,36 +103,9 @@ def evaluate_model(model_name, tasks):
         }
         marker = marker_map.get(mode)
 
-        for task in tqdm(tasks, desc=f"[{model_name}] Mode: {mode}"):
-            raw_prompt = prompt_fn(task["question"])
-            
-            # Apply Chat Template for Instruct models
-            messages = [
-                {"role": "user", "content": raw_prompt}
-            ]
-            try:
-                text_input = tokenizer.apply_chat_template(
-                    messages, 
-                    tokenize=False, 
-                    add_generation_prompt=True
-                )
-            except Exception:
-                # Fallback if chat template is missing/broken
-                text_input = raw_prompt
-
-            inputs = tokenizer(text_input, return_tensors="pt").to(model.device)
-            input_len = inputs["input_ids"].shape[1]
-
-            with torch.no_grad():
-                output = model.generate(
-                    **inputs,
-                    max_new_tokens=MAX_NEW_TOKENS,
-                    do_sample=False,
-                    pad_token_id=tokenizer.eos_token_id
-                )
-            
-            gen_tokens = output[0][input_len:]
-            gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+        for i, output in enumerate(outputs):
+            gen_text = output.outputs[0].text
+            task = tasks[i]
             
             # Split by marker
             reasoning_part = gen_text
@@ -128,6 +125,11 @@ def evaluate_model(model_name, tasks):
             if structure_violation(gen_text, mode):
                 violations += 1
             
+            # vLLM provides token_ids in the output
+            # We can map them back to reasoning/answer roughly by text usage, 
+            # but since we already have text, let's re-encode purely for counting consistency with previous script
+            # OR use logic on the text lengths.
+            # Simpler: Re-use tokenizer to count tokens of parts.
             r_tokens = len(tokenizer.encode(reasoning_part, add_special_tokens=False))
             a_tokens = len(tokenizer.encode(answer_part, add_special_tokens=False))
             
@@ -142,22 +144,24 @@ def evaluate_model(model_name, tasks):
             "avg_total_tokens": (total_reasoning_tokens + total_answer_tokens) / len(tasks),
         }
     
-    # Cleanup to free VRAM
-    del model
-    del tokenizer
+    # Cleanup / Destroy LLM to free VRAM for next model
+    from vllm.distributed.parallel_state import destroy_model_parallel
+    destroy_model_parallel()
+    del llm
     gc.collect()
     torch.cuda.empty_cache()
     
     return results
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate multiple Qwen models on structure prompts")
+    parser = argparse.ArgumentParser(description="Evaluate multiple Qwen models with vLLM")
     parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS, help="List of models to evaluate")
-    parser.add_argument("--output", default="eval/eval_results.csv", help="Output CSV file path")
+    parser.add_argument("--output", default="eval/eval_results_vllm.csv", help="Output CSV file path")
     parser.add_argument("--data", default="data/tasks.json", help="Input data file (json or jsonl)")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of tasks")
     parser.add_argument("--shuffle", action="store_true", help="Shuffle tasks before limiting")
-    parser.add_argument("--clear_cache", action="store_true", help="Delete model weights from disk after evaluation")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="vLLM GPU memory utilization (0.0-1.0)")
+    parser.add_argument("--max-model-len", type=int, default=8192, help="Maximum context length for the model. Decrease to save VRAM.")
     args = parser.parse_args()
 
     # Load tasks
@@ -174,7 +178,7 @@ def main():
 
     if args.shuffle:
         import random
-        random.seed(42) # Set seed for some reproducibility, though user can request dynamic seed if needed
+        random.seed(42)
         random.shuffle(tasks)
 
     if args.limit:
@@ -184,7 +188,6 @@ def main():
 
     all_results = {}
 
-    # Function to save results
     def save_results(current_results):
         if not current_results:
             return
@@ -213,27 +216,18 @@ def main():
             print(f"Error saving CSV: {e}")
 
     for model_name in args.models:
-        model_results = evaluate_model(model_name, tasks)
+        model_results = evaluate_model_vllm(
+            model_name, 
+            tasks, 
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len
+        )
         if model_results:
             all_results[model_name] = model_results
-            # Save incrementally
             save_results(all_results)
         
-        if args.clear_cache:
-            print(f"🧹 Clearing disk cache for {model_name}...")
-            # This is a bit aggressive but effective for tight quotas
-            try:
-                from huggingface_hub import scan_cache_dir
-                cache_info = scan_cache_dir()
-                for repo in cache_info.repos:
-                    if repo.repo_id == model_name:
-                        for revision in repo.revisions:
-                            print(f"  Removing {repo.repo_id} ({revision.commit_hash[:7]})")
-                            # huggingface_hub v0.16.4+
-                            delete_strategy = cache_info.delete_revisions(revision.commit_hash)
-                            delete_strategy.execute()
-            except Exception as e:
-                print(f"  Warning: Could not clear disk cache automatically: {e}")
+        # Explicit VRAM clearing pause
+        time.sleep(2)
 
     print("\n=== FINAL RESULTS ===")
     for model_name, modes in all_results.items():
