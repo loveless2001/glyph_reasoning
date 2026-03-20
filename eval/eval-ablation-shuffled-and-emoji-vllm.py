@@ -32,7 +32,7 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 # Import all prompt variants
-from prompts import glyph_prompt
+from prompts import glyph_prompt, natural_prompt
 sys.path.insert(0, os.path.dirname(__file__))
 from importlib import import_module
 ablation_prompts = import_module("prompts-ablation-shuffled-and-emoji")
@@ -43,6 +43,7 @@ MAX_NEW_TOKENS = 1024
 
 # All conditions to evaluate
 PROMPTS = {
+    "natural": natural_prompt,            # plain-language baseline
     "glyph": glyph_prompt,                # control
     "glyph_shuffled": glyph_shuffled_prompt,  # ablation 1
     "emoji": emoji_prompt,                 # ablation 2
@@ -50,6 +51,7 @@ PROMPTS = {
 
 # Structure violation checks per mode
 STRUCTURE_CHECKS = {
+    "natural": ["Guideline:", "Plan:", "Step:", "Takeaway:"],
     "glyph": ["🜞", "🜆", "🜂", "🜃"],
     "glyph_shuffled": ["🜞", "🜆", "🜂", "🜃"],  # same glyphs, any order
     "emoji": ["🧭", "📋", "🔢", "✅"],
@@ -57,6 +59,7 @@ STRUCTURE_CHECKS = {
 
 # Marker to split reasoning vs answer (last section marker)
 MARKER_MAP = {
+    "natural": "Takeaway:",
     "glyph": "🜃",
     "glyph_shuffled": "🜆",  # 🜆 is last in shuffled order
     "emoji": "✅",
