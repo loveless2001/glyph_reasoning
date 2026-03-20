@@ -15,7 +15,7 @@ from vllm.lora.request import LoRARequest
 
 from prompts import glyph_prompt, natural_prompt, xml_prompt
 
-MAX_NEW_TOKENS = 512
+DEFAULT_MAX_NEW_TOKENS = 512
 
 PROMPTS = {
     "glyph": glyph_prompt,
@@ -204,6 +204,7 @@ def main():
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     args = parser.parse_args()
 
     tasks = load_tasks(args.data, limit=args.limit, shuffle=args.shuffle)
@@ -223,7 +224,7 @@ def main():
     )
     sampling_params = SamplingParams(
         temperature=0,
-        max_tokens=MAX_NEW_TOKENS,
+        max_tokens=args.max_new_tokens,
         stop_token_ids=[tokenizer.eos_token_id],
     )
 
