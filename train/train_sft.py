@@ -13,13 +13,17 @@ from transformers.trainer_utils import get_last_checkpoint
 # --------------------
 # Environment & Paths
 # --------------------
-# Redirect cache to workspace to avoid "Disk quota exceeded" on root partition
-os.environ["HF_HOME"] = "/workspace/huggingface_cache"
-os.environ["HF_DATASETS_CACHE"] = "/workspace/huggingface_cache/datasets"
+# Redirect cache to workspace to avoid "Disk quota exceeded" on root partition.
+# Allow overrides from orchestrators (e.g., Modal) via environment variables.
+os.environ.setdefault("HF_HOME", "/workspace/huggingface_cache")
+os.environ.setdefault("HF_DATASETS_CACHE", "/workspace/huggingface_cache/datasets")
 
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 DATA_FILE = "data/sft_final.jsonl"
-OUTPUT_DIR = "/workspace/revision_learning/checkpoints/qwen2.5-glyph-sft"
+OUTPUT_DIR = os.environ.get(
+    "OUTPUT_DIR",
+    "/workspace/revision_learning/checkpoints/qwen2.5-glyph-sft",
+)
 
 # --------------------
 # Load tokenizer & model
