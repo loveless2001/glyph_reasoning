@@ -224,8 +224,11 @@ def main():
         description="Ablation eval: shuffled glyphs + emoji replacement"
     )
     parser.add_argument("--models", nargs="+",
-                        default=["checkpoints/qwen2.5-7b-glyph-sft-hf"],
-                        help="Models to evaluate")
+                        default=[
+                            "Qwen/Qwen2.5-7B-Instruct",
+                            "checkpoints/qwen2.5-7b-glyph-sft-hf",
+                        ],
+                        help="Models to evaluate (base + fine-tuned)")
     parser.add_argument("--output", default="eval/eval_results_ablation.csv")
     parser.add_argument("--data", default="data/unified_dataset.jsonl")
     parser.add_argument("--limit", type=int, default=None)
