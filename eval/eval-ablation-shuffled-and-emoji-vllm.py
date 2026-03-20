@@ -76,10 +76,15 @@ class StreamLogger:
 
     def flush(self):
         self.terminal.flush()
-        self.log.flush()
+        if not self.log.closed:
+            self.log.flush()
+
+    def fileno(self):
+        return self.terminal.fileno()
 
     def close(self):
-        self.log.close()
+        if not self.log.closed:
+            self.log.close()
 
 
 def extract_answer(text):
