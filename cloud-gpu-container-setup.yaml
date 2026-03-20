@@ -1,0 +1,167 @@
+# Cloud GPU Container Setup for Glyph Reasoning Experiments
+# Reusable config for quick provisioning on RunPod, FPT Cloud, or similar providers.
+#
+# Usage:
+#   1. Provision a GPU container (see `provider_presets` for recommended specs)
+#   2. SSH in and run: bash <(curl -sL <raw-github-url>/cloud-gpu-setup-script.sh)
+#      Or manually follow the steps in `setup_steps`
+#
+# Last verified: 2026-03-20 on FPT Cloud H100 80GB
+
+project:
+  name: glyph-reasoning
+  repo: https://github.com/loveless2001/glyph_reasoning.git
+  branch: main
+  work_dir: /root/glyph_reasoning
+
+# Minimum hardware requirements per experiment type
+hardware:
+  ablation_eval:
+    gpu: ">=24GB VRAM"            # A10G minimum, A100/H100 recommended
+    disk: "80GB"                  # model weights + cache + results
+    ram: "32GB"
+    recommended_gpus:
+      - "NVIDIA H100 80GB"       # fastest, ~$2-4/hr
+      - "NVIDIA A100 80GB"       # good balance
+      - "NVIDIA A100 40GB"       # budget option
+      - "NVIDIA A10G 24GB"       # minimum viable
+
+  sft_training_lora:
+    gpu: ">=24GB VRAM"
+    disk: "100GB"                 # checkpoints + merged weights
+    ram: "32GB"
+    recommended_gpus:
+      - "NVIDIA H100 80GB"
+      - "NVIDIA A100 80GB"
+      - "NVIDIA A100 40GB"
+
+  sft_training_full:
+    gpu: ">=40GB VRAM"
+    disk: "150GB"
+    ram: "64GB"
+    recommended_gpus:
+      - "NVIDIA H100 80GB"
+      - "NVIDIA A100 80GB"
+
+# Provider-specific presets
+provider_presets:
+  runpod:
+    template: "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
+    volume_mount: /workspace
+    env:
+      HF_HOME: /workspace/hf_cache
+      TRANSFORMERS_CACHE: /workspace/hf_cache
+
+  fpt_cloud:
+    # FPT Cloud serverless GPU (current provider)
+    ssh_command: "ssh root@tcp-endpoint.serverless.fptcloud.com -p <PORT> -i ~/runpod"
+    env:
+      HF_HOME: /root/.cache/huggingface
+
+# System packages required
+system_packages:
+  - git
+  - python3-pip
+  - python3-venv
+  - build-essential
+  - tmux                          # for persistent sessions / log monitoring
+
+# Python dependencies (in install order)
+python_deps:
+  base: "requirements.txt"        # torch, transformers, peft, datasets, etc.
+  eval_extra:
+    - vllm                        # batch inference engine
+  train_extra:
+    - bitsandbytes                # quantized training (optional)
+
+# Models to download (HuggingFace)
+models:
+  base:
+    id: "Qwen/Qwen2.5-7B-Instruct"
+    cache: true                   # auto-cached by transformers/vllm on first load
+    size_gb: 16
+
+  fine_tuned:
+    id: "loveless2001/qwen2.5-7b-glyph-sft"
+    local_dir: "checkpoints/qwen2.5-7b-glyph-sft-hf"
+    size_gb: 15
+    download_command: >
+      huggingface-cli download loveless2001/qwen2.5-7b-glyph-sft
+      --local-dir checkpoints/qwen2.5-7b-glyph-sft-hf
+
+  llama3:
+    id: "meta-llama/Meta-Llama-3-8B-Instruct"
+    gated: true                   # requires HF_TOKEN with access granted
+    size_gb: 16
+
+# Step-by-step setup sequence
+setup_steps:
+  - name: "Install system packages"
+    run: "apt-get update && apt-get install -y git python3-pip python3-venv build-essential tmux"
+
+  - name: "Clone repo"
+    run: "git clone https://github.com/loveless2001/glyph_reasoning.git /root/glyph_reasoning"
+
+  - name: "Create venv and install deps"
+    run: |
+      cd /root/glyph_reasoning
+      python3 -m venv .venv
+      source .venv/bin/activate
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      pip install vllm
+
+  - name: "Download fine-tuned model"
+    run: |
+      cd /root/glyph_reasoning
+      source .venv/bin/activate
+      huggingface-cli download loveless2001/qwen2.5-7b-glyph-sft \
+        --local-dir checkpoints/qwen2.5-7b-glyph-sft-hf
+
+  - name: "Verify GPU"
+    run: "python3 -c \"import torch; print(f'CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0)}')\""
+
+# Experiment run commands
+experiments:
+  ablation_eval:
+    description: "Shuffled glyph order + emoji replacement ablation"
+    command: >
+      cd /root/glyph_reasoning && source .venv/bin/activate &&
+      python eval/eval-ablation-shuffled-and-emoji-vllm.py
+      --data data/unified_dataset.jsonl
+      --limit 200
+      --gpu-memory-utilization 0.9
+      --max-model-len 4096
+    monitor: "tail -f eval/logs/ablation-*.log"
+    output: "eval/eval_results_ablation.csv"
+
+  base_eval:
+    description: "Standard 3-mode eval (glyph/xml/natural)"
+    command: >
+      cd /root/glyph_reasoning && source .venv/bin/activate &&
+      python eval/eval_structures_vllm.py
+      --models Qwen/Qwen2.5-7B-Instruct checkpoints/qwen2.5-7b-glyph-sft-hf
+      --data data/unified_dataset.jsonl
+      --limit 200
+      --gpu-memory-utilization 0.9
+      --max-model-len 4096
+    output: "eval/eval_results_vllm.csv"
+
+  sft_train:
+    description: "LoRA fine-tuning on glyph traces"
+    command: >
+      cd /root/glyph_reasoning && source .venv/bin/activate &&
+      python train/train_sft.py
+    output: "checkpoints/"
+
+# Monitoring tips
+monitoring:
+  streaming_log: "tail -f eval/logs/*.log"
+  gpu_usage: "watch -n 1 nvidia-smi"
+  tmux_session: |
+    # Create a persistent session for long runs:
+    tmux new-session -d -s train
+    tmux send-keys -t train 'cd /root/glyph_reasoning && source .venv/bin/activate' Enter
+    # Split pane for GPU monitoring:
+    tmux split-window -h -t train
+    tmux send-keys -t train 'watch -n 1 nvidia-smi' Enter
