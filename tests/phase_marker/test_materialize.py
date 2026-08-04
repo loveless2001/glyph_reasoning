@@ -19,6 +19,7 @@ from phase_marker.token_audit import (
     _load_frozen_training_traces,
     main,
     materialize_training_arms,
+    validate_pinned_qwen_tokenizer_snapshot,
 )
 
 from tests.phase_marker.test_token_audit import FaithfulFakeTokenizer
@@ -226,6 +227,29 @@ def _write_qwen_tokenizer_snapshot(
     (snapshot / "tokenizer.json").write_text(
         json.dumps(tokenizer_payload), encoding="utf-8"
     )
+
+
+def test_public_tokenizer_snapshot_validator_never_imports_transformers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if preflight started importing the tokenizer implementation."""
+    snapshot = (
+        tmp_path
+        / "models--Qwen--Qwen2.5-7B-Instruct"
+        / "snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+    _write_qwen_tokenizer_snapshot(snapshot)
+    original_import = __import__
+
+    def reject_transformers(name: str, *args: object, **kwargs: object) -> object:
+        if name == "transformers":
+            raise AssertionError("tokenizer snapshot preflight imported transformers")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", reject_transformers)
+
+    validate_pinned_qwen_tokenizer_snapshot(snapshot)
 
 
 @pytest.mark.parametrize(

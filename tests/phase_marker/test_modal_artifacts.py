@@ -17,7 +17,9 @@ from phase_marker.modal_artifacts import (
     SOURCE_INCLUDE_PATHS,
     AttemptReceipt,
     BundleFile,
+    ModelCacheManifest,
     build_input_bundle,
+    build_model_cache_manifest,
     create_attempt_id,
     hash_source_tree,
     prepare_ephemeral_workspace,
@@ -25,7 +27,12 @@ from phase_marker.modal_artifacts import (
     require_clean_tracked_status,
     run_exact_command,
     validate_bundle_at_root,
+    validate_model_cache_manifest,
     write_attempt_receipt,
+)
+from phase_marker.token_audit import (
+    QWEN25_7B_TOKENIZER_REVISION,
+    _pinned_tokenizer_snapshot_path,
 )
 import phase_marker.modal_plan as modal_plan
 import phase_marker.modal_artifacts as modal_artifacts
@@ -35,6 +42,188 @@ from tests.phase_marker.test_pipeline import _write_materializations, _write_spl
 CONFIG_PATH = Path("configs/phase-marker-qwen25-7b.toml")
 SOURCE_HASH = "1" * 64
 LOCK_HASH = "2" * 64
+
+
+@pytest.fixture
+def qwen_snapshot(tmp_path: Path) -> Path:
+    snapshot = (
+        tmp_path
+        / "models--Qwen--Qwen2.5-7B-Instruct"
+        / "snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+    snapshot.mkdir(parents=True)
+    for name, payload in (
+        ("config.json", {"model_type": "qwen2"}),
+        ("generation_config.json", {"eos_token_id": 151643}),
+        ("tokenizer.json", {"version": "1.0"}),
+        ("tokenizer_config.json", {"tokenizer_class": "Qwen2Tokenizer"}),
+        (
+            "model.safetensors.index.json",
+            {
+                "metadata": {"total_size": 8},
+                "weight_map": {
+                    "model.layers.0.weight": "model-00001-of-00002.safetensors",
+                    "model.layers.1.weight": "model-00002-of-00002.safetensors",
+                },
+            },
+        ),
+    ):
+        (snapshot / name).write_text(json.dumps(payload), encoding="utf-8")
+    (snapshot / "model-00001-of-00002.safetensors").write_bytes(b"first\n")
+    (snapshot / "model-00002-of-00002.safetensors").write_bytes(b"second\n")
+    return snapshot
+
+
+def test_model_cache_manifest_binds_every_index_shard(qwen_snapshot: Path) -> None:
+    """Would fail if a pinned cache omitted a shard named by its model index."""
+    manifest = build_model_cache_manifest(qwen_snapshot)
+
+    assert manifest.model_revision == QWEN25_7B_TOKENIZER_REVISION
+    assert {item.path for item in manifest.files} >= {
+        "config.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+    }
+    validate_model_cache_manifest(qwen_snapshot, manifest)
+
+
+def test_model_cache_rejects_missing_or_unindexed_shards(qwen_snapshot: Path) -> None:
+    """Would fail if a cache could certify incomplete or surplus weight files."""
+    (qwen_snapshot / "model-00002-of-00002.safetensors").unlink()
+    with pytest.raises(ValueError, match="model shard"):
+        build_model_cache_manifest(qwen_snapshot)
+
+    (qwen_snapshot / "model-00002-of-00002.safetensors").write_bytes(b"second\n")
+    (qwen_snapshot / "surplus.safetensors").write_bytes(b"surplus\n")
+    with pytest.raises(ValueError, match="unindexed"):
+        build_model_cache_manifest(qwen_snapshot)
+
+
+@pytest.mark.parametrize(
+    "index_payload",
+    (
+        [],
+        {"metadata": {"total_size": 8}, "weight_map": {}},
+        {"metadata": [], "weight_map": {"weight": "model-00001-of-00002.safetensors"}},
+        {"metadata": {"total_size": 0}, "weight_map": {"weight": "model-00001-of-00002.safetensors"}},
+        {"metadata": {"total_size": 8}, "weight_map": {"weight": "../escape.safetensors"}},
+    ),
+)
+def test_model_cache_rejects_invalid_index_metadata_and_paths(
+    qwen_snapshot: Path, index_payload: object,
+) -> None:
+    """Would fail if malformed index metadata or traversal named a cache file."""
+    (qwen_snapshot / "model.safetensors.index.json").write_text(
+        json.dumps(index_payload), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="model index|model shard"):
+        build_model_cache_manifest(qwen_snapshot)
+
+
+def test_model_cache_rejects_empty_shard_and_wrong_snapshot_revision(qwen_snapshot: Path) -> None:
+    """Would fail if an empty shard or a same-shaped unpinned snapshot passed."""
+    (qwen_snapshot / "model-00001-of-00002.safetensors").write_bytes(b"")
+    with pytest.raises(ValueError, match="model shard"):
+        build_model_cache_manifest(qwen_snapshot)
+
+    wrong_snapshot = qwen_snapshot.parent / ("0" * 40)
+    qwen_snapshot.rename(wrong_snapshot)
+    with pytest.raises(ValueError, match="pinned Qwen snapshot"):
+        build_model_cache_manifest(wrong_snapshot)
+
+
+def test_model_cache_requires_generation_metadata(qwen_snapshot: Path) -> None:
+    """Would fail if a model cache could omit generation configuration bytes."""
+    (qwen_snapshot / "generation_config.json").unlink()
+
+    with pytest.raises(ValueError, match="required model cache file"):
+        build_model_cache_manifest(qwen_snapshot)
+
+
+def test_model_cache_validation_rejects_changed_bytes_and_manifest_metadata(
+    qwen_snapshot: Path,
+) -> None:
+    """Would fail if validation trusted stale manifest hashes or its declared identity."""
+    manifest = build_model_cache_manifest(qwen_snapshot)
+    (qwen_snapshot / "model-00001-of-00002.safetensors").write_bytes(b"changed\n")
+
+    with pytest.raises(ValueError, match="model cache file hash mismatch"):
+        validate_model_cache_manifest(qwen_snapshot, manifest)
+    with pytest.raises(ValueError, match="schema version"):
+        validate_model_cache_manifest(
+            qwen_snapshot,
+            ModelCacheManifest(
+                schema_version=2,
+                model_id=manifest.model_id,
+                model_revision=manifest.model_revision,
+                files=manifest.files,
+                artifact_id=manifest.artifact_id,
+            ),
+        )
+
+
+def test_model_cache_hashes_symlink_target_bytes(qwen_snapshot: Path, tmp_path: Path) -> None:
+    """Would fail if a snapshot symlink name, rather than its bytes, became identity."""
+    target = qwen_snapshot.parent.parent / "blobs/blob-a"
+    target.parent.mkdir()
+    target.write_bytes(b"first\n")
+    shard = qwen_snapshot / "model-00001-of-00002.safetensors"
+    shard.unlink()
+    shard.symlink_to(target)
+    first = build_model_cache_manifest(qwen_snapshot)
+    target.write_bytes(b"mutated\n")
+
+    with pytest.raises(ValueError, match="model cache file hash mismatch"):
+        validate_model_cache_manifest(qwen_snapshot, first)
+
+
+def test_model_cache_rejects_shard_symlink_outside_pinned_cache(
+    qwen_snapshot: Path, tmp_path: Path,
+) -> None:
+    """Would fail if a pinned cache shard could resolve to unrelated host bytes."""
+    target = tmp_path / "outside-blob"
+    target.write_bytes(b"first\n")
+    shard = qwen_snapshot / "model-00001-of-00002.safetensors"
+    shard.unlink()
+    shard.symlink_to(target)
+
+    with pytest.raises(ValueError, match="model shard"):
+        build_model_cache_manifest(qwen_snapshot)
+
+
+def test_model_cache_rejects_a_snapshot_directory_symlink(qwen_snapshot: Path) -> None:
+    """Would fail if a pinned revision path could silently point at another snapshot."""
+    source = qwen_snapshot.parent / "other-snapshot"
+    qwen_snapshot.rename(source)
+    qwen_snapshot.symlink_to(source, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="pinned Qwen snapshot"):
+        build_model_cache_manifest(qwen_snapshot)
+
+
+def test_real_pinned_qwen_model_cache_is_valid_when_full_offline_snapshot_exists() -> None:
+    """Probe only an already-local full cache; never ask Hugging Face for a shard."""
+    snapshot = _pinned_tokenizer_snapshot_path("Qwen/Qwen2.5-7B-Instruct")
+    try:
+        index = json.loads((snapshot / "model.safetensors.index.json").read_text(encoding="utf-8"))
+        weight_map = index["weight_map"]
+        shards = sorted(set(weight_map.values()))
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        pytest.skip("pinned Qwen model index is not locally cached")
+    if len(shards) != 4 or not all(
+        isinstance(name, str) and (snapshot / name).is_file() for name in shards
+    ):
+        pytest.skip("all four pinned Qwen model shards are not locally cached")
+
+    manifest = build_model_cache_manifest(snapshot)
+
+    validate_model_cache_manifest(snapshot, manifest)
 
 
 def receipt_fixture(**changes: object) -> AttemptReceipt:

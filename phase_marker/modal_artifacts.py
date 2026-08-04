@@ -15,7 +15,9 @@ import tempfile
 from typing import Protocol
 import uuid
 
+from phase_marker.config import REQUIRED_MODEL_ID
 from phase_marker.io import canonical_json, sha256_json
+from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
 
 
 SOURCE_INCLUDE_PATHS = ("phase_marker/**/*.py", "modal_phase_marker.py")
@@ -43,6 +45,13 @@ _SHA256_CHARS = frozenset("0123456789abcdef")
 _PILOT_KIND = "pilot"
 _PILOT_SEED = 42
 _WORKSPACE_METADATA = "workspace-metadata.json"
+_MODEL_CACHE_REQUIRED_FILES = (
+    "config.json",
+    "generation_config.json",
+    "model.safetensors.index.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+)
 
 
 class VolumeClient(Protocol):
@@ -65,6 +74,26 @@ class InputBundle:
     bundle_id: str
     files: tuple[BundleFile, ...]
     artifact_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ModelCacheFile:
+    """One content-addressed file in the immutable pinned model cache."""
+
+    path: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ModelCacheManifest:
+    """Exact local Qwen model cache required by a later Modal adapter."""
+
+    schema_version: int
+    model_id: str
+    model_revision: str
+    files: tuple[ModelCacheFile, ...]
+    artifact_id: str
 
 
 @dataclass(frozen=True)
@@ -549,6 +578,181 @@ def hash_source_tree(repo_root: Path) -> str:
         for path in sorted(paths, key=lambda value: value.relative_to(root).as_posix())
     ]
     return sha256_json(records)
+
+
+def build_model_cache_manifest(snapshot: Path) -> ModelCacheManifest:
+    """Build an exact, content-addressed manifest for one pinned local Qwen snapshot."""
+    root = _pinned_qwen_snapshot_root(snapshot)
+    paths = _model_cache_paths(root)
+    files = tuple(_model_cache_file(root, path) for path in paths)
+    manifest = ModelCacheManifest(
+        schema_version=1,
+        model_id=REQUIRED_MODEL_ID,
+        model_revision=QWEN25_7B_TOKENIZER_REVISION,
+        files=files,
+        artifact_id=_model_cache_artifact_id(
+            schema_version=1,
+            model_id=REQUIRED_MODEL_ID,
+            model_revision=QWEN25_7B_TOKENIZER_REVISION,
+            files=files,
+        ),
+    )
+    # Re-read every record to fail closed if a cache changes while being described.
+    validate_model_cache_manifest(root, manifest)
+    return manifest
+
+
+def validate_model_cache_manifest(snapshot: Path, manifest: ModelCacheManifest) -> None:
+    """Fail closed unless manifest metadata and every pinned cache byte still match."""
+    root = _pinned_qwen_snapshot_root(snapshot)
+    _validate_model_cache_manifest_shape(manifest)
+    expected_paths = _model_cache_paths(root)
+    actual_paths = tuple(item.path for item in manifest.files)
+    if actual_paths != expected_paths:
+        raise ValueError("model cache file paths do not match the exact pinned cache")
+    for item in manifest.files:
+        actual = _model_cache_file(root, item.path)
+        if actual.size != item.size or actual.sha256 != item.sha256:
+            raise ValueError(f"model cache file hash mismatch: {item.path}")
+
+
+def _pinned_qwen_snapshot_root(snapshot: Path) -> Path:
+    root = Path(snapshot)
+    if (
+        root.name != QWEN25_7B_TOKENIZER_REVISION
+        or root.parent.name != "snapshots"
+        or root.parent.parent.name != "models--Qwen--Qwen2.5-7B-Instruct"
+    ):
+        raise ValueError(f"pinned Qwen snapshot path is not bound to the exact revision: {root}")
+    if root.is_symlink():
+        raise ValueError(f"pinned Qwen snapshot directory must not be a symlink: {root}")
+    if not root.is_dir():
+        raise ValueError(f"pinned Qwen snapshot directory is missing: {root}")
+    return root
+
+
+def _model_cache_paths(snapshot: Path) -> tuple[str, ...]:
+    shards = _model_index_shards(snapshot)
+    found_shards = tuple(
+        sorted(
+            path.relative_to(snapshot).as_posix()
+            for path in snapshot.rglob("*.safetensors")
+            if path.is_file() or path.is_symlink()
+        )
+    )
+    if found_shards != shards:
+        raise ValueError("model cache contains unindexed or missing model shards")
+    return tuple(sorted((*_MODEL_CACHE_REQUIRED_FILES, *shards)))
+
+
+def _model_index_shards(snapshot: Path) -> tuple[str, ...]:
+    index_path = snapshot / "model.safetensors.index.json"
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"model index is missing or invalid: {index_path}") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError("model index must be an object")
+    metadata = payload.get("metadata")
+    weight_map = payload.get("weight_map")
+    total_size = metadata.get("total_size") if isinstance(metadata, Mapping) else None
+    if (
+        not isinstance(metadata, Mapping)
+        or not isinstance(total_size, int)
+        or isinstance(total_size, bool)
+        or total_size <= 0
+    ):
+        raise ValueError("model index metadata is invalid")
+    if not isinstance(weight_map, Mapping) or not weight_map:
+        raise ValueError("model index weight_map is invalid")
+    shards: set[str] = set()
+    for tensor_name, shard_name in weight_map.items():
+        if not isinstance(tensor_name, str) or not tensor_name:
+            raise ValueError("model index weight_map is invalid")
+        if not isinstance(shard_name, str) or not _is_model_shard_path(shard_name):
+            raise ValueError("model shard path is invalid")
+        shards.add(shard_name)
+    return tuple(sorted(shards))
+
+
+def _is_model_shard_path(value: str) -> bool:
+    candidate = PurePosixPath(value)
+    return (
+        bool(value)
+        and not candidate.is_absolute()
+        and "." not in candidate.parts
+        and ".." not in candidate.parts
+        and candidate.suffix == ".safetensors"
+    )
+
+
+def _model_cache_file(snapshot: Path, relative_path: str) -> ModelCacheFile:
+    if relative_path not in _MODEL_CACHE_REQUIRED_FILES and not _is_model_shard_path(relative_path):
+        raise ValueError(f"model cache file path is invalid: {relative_path}")
+    path = snapshot / relative_path
+    if not path.is_file():
+        if relative_path.endswith(".safetensors"):
+            raise ValueError(f"model shard is missing or not a regular file: {relative_path}")
+        raise ValueError(f"required model cache file is missing: {relative_path}")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"model cache file cannot be resolved: {relative_path}") from error
+    if not resolved.is_file():
+        raise ValueError(f"model cache file is not a regular file: {relative_path}")
+    if path.is_symlink() and not _is_within(resolved, snapshot.parent.parent.resolve()):
+        raise ValueError(f"model shard symlink is outside the pinned cache: {relative_path}")
+    size = resolved.stat().st_size
+    if size <= 0:
+        if relative_path.endswith(".safetensors"):
+            raise ValueError(f"model shard is empty: {relative_path}")
+        raise ValueError(f"required model cache file is empty: {relative_path}")
+    return ModelCacheFile(relative_path, size, _file_sha256(resolved))
+
+
+def _model_cache_artifact_id(
+    *, schema_version: int, model_id: str, model_revision: str, files: tuple[ModelCacheFile, ...],
+) -> str:
+    return sha256_json(
+        {
+            "schema_version": schema_version,
+            "model_id": model_id,
+            "model_revision": model_revision,
+            "files": [asdict(item) for item in files],
+        }
+    )
+
+
+def _validate_model_cache_manifest_shape(manifest: ModelCacheManifest) -> None:
+    if not isinstance(manifest, ModelCacheManifest):
+        raise ValueError("model cache manifest is invalid")
+    if manifest.schema_version != 1:
+        raise ValueError("model cache schema version is invalid")
+    if manifest.model_id != REQUIRED_MODEL_ID or manifest.model_revision != QWEN25_7B_TOKENIZER_REVISION:
+        raise ValueError("model cache identity is invalid")
+    paths = tuple(item.path for item in manifest.files)
+    if (
+        not manifest.files
+        or paths != tuple(sorted(paths))
+        or len(paths) != len(set(paths))
+        or any(
+            not isinstance(item, ModelCacheFile)
+            or not isinstance(item.size, int)
+            or isinstance(item.size, bool)
+            or item.size <= 0
+            or not _is_sha256(item.sha256)
+            for item in manifest.files
+        )
+    ):
+        raise ValueError("model cache file metadata is invalid")
+    expected_id = _model_cache_artifact_id(
+        schema_version=manifest.schema_version,
+        model_id=manifest.model_id,
+        model_revision=manifest.model_revision,
+        files=manifest.files,
+    )
+    if manifest.artifact_id != expected_id:
+        raise ValueError("model cache artifact ID is noncanonical")
 
 
 def build_input_bundle(repo_root: Path) -> InputBundle:

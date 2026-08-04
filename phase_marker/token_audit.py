@@ -400,10 +400,17 @@ def _is_valid_qwen_tokenizer_json(payload: Mapping[str, object] | None) -> bool:
     )
 
 
-def _load_cached_tokenizer(model_id: str) -> object:
-    snapshot = _pinned_tokenizer_snapshot_path(model_id)
+def validate_pinned_qwen_tokenizer_snapshot(snapshot: Path) -> None:
+    """Fail before Transformers unless snapshot is the pinned Qwen JSON-BPE layout."""
+    snapshot = Path(snapshot)
     if not snapshot.is_dir():
         raise FileNotFoundError(f"missing pinned tokenizer snapshot directory: {snapshot}")
+    if (
+        snapshot.name != QWEN25_7B_TOKENIZER_REVISION
+        or snapshot.parent.name != "snapshots"
+        or snapshot.parent.parent.name != "models--Qwen--Qwen2.5-7B-Instruct"
+    ):
+        raise ValueError(f"tokenizer snapshot is not bound to the pinned Qwen revision: {snapshot}")
     if (
         not _is_valid_qwen_tokenizer_config(
             _read_json_object(snapshot / "tokenizer_config.json")
@@ -415,6 +422,11 @@ def _load_cached_tokenizer(model_id: str) -> object:
         raise FileNotFoundError(
             f"pinned tokenizer snapshot lacks valid Qwen JSON-BPE assets: {snapshot}"
         )
+
+
+def _load_cached_tokenizer(model_id: str) -> object:
+    snapshot = _pinned_tokenizer_snapshot_path(model_id)
+    validate_pinned_qwen_tokenizer_snapshot(snapshot)
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
