@@ -22,7 +22,7 @@
 - Input and model volumes are read-only inside GPU jobs; only the run volume is writable.
 - Never overwrite a canonical input, model snapshot, checkpoint, selection, receipt, or summary.
 - Receipts and logs live outside hashed checkpoint and selection directories.
-- Ordinary tests and `plan` are offline and perform no Modal/Hugging Face calls or remote writes.
+- Ordinary tests and `python -m phase_marker.modal_plan plan` are offline and perform no Modal/Hugging Face calls or remote writes; no `modal run` command is described as offline.
 - Do not execute `stage-inputs`, `cache-model`, CPU remote smoke, `run-stage-a`, deployment, or a GPU command while implementing this plan.
 - The implementation handoff must request fresh authorization separately for exact input upload/cache commands and the exact Stage A H100 command.
 - Never include local Modal credentials, `.modal.toml`, tokens, `.git`, arbitrary artifacts, or model outputs in an image or input bundle; a later authentication need must use a named Modal Secret without recording its value.
@@ -228,7 +228,7 @@ git commit -m "feat: plan immutable Modal pilot workload"
 **Interfaces:**
 - Consumes: repository root, approved artifact root, `sha256_json`, and `canonical_json`.
 - Produces: `BundleFile`, `InputBundle`, a Modal-independent `VolumeClient` `Protocol`, `SOURCE_INCLUDE_PATHS`, `INPUT_ALLOWLIST`, `require_clean_tracked_status(status: str) -> None`, `hash_source_tree(repo_root: Path) -> str`, `build_input_bundle(repo_root: Path) -> InputBundle`, and `validate_bundle_at_root(bundle: InputBundle, root: Path) -> None`.
-- CLI: `python -m phase_marker.modal_plan run-id --repo-root PATH --config PATH --artifact-root PATH --dependency-lock PATH` prints only the full canonical run ID.
+- CLI: `python -m phase_marker.modal_plan plan --repo-root PATH --config PATH --artifact-root PATH --dependency-lock PATH` prints canonical plan JSON; the sibling `run-id` subcommand prints only the full canonical run ID.
 
 - [ ] **Step 1: Write failing allowlist, dirtiness, and hash tests**
 
@@ -330,11 +330,11 @@ or bundle whose file hashes change between the first and second read.
 
 - [ ] **Step 5: Add the pure run-ID CLI**
 
-Add an `argparse` `run-id` subcommand that resolves all paths beneath
+Add `argparse` `plan` and `run-id` subcommands that resolve all paths beneath
 `--repo-root`, hashes the tracked source tree and dependency lock, builds the
-exact bundle and plan, and prints only `plan.run_id`. Test `main(argv)` with
-`capsys`; it must make no Modal, Hugging Face, network, or filesystem-write
-call.
+exact bundle and plan, and print canonical JSON or only `plan.run_id`,
+respectively. Test `main(argv)` with `capsys`; both paths must make no Modal,
+Hugging Face, network, subprocess, or filesystem-write call.
 
 - [ ] **Step 6: Run focused tests and commit**
 
@@ -664,8 +664,7 @@ attempts authentication, hydration, deployment, client RPC, or a remote call.
 
 Test `apply_approved_app_tags` separately: it must call `app.set_tags` only
 after plan/run-ID validation and preserve `experiment`, `run-kind`, and `seed`
-while adding the full `run-id`. The local `plan` and read-only `status` paths
-must never call it.
+while adding the full `run-id`. The read-only `status` path must never call it.
 
 - [ ] **Step 3: Implement image, app, and volume declarations**
 
@@ -720,12 +719,13 @@ Use `.read_only()` on input/model volumes in GPU decorators because that is the
 Modal 1.3.5 API installed in this workspace. Do not use the newer
 `with_mount_options` spelling.
 
-- [ ] **Step 4: Add inert local `plan` entrypoint**
+- [ ] **Step 4: Keep offline planning outside the Modal adapter**
 
-The entrypoint may read the repository and run `git status --porcelain
---untracked-files=no`, then call the pure planner. It must not instantiate a
-remote function or create a volume. Print `canonical_json(pilot_plan_payload)`.
-Test it by injecting repository/status functions; assert zero fake remote calls.
+Do not add a Modal `plan` entrypoint: `modal run` hydrates an app even for local
+entrypoints. Test the Task 2 pure CLI while the fake Modal module records the
+adapter import; the Python CLI must print canonical plan JSON with zero Modal
+imports or fake calls, while importing the adapter may only create inert local
+declarations and must perform zero client RPCs.
 
 - [ ] **Step 5: Run adapter tests and commit**
 
@@ -896,7 +896,7 @@ git commit -m "feat: stage Modal inputs and model cache"
 
 **Interfaces:**
 - Consumes: approved serialized `PilotPlan`, canonical bundle/model cache, one `PilotJob`, and three volumes.
-- Produces: remote `run_training_job(job_payload: dict[str, object]) -> dict[str, object]`, remote `run_selection_job(job_payload: dict[str, object]) -> dict[str, object]`, `finalize_stage_a(plan_payload: Mapping[str, object], receipts: Sequence[Mapping[str, object]]) -> dict[str, object]`, `run_stage_a_local(plan: PilotPlan, *, approved_run_id: str, budget_acknowledged: bool, training_function: RemoteFunction, selection_function: RemoteFunction, runs_client: VolumeClient) -> dict[str, object]`, and the `run-stage-a` entrypoint.
+- Produces: remote `run_training_job(job_payload: dict[str, object]) -> dict[str, object]`, remote `run_selection_job(job_payload: dict[str, object]) -> dict[str, object]`, remote `finalize_stage_a_remote(plan_payload: Mapping[str, object], receipts: Sequence[Mapping[str, object]]) -> dict[str, object]`, `run_stage_a_local(plan: PilotPlan, *, approved_run_id: str, budget_acknowledged: bool, resume: bool, training_function: RemoteFunction, selection_function: RemoteFunction, finalizer_function: RemoteFunction, runs_client: VolumeClient) -> dict[str, object]`, and the `run-stage-a` entrypoint.
 
 - [ ] **Step 1: Write failing resource and stage-order tests**
 
@@ -924,8 +924,10 @@ def test_training_failure_prevents_every_selection(fake_adapter, plan):
             plan,
             approved_run_id=plan.run_id,
             budget_acknowledged=True,
+            resume=False,
             training_function=fake_adapter.training_function,
             selection_function=fake_adapter.selection_function,
+            finalizer_function=fake_adapter.finalizer_function,
             runs_client=fake_adapter.runs_client,
         )
     assert fake_adapter.selection_calls == []
@@ -979,7 +981,9 @@ Inside `_execute_job`: validate plan/job/bundle/cache before importing model
 packages, create a fresh UUID attempt and ephemeral workspace, execute with
 `shell=False`, call existing pipeline producer/consumer validators, observe GPU
 identity through a bounded `nvidia-smi --query-gpu=name --format=csv,noheader`
-call, write receipt/log, promote once, commit, and return canonical receipt JSON.
+call, require exactly one visible CUDA device and
+`torch.cuda.is_bf16_supported()` before the experiment command, write
+receipt/log, promote once, commit, and return canonical receipt JSON.
 
 Catch exceptions only to persist a failed receipt and log; re-raise afterward.
 Never turn an exception into a successful map result.
@@ -990,8 +994,9 @@ Never turn an exception into a successful map result.
 
 1. require exact `approved_run_id` and environment-budget acknowledgement,
    then call `apply_approved_app_tags(plan)` before the first remote action;
-2. re-run local preflight, revalidate every existing canonical receipt and
-   producer manifest, and abort before remote work on any mismatch;
+2. re-run local preflight; with `resume=False`, reject any canonical output;
+   with `resume=True`, revalidate every existing canonical receipt and producer
+   manifest and abort before remote work on any mismatch;
 3. derive a frozen-order resume plan containing only missing canonical training
    arms, print it for the operator, and invoke `run_training_job.map` only for
    those arms;
@@ -1004,18 +1009,24 @@ Never turn an exception into a successful map result.
 7. require six successful validated selection receipts across existing and new
    outputs;
 8. call `runs_volume.reload()` before finalization;
-9. run the existing behavior prerequisite gate as read-only validation; and
+9. call CPU-only `finalize_stage_a_remote` with the run volume mounted,
+   re-run the existing behavior prerequisite gate as read-only validation; and
 10. publish a Stage A summary whose `next_command` is inert data and whose
     `stopped_before_behavior` is exactly `true`.
 
 The summary schema must reject an executable callback, confirmation seeds, or
 mechanism approval. No code path calls the behavior command.
 
+Decorate `finalize_stage_a_remote` with `cpu_image`, bounded CPU/memory/timeout,
+zero retries, read-only input/model mounts, and the writable run volume. It
+must not request a GPU or import/load model weights.
+
 - [ ] **Step 5: Run fake end-to-end Stage A tests**
 
 Test all six arms through fake remote functions, a training error, a selection
-error, a corrupt canonical output, a mismatched run ID, a partial valid resume,
-and a successful summary. Assert exactly 12 GPU calls and zero behavior calls
+error, a corrupt canonical output, a mismatched run ID, initial-mode refusal of
+existing outputs, a partial valid explicit resume, and a successful summary.
+Assert exactly 12 GPU calls plus one CPU finalizer call and zero behavior calls
 in the clean successful case; assert the resume case calls only missing arms
 and never deletes or overwrites an existing attempt or canonical output.
 
@@ -1094,14 +1105,21 @@ PHASE_MARKER_RUN_ID="$(./.venv/bin/python -m phase_marker.modal_plan run-id \
   --artifact-root artifacts/phase-marker \
   --dependency-lock requirements-modal-phase-marker.txt)"
 
-# Local only: print the canonical plan; no remote call, write, model load, or GPU.
-modal run modal_phase_marker.py::plan
+# Local only: print the canonical plan; no Modal import, remote call, write, model load, or GPU.
+./.venv/bin/python -m phase_marker.modal_plan plan \
+  --repo-root . \
+  --config configs/phase-marker-qwen25-7b.toml \
+  --artifact-root artifacts/phase-marker \
+  --dependency-lock requirements-modal-phase-marker.txt
 
 # External writes/compute shown for handoff only; do not execute without fresh approval.
 modal run modal_phase_marker.py::stage-inputs --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
 modal run modal_phase_marker.py::cache-model --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
 modal run modal_phase_marker.py::smoke --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
 modal run modal_phase_marker.py::run-stage-a --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
+
+# Explicit crash recovery only; first inspect status and approve the printed missing-arm plan.
+modal run modal_phase_marker.py::run-stage-a --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000 --resume
 
 # Read-only remote inspection after an authorized run.
 modal run modal_phase_marker.py::status --run-id "$PHASE_MARKER_RUN_ID"

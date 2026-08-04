@@ -103,16 +103,20 @@ fails unless that output contains exactly six pilot jobs in frozen arm order,
 all at seed `42`, with complete approval metadata and the pinned revision.
 
 The planner has no Modal import and no network, filesystem-write, or subprocess
-side effects. Its dry run prints canonical JSON only.
+side effects. `python -m phase_marker.modal_plan plan` prints canonical JSON;
+the narrower `run-id` subcommand prints only the full run ID. These are the
+only commands described as offline planning commands because `modal run`
+hydrates an app even when its target is a local entrypoint.
 
 ### Thin Modal adapter
 
 `modal_phase_marker.py` defines one dedicated app, tagged for cost attribution,
-and exposes explicit operator entrypoints:
+and exposes explicit remote operator entrypoints:
 
-- `plan`: local and read-only; print the exact workload and hashes.
 - `stage-inputs`: upload only the approved input bundle.
 - `cache-model`: download and verify the pinned Qwen snapshot on CPU.
+- `smoke`: validate locked imports, source, staged inputs, and model cache on
+  CPU and publish a smoke receipt.
 - `run-stage-a`: run six training jobs, validate them, run six selections,
   validate them, publish a compact summary, and stop.
 - `status`: inspect existing receipts and canonical outputs without mutation.
@@ -234,8 +238,11 @@ approval-ready pilot command generation using:
 - mechanism jobs explicitly excluded.
 
 Preflight also verifies the staged input bundle, model-cache manifest, source
-and lock hashes, exact empty canonical output paths, and the environment-budget
-operator acknowledgement. It performs no cleanup or overwrite.
+and lock hashes, and the environment-budget operator acknowledgement. A normal
+initial launch requires exact empty canonical output paths. An explicitly
+requested `--resume` launch revalidates every existing canonical parent and
+receipt, prints a new missing-arm plan, and schedules only absent canonical
+outputs. Both modes perform no cleanup or overwrite.
 
 ### Training fan-out
 
