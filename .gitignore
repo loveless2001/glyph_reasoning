@@ -155,6 +155,7 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific results/logs
+.worktrees/
 experiments/results.txt
 experiments/results_cleaned.txt
 experiments/*.png
