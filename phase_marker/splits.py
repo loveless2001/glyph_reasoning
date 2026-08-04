@@ -7,8 +7,10 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Protocol
 import unicodedata
@@ -24,6 +26,7 @@ SVAMP_DATASET = ("ChilleD/SVAMP", None, "main")
 MATH_DATASET = ("EleutherAI/hendrycks_math", "all", "main")
 VALIDATION_PER_SOURCE = 300
 SVAMP_TEST_SIZE = 1000
+IMMUTABLE_REVISION = re.compile(r"[0-9a-f]{40}", re.IGNORECASE)
 
 
 class SplitOverlapError(ValueError):
@@ -106,10 +109,12 @@ def build_split_bundle(
     loader: DatasetLoader,
     source_traces: Sequence[CanonicalTrace],
     unified_rows: Sequence[Mapping[str, object]],
+    *,
+    dataset_specs: Sequence[Mapping[str, object]] | None = None,
 ) -> SplitBundle:
     """Build the full benchmark bundle before emitting any manifest files."""
     del config  # The frozen config is an explicit pipeline dependency and manifest parent.
-    official = _load_official_rows(loader)
+    official = _load_official_rows(loader, dataset_specs or _dataset_specs())
     recovered, exclusions = _recover_training_traces(source_traces, unified_rows)
 
     train = tuple(
@@ -157,11 +162,22 @@ def assert_disjoint_splits(bundle: SplitBundle) -> None:
             seen[row.question_hash] = (split_name, row)
 
 
-def write_split_bundle(output_root: Path, config: ExperimentConfig, bundle: SplitBundle) -> None:
+def write_split_bundle(
+    output_root: Path,
+    config: ExperimentConfig,
+    bundle: SplitBundle,
+    *,
+    dataset_specs: Sequence[Mapping[str, object]] | None = None,
+    input_lineage: Mapping[str, Mapping[str, str]] | None = None,
+    source_pool_accounting: Mapping[str, int] | None = None,
+) -> None:
     """Atomically publish a complete immutable bundle, never a partial manifest."""
     if output_root.exists():
         raise FileExistsError(f"refusing to overwrite frozen split manifests: {output_root}")
     assert_disjoint_splits(bundle)
+    frozen_specs = _validate_frozen_dataset_specs(dataset_specs or _dataset_specs())
+    frozen_lineage = _validate_input_lineage(input_lineage)
+    accounting = _validate_source_pool_accounting(source_pool_accounting)
     output_root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output_root.parent, prefix=f".{output_root.name}-") as temporary:
         staging = Path(temporary)
@@ -180,15 +196,16 @@ def write_split_bundle(output_root: Path, config: ExperimentConfig, bundle: Spli
                     "validation": [_row(row) for row in bundle.validation],
                     "test": [_row(row) for row in bundle.test],
                     "exclusions": [_row(row) for row in bundle.exclusions],
+                    "datasets": frozen_specs,
+                    "input_lineage": frozen_lineage,
+                    "source_pool_accounting": accounting,
                 }
             ),
             "config_hash": sha256_json(asdict(config)),
-            "dataset_revisions": {
-                "gsm8k": GSM8K_DATASET[2],
-                "svamp": SVAMP_DATASET[2],
-                "math": MATH_DATASET[2],
-            },
+            "datasets": frozen_specs,
+            "input_lineage": frozen_lineage,
             "overlap_count": 0,
+            "source_pool_accounting": accounting,
             "source_counts": {
                 name: dict(sorted(Counter(row.source for row in rows).items()))
                 for name, rows in (
@@ -203,23 +220,34 @@ def write_split_bundle(output_root: Path, config: ExperimentConfig, bundle: Spli
         staging.replace(output_root)
 
 
-def _load_official_rows(loader: DatasetLoader) -> dict[str, dict[str, tuple[DatasetExample, ...]]]:
+def _load_official_rows(
+    loader: DatasetLoader, dataset_specs: Sequence[Mapping[str, object]]
+) -> dict[str, dict[str, tuple[DatasetExample, ...]]]:
+    specs = {
+        (_required_spec_text(spec, "source"), _required_spec_text(spec, "requested_split")): spec
+        for spec in dataset_specs
+    }
+    gsm_train_spec = specs[("gsm8k", "train")]
     gsm_train = _examples_from_rows(
-        "gsm8k", "train", loader.load(GSM8K_DATASET[0], GSM8K_DATASET[1], "train", GSM8K_DATASET[2])
+        "gsm8k", "train", _load_spec(loader, gsm_train_spec)
     )
+    gsm_test_spec = specs[("gsm8k", "test")]
     gsm_test = _examples_from_rows(
-        "gsm8k", "test", loader.load(GSM8K_DATASET[0], GSM8K_DATASET[1], "test", GSM8K_DATASET[2])
+        "gsm8k", "test", _load_spec(loader, gsm_test_spec)
     )
+    svamp_spec = specs[("svamp", "train")]
     svamp_test = _examples_from_rows(
-        "svamp", "test", loader.load(SVAMP_DATASET[0], SVAMP_DATASET[1], "train", SVAMP_DATASET[2])
+        "svamp", "test", _load_spec(loader, svamp_spec)
     )
     if len(svamp_test) != SVAMP_TEST_SIZE:
         raise ValueError(f"SVAMP held-out dataset must contain exactly {SVAMP_TEST_SIZE} rows, got {len(svamp_test)}")
+    math_train_spec = specs[("math", "train")]
     math_train = _examples_from_rows(
-        "math", "train", loader.load(MATH_DATASET[0], MATH_DATASET[1], "train", MATH_DATASET[2])
+        "math", "train", _load_spec(loader, math_train_spec)
     )
+    math_test_spec = specs[("math", "test")]
     math_test = _examples_from_rows(
-        "math", "test", loader.load(MATH_DATASET[0], MATH_DATASET[1], "test", MATH_DATASET[2])
+        "math", "test", _load_spec(loader, math_test_spec)
     )
     return {
         "gsm8k": {"train": gsm_train, "test": gsm_test},
@@ -231,25 +259,32 @@ def _load_official_rows(loader: DatasetLoader) -> dict[str, dict[str, tuple[Data
 def _recover_training_traces(
     traces: Sequence[CanonicalTrace], unified_rows: Sequence[Mapping[str, object]]
 ) -> tuple[list[tuple[str, CanonicalTrace]], list[DatasetExample]]:
-    sources_by_question: dict[str, set[str]] = defaultdict(set)
-    for row in unified_rows:
+    rows_by_question: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for index, row in enumerate(unified_rows):
         question = _required_text(row, "question")
         source = _required_text(row, "source").casefold()
-        sources_by_question[normalize_question(question)].add(source)
+        rows_by_question[normalize_question(question)].append((source, _unified_row_id(row, index)))
 
     recovered: list[tuple[str, CanonicalTrace]] = []
     exclusions: list[DatasetExample] = []
     for trace in traces:
-        sources = sources_by_question.get(normalize_question(trace.question), set())
-        if len(sources) == 1:
-            recovered.append((next(iter(sources)), trace))
-        elif not sources:
+        matches = rows_by_question.get(normalize_question(trace.question), [])
+        if len(matches) == 1:
+            recovered.append((matches[0][0], trace))
+        elif not matches:
             exclusions.append(
                 _example("unknown", "excluded_unmatched", trace.trace_id, trace.question, trace.answer)
             )
         else:
+            candidates = ",".join(f"{source}:{row_id}" for source, row_id in matches)
             exclusions.append(
-                _example("unknown", "excluded_ambiguous", trace.trace_id, trace.question, trace.answer)
+                _example(
+                    "unknown",
+                    "excluded_ambiguous",
+                    f"{trace.trace_id}|candidates={candidates}",
+                    trace.question,
+                    trace.answer,
+                )
             )
     return recovered, exclusions
 
@@ -363,14 +398,158 @@ def _row(row: DatasetExample) -> dict[str, str]:
     }
 
 
-def _parse_traces(path: Path) -> tuple[CanonicalTrace, ...]:
+def parse_trace_pool(
+    path: Path,
+) -> tuple[tuple[CanonicalTrace, ...], tuple[DatasetExample, ...], dict[str, int]]:
     traces: list[CanonicalTrace] = []
-    for row in read_jsonl(path):
-        try:
-            traces.append(parse_legacy_trace(row))
-        except TraceParseError:
-            continue
-    return tuple(traces)
+    exclusions: list[DatasetExample] = []
+    input_rows = 0
+    with path.open(encoding="utf-8") as handle:
+        rows = enumerate(handle, start=1)
+        for line_number, line in rows:
+            if not line.strip():
+                continue
+            input_rows += 1
+            try:
+                row = json.loads(line)
+                if not isinstance(row, Mapping):
+                    raise TraceParseError("invalid_row")
+                traces.append(parse_legacy_trace(row))
+            except json.JSONDecodeError:
+                exclusions.append(_parse_exclusion(line_number, "invalid_json"))
+            except TraceParseError as error:
+                exclusions.append(_parse_exclusion(line_number, error.code))
+    accounting = {
+        "input_rows": input_rows,
+        "parsed": len(traces),
+        "parse_exclusions": len(exclusions),
+    }
+    return tuple(traces), tuple(exclusions), accounting
+
+
+def _dataset_specs(
+    *, gsm8k_revision: str = GSM8K_DATASET[2], svamp_revision: str = SVAMP_DATASET[2], math_revision: str = MATH_DATASET[2]
+) -> tuple[dict[str, object], ...]:
+    return (
+        _dataset_spec("gsm8k", GSM8K_DATASET[0], GSM8K_DATASET[1], "train", gsm8k_revision),
+        _dataset_spec("gsm8k", GSM8K_DATASET[0], GSM8K_DATASET[1], "test", gsm8k_revision),
+        _dataset_spec("svamp", SVAMP_DATASET[0], SVAMP_DATASET[1], "train", svamp_revision),
+        _dataset_spec("math", MATH_DATASET[0], MATH_DATASET[1], "train", math_revision),
+        _dataset_spec("math", MATH_DATASET[0], MATH_DATASET[1], "test", math_revision),
+    )
+
+
+def _dataset_spec(
+    source: str, dataset_id: str, config: str | None, requested_split: str, revision: str
+) -> dict[str, object]:
+    return {
+        "source": source,
+        "dataset_id": dataset_id,
+        "config": config,
+        "requested_split": requested_split,
+        "revision": revision,
+    }
+
+
+def _load_spec(loader: DatasetLoader, spec: Mapping[str, object]) -> Sequence[Mapping[str, object]]:
+    config = spec.get("config")
+    if config is not None and not isinstance(config, str):
+        raise ValueError("dataset config must be a string or null")
+    return loader.load(
+        _required_spec_text(spec, "dataset_id"),
+        config,
+        _required_spec_text(spec, "requested_split"),
+        _required_spec_text(spec, "revision"),
+    )
+
+
+def _validate_frozen_dataset_specs(
+    dataset_specs: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    expected = {
+        ("gsm8k", "gsm8k", "main", "train"),
+        ("gsm8k", "gsm8k", "main", "test"),
+        ("svamp", "ChilleD/SVAMP", None, "train"),
+        ("math", "EleutherAI/hendrycks_math", "all", "train"),
+        ("math", "EleutherAI/hendrycks_math", "all", "test"),
+    }
+    normalized = [dict(spec) for spec in dataset_specs]
+    actual = {
+        (spec.get("source"), spec.get("dataset_id"), spec.get("config"), spec.get("requested_split"))
+        for spec in normalized
+    }
+    if actual != expected or len(normalized) != len(expected):
+        raise ValueError("frozen publication requires complete dataset specs")
+    for spec in normalized:
+        revision = _required_spec_text(spec, "revision")
+        if IMMUTABLE_REVISION.fullmatch(revision) is None:
+            raise ValueError(
+                f"frozen publication requires immutable commit revision for {spec['dataset_id']}: {revision}"
+            )
+    return normalized
+
+
+def _validate_input_lineage(
+    input_lineage: Mapping[str, Mapping[str, str]] | None,
+) -> dict[str, dict[str, str]]:
+    if input_lineage is None:
+        raise ValueError("frozen publication requires trace and unified input lineage")
+    normalized: dict[str, dict[str, str]] = {}
+    for name in ("traces", "unified"):
+        item = input_lineage.get(name)
+        if not isinstance(item, Mapping):
+            raise ValueError(f"frozen publication requires {name} input lineage")
+        path = item.get("path")
+        digest = item.get("sha256")
+        if not isinstance(path, str) or not path or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest, re.IGNORECASE):
+            raise ValueError(f"invalid {name} input lineage")
+        normalized[name] = {"path": path, "sha256": digest}
+    return normalized
+
+
+def _validate_source_pool_accounting(
+    source_pool_accounting: Mapping[str, int] | None,
+) -> dict[str, int]:
+    if source_pool_accounting is None:
+        raise ValueError("frozen publication requires source-pool accounting")
+    expected_keys = {"input_rows", "parsed", "parse_exclusions"}
+    if set(source_pool_accounting) != expected_keys or any(
+        not isinstance(value, int) or value < 0 for value in source_pool_accounting.values()
+    ):
+        raise ValueError("invalid source-pool accounting")
+    accounting = dict(source_pool_accounting)
+    if accounting["input_rows"] != accounting["parsed"] + accounting["parse_exclusions"]:
+        raise ValueError("source-pool accounting does not cover every input row")
+    return accounting
+
+
+def _required_spec_text(spec: Mapping[str, object], key: str) -> str:
+    value = spec.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"dataset spec missing {key}")
+    return value
+
+
+def _unified_row_id(row: Mapping[str, object], index: int) -> str:
+    value = row.get("id")
+    return str(value) if isinstance(value, (str, int)) else f"unified-line-{index + 1}"
+
+
+def _parse_exclusion(line_number: int, reason: str) -> DatasetExample:
+    return _example("legacy", f"excluded_parse_{reason}", f"line-{line_number}", "", "")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _parse_traces(path: Path) -> tuple[CanonicalTrace, ...]:
+    """Backward-compatible parsed-trace accessor; callers needing accounting use parse_trace_pool."""
+    return parse_trace_pool(path)[0]
 
 
 def main(argv: Sequence[str] | None = None, *, loader: DatasetLoader | None = None) -> None:
@@ -381,20 +560,47 @@ def main(argv: Sequence[str] | None = None, *, loader: DatasetLoader | None = No
     build.add_argument("--traces", type=Path, required=True)
     build.add_argument("--unified", type=Path, required=True)
     build.add_argument("--output-root", type=Path, required=True)
+    build.add_argument("--gsm8k-revision", default=GSM8K_DATASET[2])
+    build.add_argument("--svamp-revision", default=SVAMP_DATASET[2])
+    build.add_argument("--math-revision", default=MATH_DATASET[2])
     arguments = parser.parse_args(argv)
 
     if arguments.command == "build":
         config = ExperimentConfig.load(arguments.config)
+        traces, parse_exclusions, accounting = parse_trace_pool(arguments.traces)
+        dataset_specs = _dataset_specs(
+            gsm8k_revision=arguments.gsm8k_revision,
+            svamp_revision=arguments.svamp_revision,
+            math_revision=arguments.math_revision,
+        )
         try:
             bundle = build_split_bundle(
                 config,
                 loader or OfflineDatasetLoader(),
-                _parse_traces(arguments.traces),
+                traces,
                 tuple(read_jsonl(arguments.unified)),
+                dataset_specs=dataset_specs,
             )
         except DatasetCacheMiss as error:
             raise SystemExit(str(error)) from error
-        write_split_bundle(arguments.output_root, config, bundle)
+        bundle = SplitBundle(
+            train=bundle.train,
+            validation=bundle.validation,
+            test=bundle.test,
+            exclusions=(*parse_exclusions, *bundle.exclusions),
+        )
+        input_lineage = {
+            "traces": {"path": str(arguments.traces), "sha256": _sha256_file(arguments.traces)},
+            "unified": {"path": str(arguments.unified), "sha256": _sha256_file(arguments.unified)},
+        }
+        write_split_bundle(
+            arguments.output_root,
+            config,
+            bundle,
+            dataset_specs=dataset_specs,
+            input_lineage=input_lineage,
+            source_pool_accounting=accounting,
+        )
         print(
             canonical_json(
                 {

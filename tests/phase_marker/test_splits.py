@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import json
 
 import pytest
 
@@ -14,7 +15,9 @@ from phase_marker.splits import (
     assert_disjoint_splits,
     build_split_bundle,
     main,
+    parse_trace_pool,
     question_hash,
+    write_split_bundle,
 )
 
 
@@ -203,3 +206,93 @@ def test_cli_cache_miss_writes_no_partial_manifest(tmp_path):
         )
 
     assert not output_root.exists()
+
+
+def test_frozen_publication_requires_immutable_dataset_specs_and_complete_input_lineage(tmp_path):
+    output_root = tmp_path / "splits"
+    bundle = SplitBundle()
+    lineage = {
+        "traces": {"sha256": "a" * 64, "path": "data/sft_final.jsonl"},
+        "unified": {"sha256": "b" * 64, "path": "data/unified_dataset.jsonl"},
+    }
+    mutable_specs = (
+        {"source": "gsm8k", "dataset_id": "gsm8k", "config": "main", "requested_split": "train", "revision": "main"},
+        {"source": "gsm8k", "dataset_id": "gsm8k", "config": "main", "requested_split": "test", "revision": "main"},
+        {"source": "svamp", "dataset_id": "ChilleD/SVAMP", "config": None, "requested_split": "train", "revision": "main"},
+        {"source": "math", "dataset_id": "EleutherAI/hendrycks_math", "config": "all", "requested_split": "train", "revision": "main"},
+        {"source": "math", "dataset_id": "EleutherAI/hendrycks_math", "config": "all", "requested_split": "test", "revision": "main"},
+    )
+
+    with pytest.raises(ValueError, match="immutable"):
+        write_split_bundle(
+            output_root,
+            TEST_CONFIG,
+            bundle,
+            dataset_specs=mutable_specs,
+            input_lineage=lineage,
+        )
+
+    frozen_specs = tuple({**spec, "revision": "a" * 40} for spec in mutable_specs)
+    write_split_bundle(
+        output_root,
+        TEST_CONFIG,
+        bundle,
+        dataset_specs=frozen_specs,
+        input_lineage=lineage,
+        source_pool_accounting={"input_rows": 0, "parsed": 0, "parse_exclusions": 0},
+    )
+
+    manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["datasets"] == list(frozen_specs)
+    assert manifest["input_lineage"] == lineage
+
+
+def test_parse_trace_pool_accounts_for_each_parse_failure_with_reason_and_line(tmp_path):
+    trace_path = tmp_path / "traces.jsonl"
+    trace_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": "Problem:\nOne plus one?"},
+                            {
+                                "role": "assistant",
+                                "content": (
+                                    "🜞 Guideline: add\n🜆 Plan: add\n🜂 Step: 1+1=2\n"
+                                    "🜃 Takeaway: two\n🝞 Final answer: 2"
+                                ),
+                            },
+                        ]
+                    }
+                ),
+                json.dumps({"messages": []}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    traces, exclusions, accounting = parse_trace_pool(trace_path)
+
+    assert len(traces) == 1
+    assert [(row.example_id, row.split) for row in exclusions] == [
+        ("line-2", "excluded_parse_invalid_messages")
+    ]
+    assert accounting == {"input_rows": 2, "parsed": 1, "parse_exclusions": 1}
+
+
+def test_same_source_duplicate_unified_questions_are_ambiguous(fake_loader):
+    duplicate_trace = trace("duplicate question")
+    rows = [
+        {"id": "duplicate-1", "source": "gsm8k", "question": "duplicate question", "answer": "1"},
+        {"id": "duplicate-2", "source": "gsm8k", "question": "duplicate question", "answer": "1"},
+    ]
+
+    bundle = build_split_bundle(TEST_CONFIG, fake_loader, [duplicate_trace], rows)
+
+    assert not any(row.question == "duplicate question" for row in bundle.train)
+    ambiguous = [row for row in bundle.exclusions if row.split == "excluded_ambiguous"]
+    assert len(ambiguous) == 1
+    assert "gsm8k:duplicate-1" in ambiguous[0].example_id
+    assert "gsm8k:duplicate-2" in ambiguous[0].example_id
