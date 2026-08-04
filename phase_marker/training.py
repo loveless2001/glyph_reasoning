@@ -8,6 +8,7 @@ from dataclasses import asdict
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -71,24 +72,51 @@ def tokenize_assistant_only(
     rendered_prefix = apply_template(
         messages[:-1], tokenize=False, add_generation_prompt=True
     )
-    if not isinstance(rendered, str) or not isinstance(rendered_prefix, str):
+    empty_assistant = dict(assistant)
+    empty_assistant["content"] = ""
+    rendered_empty_assistant = apply_template(
+        [*messages[:-1], empty_assistant],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    if not all(
+        isinstance(value, str)
+        for value in (rendered, rendered_prefix, rendered_empty_assistant)
+    ):
         raise TypeError("chat template must render text when tokenize=False")
     input_ids = _integer_ids(encode(rendered, add_special_tokens=False))
     prefix_ids = _integer_ids(encode(rendered_prefix, add_special_tokens=False))
+    empty_assistant_ids = _integer_ids(
+        encode(rendered_empty_assistant, add_special_tokens=False)
+    )
     if input_ids[: len(prefix_ids)] != prefix_ids:
         raise ValueError(
             "assistant generation prefix is not a token prefix of the rendered chat"
         )
+    suffix_width = _common_suffix_width(
+        input_ids,
+        empty_assistant_ids,
+        minimum_prefix_width=len(prefix_ids),
+    )
+    if suffix_width < 1:
+        raise ValueError("chat template must include an assistant end-of-turn suffix")
+    assistant_start = len(prefix_ids)
+    assistant_end = len(input_ids) - suffix_width
+    if assistant_end <= assistant_start:
+        raise ValueError("assistant content must tokenize to at least one token")
 
-    labels = [-100] * len(prefix_ids) + input_ids[len(prefix_ids) :]
+    assistant_ids = input_ids[assistant_start:assistant_end]
+    final_span_ids = _integer_ids(encode(final_span, add_special_tokens=False))
+    final_span_offsets = _window_offsets(assistant_ids, final_span_ids)
+    if not final_span_offsets:
+        raise ValueError("final-answer token span is not inside assistant content")
+    final_span_end = assistant_start + final_span_offsets[-1] + len(final_span_ids)
+    labels = [-100] * len(input_ids)
+    labels[assistant_start:assistant_end] = input_ids[assistant_start:assistant_end]
     truncated_input_ids = input_ids[:max_length]
     truncated_labels = labels[:max_length]
-    delimiter_ids = _integer_ids(encode(REQUIRED_FINAL_DELIMITER, add_special_tokens=False))
-    final_span_ids = _integer_ids(encode(final_span, add_special_tokens=False))
     example_id = str(example.get("example_id", "<unknown>"))
-    if not _contains_window(truncated_input_ids, delimiter_ids) or not _contains_window(
-        truncated_input_ids, final_span_ids
-    ):
+    if final_span_end > max_length:
         raise TruncatedAnswerError(
             f"{example_id}: max_length={max_length} truncates the final delimiter or answer"
         )
@@ -98,7 +126,7 @@ def tokenize_assistant_only(
         "input_ids": truncated_input_ids,
         "attention_mask": [1] * len(truncated_input_ids),
         "labels": truncated_labels,
-        "assistant_start": len(prefix_ids),  # type: ignore[dict-item]
+        "assistant_start": assistant_start,  # type: ignore[dict-item]
     }
 
 
@@ -121,6 +149,7 @@ def build_training_arguments(
 ) -> TrainingArguments:
     """Return the fixed matched-training arguments, varying only lineage fields."""
     _validate_run_identity(config, arm, seed)
+    _require_single_process_world_size()
     return TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=1,
@@ -133,7 +162,7 @@ def build_training_arguments(
         logging_steps=5,
         logging_first_step=True,
         save_steps=100,
-        save_total_limit=1,
+        save_total_limit=None,
         report_to="none",
         optim="adamw_torch",
         lr_scheduler_type="cosine",
@@ -163,6 +192,7 @@ def build_run_manifest(
         raise FileNotFoundError(data)
     if model_revision != QWEN25_7B_TOKENIZER_REVISION:
         raise ValueError("resolved model revision does not match the pinned Qwen revision")
+    materialization = _validate_materialization_manifest(data, config, arm)
     checkpoints = _checkpoint_lineage(output_dir) if output_dir is not None else []
     environment = {
         "torch": torch.__version__,
@@ -181,6 +211,9 @@ def build_run_manifest(
         "config_hash": sha256_json(asdict(config)),
         "dataset_path": str(data),
         "dataset_hash": sha256_json(data.read_bytes().hex()),
+        "data_artifact_id": materialization["artifact_id"],
+        "parent_hashes": [materialization["artifact_id"]],
+        "data_parent_hashes": list(materialization["parent_hashes"]),
         "arguments": list(arguments),
         "environment": environment,
         "checkpoints": checkpoints,
@@ -257,7 +290,6 @@ def _build_parser() -> argparse.ArgumentParser:
     train.add_argument("--data", type=Path, required=True)
     train.add_argument("--output-dir", type=Path, required=True)
     train.add_argument("--manifest", type=Path, required=True)
-    train.add_argument("--max-length", type=int, default=MAX_SEQUENCE_LENGTH)
     return parser
 
 
@@ -300,6 +332,7 @@ def _tokenize_smoke(config_path: Path, data: Path, limit: int, max_length: int) 
 def _train(arguments: argparse.Namespace, command_arguments: list[str]) -> int:
     config = ExperimentConfig.load(arguments.config)
     _validate_run_identity(config, arguments.arm, arguments.seed)
+    _validate_materialization_manifest(arguments.data, config, arguments.arm)
     verify_confirmatory_output(
         arguments.output_dir, config, arguments.seed, arguments.manifest
     )
@@ -307,6 +340,9 @@ def _train(arguments: argparse.Namespace, command_arguments: list[str]) -> int:
         arguments.output_dir / "run-manifest.json"
     ).exists():
         raise FileExistsError("refusing to overwrite an immutable completed run manifest")
+    training_arguments = build_training_arguments(
+        config, arguments.arm, arguments.seed, arguments.output_dir
+    )
     if not torch.cuda.is_available() or not is_torch_bf16_gpu_available():
         raise RuntimeError("LoRA training requires a BF16-capable CUDA device")
 
@@ -332,7 +368,7 @@ def _train(arguments: argparse.Namespace, command_arguments: list[str]) -> int:
     for index, row in enumerate(read_jsonl(arguments.data), start=1):
         labeled = dict(row)
         labeled.setdefault("example_id", f"row-{index}")
-        encoded = tokenize_assistant_only(labeled, tokenizer, arguments.max_length)
+        encoded = tokenize_assistant_only(labeled, tokenizer, MAX_SEQUENCE_LENGTH)
         tokenized_rows.append(
             {key: value for key, value in encoded.items() if key != "assistant_start"}
         )
@@ -349,9 +385,6 @@ def _train(arguments: argparse.Namespace, command_arguments: list[str]) -> int:
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
 
-    training_arguments = build_training_arguments(
-        config, arguments.arm, arguments.seed, arguments.output_dir
-    )
     trainer = Trainer(
         model=model,
         args=training_arguments,
@@ -394,14 +427,28 @@ def _integer_ids(value: object) -> list[int]:
     return result
 
 
-def _contains_window(values: Sequence[int], window: Sequence[int]) -> bool:
+def _window_offsets(values: Sequence[int], window: Sequence[int]) -> list[int]:
     if not window or len(window) > len(values):
-        return False
+        return []
     width = len(window)
-    return any(
-        list(values[index : index + width]) == list(window)
+    return [
+        index
         for index in range(len(values) - width + 1)
+        if list(values[index : index + width]) == list(window)
+    ]
+
+
+def _common_suffix_width(
+    left: Sequence[int], right: Sequence[int], *, minimum_prefix_width: int
+) -> int:
+    maximum = min(
+        len(left) - minimum_prefix_width,
+        len(right) - minimum_prefix_width,
     )
+    width = 0
+    while width < maximum and left[-(width + 1)] == right[-(width + 1)]:
+        width += 1
+    return width
 
 
 def _require_supported_model(config: ExperimentConfig) -> None:
@@ -417,6 +464,25 @@ def _validate_run_identity(config: ExperimentConfig, arm: str, seed: int) -> Non
         raise ValueError(f"unknown configured training arm: {arm}")
     if seed not in (config.pilot_seed, *config.confirmatory_seeds):
         raise ValueError(f"seed {seed} is not a configured pilot or confirmatory seed")
+
+
+def _require_single_process_world_size() -> None:
+    observed: list[int] = []
+    for variable in ("WORLD_SIZE", "LOCAL_WORLD_SIZE"):
+        raw = os.environ.get(variable)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except ValueError as error:
+            raise ValueError(f"{variable} must be an integer") from error
+        if value < 1:
+            raise ValueError(f"{variable} must be positive")
+        observed.append(value)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        observed.append(torch.distributed.get_world_size())
+    if any(value != 1 for value in observed):
+        raise ValueError("training world size must be exactly 1 for effective batch size 16")
 
 
 def _package_version(name: str) -> str:
@@ -463,6 +529,69 @@ def _read_manifest(path: Path) -> Mapping[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError(f"run manifest must be a JSON object: {path}")
     return payload
+
+
+def _validate_materialization_manifest(
+    data: Path, config: ExperimentConfig, arm: str
+) -> Mapping[str, Any]:
+    if not data.is_file():
+        raise FileNotFoundError(data)
+    if data.stem != arm:
+        raise ValueError(
+            f"materialized data arm {data.stem!r} does not match requested arm {arm!r}"
+        )
+    manifest_path = data.with_suffix(".manifest.json")
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"materialization manifest required beside training data: {manifest_path}"
+        )
+    payload = _read_manifest(manifest_path)
+    if payload.get("kind") != "phase_marker_training_data":
+        raise ValueError("materialization manifest has an invalid kind")
+    config_hash = sha256_json(asdict(config))
+    if payload.get("config_hash") != config_hash:
+        raise ValueError("materialization manifest has a different config hash")
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("materialization manifest metadata must be an object")
+    if metadata.get("tokenizer_revision") != QWEN25_7B_TOKENIZER_REVISION:
+        raise ValueError("materialization manifest has a different tokenizer revision")
+    expected_row_hashes = [sha256_json(row) for row in read_jsonl(data)]
+    row_hashes = metadata.get("row_hashes")
+    if row_hashes != expected_row_hashes:
+        raise ValueError("materialization manifest row hashes do not match the JSONL data")
+    if payload.get("row_count") != len(expected_row_hashes):
+        raise ValueError("materialization manifest row count does not match the JSONL data")
+
+    parent_hashes = payload.get("parent_hashes")
+    parent_split_hash = metadata.get("parent_split_hash")
+    if (
+        not isinstance(parent_hashes, list)
+        or len(parent_hashes) != 1
+        or not _is_sha256(parent_hashes[0])
+        or parent_split_hash != parent_hashes[0]
+    ):
+        raise ValueError("materialization manifest parent lineage is inconsistent")
+    artifact_id = payload.get("artifact_id")
+    expected_artifact_id = sha256_json(
+        {
+            "arm": arm,
+            "config_hash": config_hash,
+            "parent_split_hash": parent_split_hash,
+            "row_hashes": expected_row_hashes,
+            "metadata": dict(metadata),
+        }
+    )
+    if not _is_sha256(artifact_id) or artifact_id != expected_artifact_id:
+        raise ValueError("materialization manifest artifact id does not match its arm or metadata")
+    return payload
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
 
 
 def _write_manifest_immutable(path: Path, manifest: Mapping[str, object]) -> None:
