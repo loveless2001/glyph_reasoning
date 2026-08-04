@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from dataclasses import asdict
 import hashlib
 import json
+import sys
+from types import ModuleType
 
 import pytest
 import torch
@@ -307,6 +309,80 @@ def test_capture_cli_tiny_fixture_emits_plumbing_only_envelope(tmp_path: Path):
     assert manifest["schema_version"] == 1
     assert manifest["evidence_scope"] == "plumbing_only"
     assert manifest["backend"] == "tiny-fixture"
+
+
+def test_capture_rejects_stale_behavior_files_before_model_loader_or_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from phase_marker.activations import main
+    from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
+
+    config_path = Path("configs/phase-marker-qwen25-7b.toml")
+    config = ExperimentConfig.load(config_path)
+    config_hash = sha256_json(asdict(config))
+
+    def write_parent(name: str, payload: dict[str, object]) -> Path:
+        payload["artifact_id"] = sha256_json(payload)
+        path = tmp_path / f"{name}.json"
+        path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+        return path
+
+    selection = write_parent("selection", {
+        "schema_version": 1, "kind": "selection", "config_hash": config_hash,
+        "selected_on": "validation",
+    })
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    checkpoint = write_parent("checkpoint", {
+        "schema_version": 1, "kind": "checkpoint", "config_hash": config_hash,
+        "model_id": config.model_id, "model_revision": QWEN25_7B_TOKENIZER_REVISION,
+        "checkpoint_path": str(checkpoint_dir),
+    })
+    missing_records = tmp_path / "missing-records.jsonl"
+    behavior = write_parent("behavior", {
+        "schema_version": 1, "kind": "phase_marker_behavior_generations",
+        "evidence_scope": "experiment_candidate", "backend": "vllm", "config_hash": config_hash,
+        "run_kind": "pilot", "seeds": [42], "split_artifact_id": "a" * 64,
+        "split_manifest_hash": "b" * 64, "materialization_artifact_ids": {},
+        "checkpoint_artifact_ids": {}, "checkpoint_manifest_hashes": {},
+        "checkpoint_manifests": {}, "examples_file": str(tmp_path / "missing-examples.jsonl"),
+        "examples_hash": "c" * 64, "records_file": missing_records.name,
+        "records_hash": "d" * 64, "row_count": 1, "record_hashes": ["e" * 64],
+        "exclusions": [], "parent_hashes": ["a" * 64], "completed": True,
+    })
+    synthetic = write_parent("synthetic", {
+        "schema_version": 1, "kind": "phase_marker_synthetic_four_state_suite", "seed": 42,
+        "counts": {"train": 1, "validation": 1, "test": 1}, "family_counts": {},
+        "split_counts": {"train": 1, "validation": 1, "test": 1},
+        "parameter_overlap": {}, "exact_scorer_agreement": {"agreeing": 3, "total": 3},
+        "evidence_scope": "experiment", "backend": "production", "config_hash": config_hash,
+        "preregistration_hash": "f" * 64, "completed": True,
+        "data_hashes": {"train": "1" * 64, "validation": "2" * 64, "test": "3" * 64},
+    })
+    batch_path = tmp_path / "batch.pt"
+    batch_path.write_bytes(b"batch")
+    batch = write_parent("batch", {
+        "schema_version": 1, "kind": "tokenized_batch", "config_hash": config_hash,
+        "batch_file": str(batch_path), "batch_hash": hashlib.sha256(batch_path.read_bytes()).hexdigest(),
+        "layers": [0], "positions": [0],
+    })
+    transformers = ModuleType("transformers")
+    transformers.AutoModelForCausalLM = SimpleNamespace(  # type: ignore[attr-defined]
+        from_pretrained=lambda *_args, **_kwargs: pytest.fail("model loader was called")
+    )
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match="behavior"):
+        main((
+            "capture", "--config", str(config_path), "--mode", "teacher_forced",
+            "--validation-selection-manifest", str(selection), "--tokenized-batch-manifest", str(batch),
+            "--tokenized-batch", str(batch_path), "--model-id", config.model_id,
+            "--model-revision", QWEN25_7B_TOKENIZER_REVISION,
+            "--checkpoint-manifest", str(checkpoint), "--behavior-manifest", str(behavior),
+            "--synthetic-manifest", str(synthetic), "--backend", "hf", "--output-root", str(output),
+        ))
+    assert not output.exists()
 
 
 def _probe_batch(condition: str, *, informative: bool) -> ActivationBatch:

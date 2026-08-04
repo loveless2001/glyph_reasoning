@@ -11,7 +11,7 @@ from pathlib import Path
 import tempfile
 from typing import Any, Protocol
 
-from phase_marker.config import ExperimentConfig
+from phase_marker.config import ExperimentConfig, REQUIRED_MODEL_ID
 from phase_marker.io import canonical_json, read_jsonl, sha256_json, write_jsonl_atomic
 from phase_marker.prompts import MarkerSet, render_perturbation, render_prompt
 from phase_marker.schema import ArtifactManifest, GenerationRecord
@@ -112,16 +112,48 @@ class VLLMGenerationBackend:
     """Lazy production adapter; importing this module never imports or loads vLLM."""
 
     def __init__(
-        self, model: str, *, adapter_seed: int | None = None, **llm_kwargs: object
+        self,
+        model: str,
+        *,
+        model_revision: str = QWEN25_7B_TOKENIZER_REVISION,
+        adapter_path: str | None = None,
+        adapter_seed: int | None = None,
+        **llm_kwargs: object,
     ) -> None:
-        if not _is_production_checkpoint(model):
-            raise ValueError("vLLM backend requires a real checkpoint model identifier")
+        if model != REQUIRED_MODEL_ID or model_revision != QWEN25_7B_TOKENIZER_REVISION:
+            raise ValueError("vLLM backend requires the frozen base model and revision")
+        if not _is_production_checkpoint(adapter_path):
+            raise ValueError("vLLM backend requires a real LoRA adapter path")
         if not isinstance(adapter_seed, int) or isinstance(adapter_seed, bool):
             raise ValueError("vLLM backend requires an explicit integer adapter seed")
         self._model = model
+        self._model_revision = model_revision
+        self._adapter_path = str(adapter_path)
         self._adapter_seed = adapter_seed
         self._llm_kwargs = dict(llm_kwargs)
         self._llm: Any | None = None
+
+    def _ensure_llm(self) -> Any:
+        if self._llm is None:
+            from vllm import LLM  # Imported only when the production backend is used.
+
+            self._llm = LLM(
+                model=self._model,
+                revision=self._model_revision,
+                tokenizer_revision=self._model_revision,
+                enable_lora=True,
+                **self._llm_kwargs,
+            )
+        return self._llm
+
+    def _lora_request(self) -> Any:
+        from vllm.lora.request import LoRARequest
+
+        return LoRARequest(
+            f"{Path(self._adapter_path).name}-seed-{self._adapter_seed}",
+            self._adapter_seed,
+            self._adapter_path,
+        )
 
     def generate(self, requests: Sequence[GenerationRequest]) -> Sequence[GenerationOutput]:
         _validate_requests(requests)
@@ -129,22 +161,21 @@ class VLLMGenerationBackend:
             return ()
         for request in requests:
             _validate_production_request(request)
-            if request.decoding["checkpoint"] != self._model:
-                raise ValueError("vLLM request checkpoint must exactly match backend model")
+            if request.decoding["checkpoint"] != self._adapter_path:
+                raise ValueError("vLLM request checkpoint must exactly match backend adapter")
             if request.decoding["adapter_seed"] != self._adapter_seed:
                 raise ValueError("vLLM request must match backend adapter seed")
-        if self._llm is None:
-            from vllm import LLM  # Imported only when the production backend is used.
-
-            self._llm = LLM(model=self._model, **self._llm_kwargs)
         from vllm import SamplingParams
+        llm = self._ensure_llm()
+        lora_request = self._lora_request()
 
         outputs: list[GenerationOutput] = []
         for request in requests:
-            results = self._llm.generate(
+            results = llm.generate(
                 prompt_token_ids=[list(request.prompt_token_ids)],
                 sampling_params=SamplingParams(**_vllm_sampling_parameters((request,))),
                 use_tqdm=False,
+                lora_request=lora_request,
             )
             if len(results) != 1:
                 raise ValueError("vLLM returned a missing output")
@@ -160,6 +191,88 @@ class VLLMGenerationBackend:
             )
         _validate_outputs(requests, outputs)
         return tuple(outputs)
+
+    def mean_gold_answer_logprob(
+        self,
+        requests: Sequence[GenerationRequest],
+        gold_answers: Sequence[str],
+        *,
+        tokenize: Callable[[str], Sequence[int]],
+        final_delimiter: str,
+    ) -> float:
+        """Teacher-force each frozen gold continuation and average its log probability."""
+        if len(requests) != len(gold_answers) or not requests:
+            raise ValueError("gold-answer scoring requires one answer per request")
+        from vllm import SamplingParams
+
+        llm = self._ensure_llm()
+        lora_request = self._lora_request()
+        answer_logprobs: list[float] = []
+        for request, answer in zip(requests, gold_answers, strict=True):
+            suffix_ids = tuple(tokenize(f"\n{final_delimiter} {answer}"))
+            if not suffix_ids:
+                raise ValueError("gold-answer continuation tokenized to zero tokens")
+            prompt_ids = (*request.prompt_token_ids, *suffix_ids)
+            results = llm.generate(
+                prompt_token_ids=[list(prompt_ids)],
+                sampling_params=SamplingParams(
+                    temperature=0.0, max_tokens=1, prompt_logprobs=1
+                ),
+                use_tqdm=False,
+                lora_request=lora_request,
+            )
+            if len(results) != 1:
+                raise ValueError("vLLM returned a missing gold-answer score")
+            prompt_logprobs = getattr(results[0], "prompt_logprobs", None)
+            if not isinstance(prompt_logprobs, list) or len(prompt_logprobs) != len(prompt_ids):
+                raise ValueError("vLLM omitted teacher-forced gold-answer logprobs")
+            total = 0.0
+            start = len(request.prompt_token_ids)
+            for position, token_id in enumerate(suffix_ids, start=start):
+                entry = prompt_logprobs[position]
+                if not isinstance(entry, Mapping) or token_id not in entry:
+                    raise ValueError("vLLM omitted a gold-answer token logprob")
+                value = entry[token_id]
+                logprob = getattr(value, "logprob", value)
+                if not isinstance(logprob, (int, float)) or isinstance(logprob, bool):
+                    raise ValueError("vLLM returned a malformed gold-answer logprob")
+                total += float(logprob)
+            answer_logprobs.append(total)
+        return sum(answer_logprobs) / len(answer_logprobs)
+
+
+def select_validation_checkpoint(
+    candidates: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    """Apply the frozen validation-only checkpoint selection criterion."""
+    if not candidates:
+        raise ValueError("checkpoint selection requires at least one candidate")
+    normalized: list[Mapping[str, object]] = []
+    for candidate in candidates:
+        accuracy = candidate.get("strict_accuracy")
+        logprob = candidate.get("mean_gold_answer_logprob")
+        step = candidate.get("step")
+        if (
+            not isinstance(accuracy, (int, float))
+            or isinstance(accuracy, bool)
+            or not 0 <= float(accuracy) <= 1
+            or not isinstance(logprob, (int, float))
+            or isinstance(logprob, bool)
+            or not isinstance(step, int)
+            or isinstance(step, bool)
+            or step < 0
+            or not isinstance(candidate.get("path"), str)
+        ):
+            raise ValueError("checkpoint candidate metrics are malformed")
+        normalized.append(candidate)
+    return min(
+        normalized,
+        key=lambda candidate: (
+            -float(candidate["strict_accuracy"]),
+            -float(candidate["mean_gold_answer_logprob"]),
+            int(candidate["step"]),
+        ),
+    )
 
 
 def build_behavior_matrix(
@@ -624,11 +737,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument("--backend", choices=("vllm", "tiny-fixture"), required=True)
     run.add_argument("--allow-test-backend", action="store_true")
     run.add_argument("--output-root", type=Path, required=True)
+    select = subparsers.add_parser("select")
+    select.add_argument("--config", type=Path, required=True)
+    select.add_argument("--kind", choices=("pilot", "confirmatory"), required=True)
+    select.add_argument("--seed", type=int, required=True)
+    select.add_argument("--arm", required=True)
+    select.add_argument("--split-manifest", type=Path, required=True)
+    select.add_argument("--validation-examples", type=Path, required=True)
+    select.add_argument("--training-manifest", type=Path, required=True)
+    select.add_argument("--backend", choices=("vllm", "tiny-fixture"), required=True)
+    select.add_argument("--allow-test-backend", action="store_true")
+    select.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args(argv)
     if arguments.command == "dry-run":
         return _dry_run(arguments)
     if arguments.command == "run":
         return _run_behavior(arguments)
+    if arguments.command == "select":
+        return _run_selection(arguments)
     raise AssertionError("unreachable")
 
 
@@ -641,13 +767,173 @@ _CHECKPOINT_SELECTION_FIELDS = frozenset(
         "arm",
         "seed",
         "selected_on",
-        "checkpoint_path",
+        "evidence_scope",
+        "backend",
+        "criterion",
+        "split_artifact_id",
+        "split_manifest_hash",
+        "validation_examples_file",
+        "validation_examples_hash",
+        "training_manifest_file",
         "training_manifest_hash",
         "materialization_artifact_id",
+        "candidates",
+        "selected_path",
+        "selected_checkpoint_hash",
+        "selected_step",
+        "parent_hashes",
         "completed",
         "artifact_id",
     }
 )
+
+
+def _run_selection(arguments: argparse.Namespace) -> int:
+    if arguments.backend == "tiny-fixture" and not arguments.allow_test_backend:
+        raise SystemExit("--allow-test-backend is required for tiny-fixture")
+    config = ExperimentConfig.load(arguments.config)
+    expected_seeds = (config.pilot_seed,) if arguments.kind == "pilot" else tuple(config.confirmatory_seeds)
+    if arguments.seed not in expected_seeds:
+        raise ValueError(f"checkpoint selection seed must be one of {expected_seeds}")
+    if arguments.arm not in config.arms:
+        raise ValueError("checkpoint selection arm is not in the frozen protocol")
+    split = _load_json_object(arguments.split_manifest, "split manifest")
+    config_hash = sha256_json(asdict(config))
+    if split.get("config_hash") != config_hash:
+        raise ValueError("checkpoint selection split config hash mismatch")
+    split_id = _required_hash(split, "artifact_id", "split manifest")
+    examples = tuple(_example_from_row(row) for row in read_jsonl(arguments.validation_examples))
+    if not examples or any(example.split != "validation" for example in examples):
+        raise ValueError("checkpoint selection uses frozen validation examples only")
+    training = _load_json_object(arguments.training_manifest, "training manifest")
+    required_training = {
+        "kind", "arm", "seed", "model_id", "model_revision", "tokenizer_revision",
+        "config_hash", "dataset_path", "dataset_hash", "data_artifact_id", "parent_hashes",
+        "data_parent_hashes", "arguments", "environment", "checkpoints", "saved_artifacts",
+        "output_hash",
+    }
+    if set(training) != required_training:
+        raise ValueError("training manifest fields do not match the producer schema")
+    if (
+        training.get("kind") != "phase_marker_training_run"
+        or training.get("arm") != arguments.arm
+        or training.get("seed") != arguments.seed
+        or training.get("model_id") != config.model_id
+        or training.get("model_revision") != QWEN25_7B_TOKENIZER_REVISION
+        or training.get("tokenizer_revision") != QWEN25_7B_TOKENIZER_REVISION
+        or training.get("config_hash") != config_hash
+        or training.get("data_parent_hashes") != [split_id]
+    ):
+        raise ValueError("training manifest identity or split lineage mismatch")
+    data_path = Path(str(training.get("dataset_path")))
+    if training.get("dataset_hash") != sha256_json(data_path.read_bytes().hex()):
+        raise ValueError("training manifest dataset hash mismatch")
+    materialization_path = data_path.with_suffix(".manifest.json")
+    materialization = _load_json_object(materialization_path, "materialization manifest")
+    materialization_id = _required_hash(materialization, "artifact_id", "materialization manifest")
+    if (
+        training.get("data_artifact_id") != materialization_id
+        or training.get("parent_hashes") != [materialization_id]
+    ):
+        raise ValueError("training materialization lineage mismatch")
+    declared = training.get("checkpoints")
+    if not isinstance(declared, list) or not declared:
+        raise ValueError("training manifest declares no checkpoints")
+    candidate_inputs: list[tuple[Path, str, int]] = []
+    for item in declared:
+        if not isinstance(item, Mapping) or set(item) != {"path", "hash"}:
+            raise ValueError("training checkpoint lineage is malformed")
+        relative = item["path"]
+        if not isinstance(relative, str) or not relative.startswith("checkpoint-"):
+            raise ValueError("training checkpoint path is malformed")
+        try:
+            step = int(relative.removeprefix("checkpoint-"))
+        except ValueError as error:
+            raise ValueError("training checkpoint step is malformed") from error
+        checkpoint = arguments.training_manifest.parent / relative
+        if not checkpoint.is_dir() or item["hash"] != _behavior_directory_hash(checkpoint):
+            raise ValueError("training checkpoint directory hash mismatch")
+        _validate_adapter_compatibility(checkpoint, config)
+        candidate_inputs.append((checkpoint, str(item["hash"]), step))
+
+    tokenizer: object | None = None
+    if arguments.backend == "vllm":
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_id, revision=QWEN25_7B_TOKENIZER_REVISION, local_files_only=True
+        )
+    metrics: list[dict[str, object]] = []
+    prompt_condition = arguments.arm if arguments.arm in {"glyph", "dot"} else "neutral"
+    cell = EvaluationCell("primary", arguments.arm, prompt_condition, None, "greedy")
+    for checkpoint, checkpoint_hash, step in candidate_inputs:
+        if arguments.backend == "tiny-fixture":
+            accuracy, mean_logprob = 0.0, 0.0
+        else:
+            assert tokenizer is not None
+            requests = build_generation_requests(
+                cell, examples, config, checkpoint=str(checkpoint),
+                tokenize=lambda value: tokenizer.encode(value, add_special_tokens=False),
+                tokenizer_revision=QWEN25_7B_TOKENIZER_REVISION,
+                split_manifest=ArtifactManifest(
+                    split_id, "phase_marker_splits", config_hash, _split_parent_hashes(split),
+                    len(examples), {},
+                ),
+                adapter_seed=arguments.seed,
+            )
+            backend = VLLMGenerationBackend(
+                config.model_id, model_revision=QWEN25_7B_TOKENIZER_REVISION,
+                adapter_path=str(checkpoint), adapter_seed=arguments.seed,
+            )
+            records = records_from_outputs(
+                cell, examples, requests, backend.generate(requests),
+                (split_id, materialization_id, _file_hash(arguments.training_manifest)),
+            )
+            scored = [score_generation(record) for record in records]
+            accuracy = sum(row.correct for row in scored) / len(scored)
+            mean_logprob = backend.mean_gold_answer_logprob(
+                requests,
+                tuple(example.answer for example in examples),
+                tokenize=lambda value: tokenizer.encode(
+                    value, add_special_tokens=False
+                ),
+                final_delimiter=config.final_delimiter,
+            )
+        metrics.append({
+            "path": str(checkpoint), "checkpoint_hash": checkpoint_hash, "step": step,
+            "strict_accuracy": accuracy, "mean_gold_answer_logprob": mean_logprob,
+            "row_count": len(examples),
+        })
+    selected = select_validation_checkpoint(metrics)
+    manifest: dict[str, object] = {
+        "schema_version": 1, "kind": "phase_marker_checkpoint_selection",
+        "evidence_scope": "plumbing_only" if arguments.backend == "tiny-fixture" else "experiment",
+        "backend": arguments.backend, "config_hash": config_hash, "run_kind": arguments.kind,
+        "arm": arguments.arm, "seed": arguments.seed, "selected_on": "validation",
+        "criterion": {
+            "primary": "maximize_strict_validation_exact_answer_accuracy",
+            "tie_break_1": "higher_mean_gold_answer_logprob",
+            "tie_break_2": "earliest_checkpoint_step",
+        },
+        "split_artifact_id": split_id, "split_manifest_hash": _file_hash(arguments.split_manifest),
+        "validation_examples_file": str(arguments.validation_examples),
+        "validation_examples_hash": _file_hash(arguments.validation_examples),
+        "training_manifest_file": str(arguments.training_manifest),
+        "training_manifest_hash": _file_hash(arguments.training_manifest),
+        "materialization_artifact_id": materialization_id, "candidates": metrics,
+        "selected_path": selected["path"],
+        "selected_checkpoint_hash": selected["checkpoint_hash"],
+        "selected_step": selected["step"],
+        "parent_hashes": [split_id, materialization_id, _file_hash(arguments.training_manifest)],
+        "completed": True,
+    }
+    manifest["artifact_id"] = sha256_json(manifest)
+    if arguments.output.exists():
+        raise FileExistsError(f"refusing to overwrite checkpoint selection: {arguments.output}")
+    arguments.output.parent.mkdir(parents=True, exist_ok=True)
+    arguments.output.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    print(canonical_json(manifest))
+    return 0
 
 
 def _run_behavior(arguments: argparse.Namespace) -> int:
@@ -669,17 +955,16 @@ def _run_behavior(arguments: argparse.Namespace) -> int:
         config,
         arguments.kind,
         seeds,
+        allow_test=arguments.backend == "tiny-fixture",
     )
     if arguments.backend == "vllm":
+        _validate_production_behavior_inputs(
+            arguments.split_manifest, split_id, config, selections
+        )
         for identity, selection in selections.items():
-            checkpoint_root = Path(str(selection["checkpoint_path"]))
-            training_manifest = checkpoint_root / "run-manifest.json"
-            if not checkpoint_root.is_dir() or not training_manifest.is_file():
-                raise FileNotFoundError(
-                    f"selected production checkpoint manifest is missing for {identity}: {training_manifest}"
-                )
-            if selection["training_manifest_hash"] != _file_hash(training_manifest):
-                raise ValueError(f"selected training manifest hash mismatch for {identity}")
+            checkpoint_root = Path(str(selection["selected_path"]))
+            if not checkpoint_root.is_dir():
+                raise FileNotFoundError(f"selected production checkpoint is missing for {identity}")
     if arguments.output_root.exists():
         raise FileExistsError(f"refusing to overwrite behavior output: {arguments.output_root}")
 
@@ -696,7 +981,7 @@ def _run_behavior(arguments: argparse.Namespace) -> int:
     for seed in seeds:
         for cell in build_behavior_matrix(config, split_manifest):
             selection = selections[(seed, cell.training_arm)]
-            checkpoint = str(selection["checkpoint_path"])
+            checkpoint = str(selection["selected_path"])
             if arguments.backend == "tiny-fixture":
                 requests = build_generation_requests(
                     cell,
@@ -730,7 +1015,12 @@ def _run_behavior(arguments: argparse.Namespace) -> int:
                     split_manifest=split_manifest,
                     adapter_seed=seed,
                 )
-                backend = VLLMGenerationBackend(checkpoint, adapter_seed=seed)
+                backend = VLLMGenerationBackend(
+                    config.model_id,
+                    model_revision=QWEN25_7B_TOKENIZER_REVISION,
+                    adapter_path=checkpoint,
+                    adapter_seed=seed,
+                )
                 record_parents = (split_id, *split_parents, str(selection["artifact_id"]))
             records = records_from_outputs(
                 cell,
@@ -821,6 +1111,8 @@ def _load_checkpoint_selections(
     config: ExperimentConfig,
     kind: str,
     seeds: tuple[int, ...],
+    *,
+    allow_test: bool,
 ) -> dict[tuple[int, str], dict[str, object]]:
     expected = {(seed, arm) for seed in seeds for arm in config.arms}
     result: dict[tuple[int, str], dict[str, object]] = {}
@@ -838,10 +1130,53 @@ def _load_checkpoint_selections(
             or payload["completed"] is not True
         ):
             raise ValueError(f"checkpoint selection provenance mismatch: {path}")
+        expected_scope = "plumbing_only" if allow_test else "experiment"
+        expected_backend = "tiny-fixture" if allow_test else "vllm"
+        if payload["evidence_scope"] != expected_scope or payload["backend"] != expected_backend:
+            raise ValueError(f"checkpoint selection evidence scope mismatch: {path}")
         artifact_id = payload.pop("artifact_id")
         if artifact_id != sha256_json(payload):
             raise ValueError(f"checkpoint selection artifact hash mismatch: {path}")
         payload["artifact_id"] = artifact_id
+        if payload["criterion"] != {
+            "primary": "maximize_strict_validation_exact_answer_accuracy",
+            "tie_break_1": "higher_mean_gold_answer_logprob",
+            "tie_break_2": "earliest_checkpoint_step",
+        }:
+            raise ValueError(f"checkpoint selection criterion mismatch: {path}")
+        for file_field, hash_field in (
+            ("validation_examples_file", "validation_examples_hash"),
+            ("training_manifest_file", "training_manifest_hash"),
+        ):
+            bound_path = Path(str(payload[file_field]))
+            if not bound_path.is_file() or payload[hash_field] != _file_hash(bound_path):
+                raise ValueError(f"checkpoint selection bound file hash mismatch: {path}")
+        selected_path = Path(str(payload["selected_path"]))
+        if not allow_test and (
+            not selected_path.is_dir()
+            or payload["selected_checkpoint_hash"] != _behavior_directory_hash(selected_path)
+        ):
+            raise ValueError(f"checkpoint selection selected adapter hash mismatch: {path}")
+        if not allow_test:
+            _validate_adapter_compatibility(selected_path, config)
+        candidates = payload["candidates"]
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError(f"checkpoint selection candidates are missing: {path}")
+        selected_candidates = [
+            item for item in candidates
+            if isinstance(item, Mapping)
+            and item.get("path") == payload["selected_path"]
+            and item.get("checkpoint_hash") == payload["selected_checkpoint_hash"]
+            and item.get("step") == payload["selected_step"]
+        ]
+        if len(selected_candidates) != 1 or select_validation_checkpoint(candidates) != selected_candidates[0]:
+            raise ValueError(f"checkpoint selection winner does not match frozen criterion: {path}")
+        parents = payload["parent_hashes"]
+        if parents != [
+            payload["split_artifact_id"], payload["materialization_artifact_id"],
+            payload["training_manifest_hash"],
+        ]:
+            raise ValueError(f"checkpoint selection parent lineage mismatch: {path}")
         payload["manifest_hash"] = _file_hash(path)
         payload["manifest_path"] = str(path)
         identity = (payload["seed"], payload["arm"])
@@ -863,6 +1198,63 @@ def _load_json_object(path: Path, label: str) -> Mapping[str, object]:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{label} must be a JSON object: {path}")
     return payload
+
+
+def _validate_production_behavior_inputs(
+    split_manifest: Path,
+    split_id: str,
+    config: ExperimentConfig,
+    selections: Mapping[tuple[int, str], Mapping[str, object]],
+) -> None:
+    from phase_marker.pipeline import (
+        GateFailure,
+        _validate_materializations,
+        _validate_split_manifest,
+    )
+
+    artifact_root = split_manifest.parent.parent
+    try:
+        split = _validate_split_manifest(artifact_root, config)
+        materializations = _validate_materializations(artifact_root, config, split.artifact_id)
+    except GateFailure as error:
+        raise ValueError(str(error)) from error
+    if split.artifact_id != split_id or split.path != split_manifest:
+        raise ValueError("behavior split manifest does not match the canonical producer artifact")
+    expected_materializations = dict(zip(config.arms, materializations, strict=True))
+    required_training = {
+        "kind", "arm", "seed", "model_id", "model_revision", "tokenizer_revision",
+        "config_hash", "dataset_path", "dataset_hash", "data_artifact_id", "parent_hashes",
+        "data_parent_hashes", "arguments", "environment", "checkpoints", "saved_artifacts",
+        "output_hash",
+    }
+    for (seed, arm), selection in selections.items():
+        path = Path(str(selection["training_manifest_file"]))
+        training = _load_json_object(path, "training manifest")
+        if set(training) != required_training:
+            raise ValueError(f"training manifest fields mismatch: {path}")
+        data_path = Path(str(training["dataset_path"]))
+        if (
+            training["kind"] != "phase_marker_training_run"
+            or training["seed"] != seed
+            or training["arm"] != arm
+            or training["model_id"] != config.model_id
+            or training["model_revision"] != QWEN25_7B_TOKENIZER_REVISION
+            or training["tokenizer_revision"] != QWEN25_7B_TOKENIZER_REVISION
+            or training["config_hash"] != sha256_json(asdict(config))
+            or training["data_parent_hashes"] != [split_id]
+            or training["data_artifact_id"] != expected_materializations[arm]
+            or training["parent_hashes"] != [expected_materializations[arm]]
+            or training["dataset_hash"] != sha256_json(data_path.read_bytes().hex())
+            or selection["materialization_artifact_id"] != expected_materializations[arm]
+        ):
+            raise ValueError(f"training/materialization lineage mismatch: {path}")
+        declared = training["checkpoints"]
+        selected_path = Path(str(selection["selected_path"]))
+        relative = str(selected_path.relative_to(path.parent))
+        if not isinstance(declared, list) or {
+            "path": relative, "hash": selection["selected_checkpoint_hash"]
+        } not in declared:
+            raise ValueError(f"selected checkpoint is not declared by training manifest: {path}")
 
 
 def _example_from_row(row: Mapping[str, object]) -> DatasetExample:
@@ -889,6 +1281,30 @@ def _required_hash(payload: Mapping[str, object], field: str, label: str) -> str
     if not isinstance(value, str) or len(value) != 64:
         raise ValueError(f"{label} missing {field}")
     return value
+
+
+def _behavior_directory_hash(path: Path) -> str:
+    records = [
+        {
+            "path": str(candidate.relative_to(path)),
+            "sha256": _file_hash(candidate),
+        }
+        for candidate in sorted(path.rglob("*"))
+        if candidate.is_file() and candidate.name != "run-manifest.json"
+    ]
+    return sha256_json(records)
+
+
+def _validate_adapter_compatibility(checkpoint: Path, config: ExperimentConfig) -> None:
+    adapter_config = _load_json_object(
+        checkpoint / "adapter_config.json", "adapter configuration"
+    )
+    if (
+        adapter_config.get("base_model_name_or_path") != config.model_id
+        or adapter_config.get("revision") != QWEN25_7B_TOKENIZER_REVISION
+        or not (checkpoint / "adapter_model.safetensors").is_file()
+    ):
+        raise ValueError("LoRA adapter is incompatible with the frozen base model/revision")
 
 
 def _file_hash(path: Path) -> str:

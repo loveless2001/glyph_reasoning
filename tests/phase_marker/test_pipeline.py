@@ -6,8 +6,11 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import shlex
+from types import SimpleNamespace
 
 import pytest
+import phase_marker.pipeline as pipeline_module
 
 from phase_marker.config import ExperimentConfig
 from phase_marker.io import canonical_json, sha256_json
@@ -169,25 +172,45 @@ def _write_training_runs(root: Path, config: ExperimentConfig) -> None:
         (root / "splits" / "manifest.json").read_text(encoding="utf-8")
     )["artifact_id"]
     for seed in config.confirmatory_seeds:
-        for arm_index, arm in enumerate(config.arms):
+        for arm in config.arms:
             materialization = json.loads(
                 (root / "training-data" / f"{arm}.manifest.json").read_text(encoding="utf-8")
             )
-            output_dir = (
-                root / "checkpoints" / "confirmatory" / f"seed-{seed}" / arm
-            )
+            output_dir = root / "checkpoints" / "confirmatory" / f"seed-{seed}" / arm
             output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+            (output_dir / "adapter_config.json").write_text(
+                canonical_json({
+                    "base_model_name_or_path": config.model_id,
+                    "revision": QWEN25_7B_TOKENIZER_REVISION,
+                }) + "\n", encoding="utf-8"
+            )
             (output_dir / "adapter_model.safetensors").write_bytes(
                 f"fixture adapter {seed} {arm}".encode()
             )
             (output_dir / "tokenizer_config.json").write_text("{}\n", encoding="utf-8")
             (output_dir / "trainer_state.json").write_text("{}\n", encoding="utf-8")
-            output_records = [
+            checkpoint_dir = output_dir / "checkpoint-100"
+            checkpoint_dir.mkdir()
+            for filename in (
+                "adapter_config.json",
+                "adapter_model.safetensors",
+                "tokenizer_config.json",
+                "trainer_state.json",
+            ):
+                source = output_dir / filename
+                target = checkpoint_dir / filename
+                target.write_bytes(source.read_bytes())
+            checkpoint_records = [
                 {
-                    "path": str(path.relative_to(output_dir)),
+                    "path": str(path.relative_to(checkpoint_dir)),
                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                 }
+                for path in sorted(checkpoint_dir.rglob("*"))
+                if path.is_file()
+            ]
+            checkpoint_hash = sha256_json(checkpoint_records)
+            output_records = [
+                {"path": str(path.relative_to(output_dir)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                 for path in sorted(output_dir.rglob("*"))
                 if path.is_file() and path.name != "run-manifest.json"
             ]
@@ -195,22 +218,132 @@ def _write_training_runs(root: Path, config: ExperimentConfig) -> None:
             _write_json(
                 output_dir / "run-manifest.json",
                 {
-                    "kind": "phase_marker_training_run",
-                    "arm": arm,
-                    "seed": seed,
-                    "model_id": config.model_id,
-                    "model_revision": QWEN25_7B_TOKENIZER_REVISION,
+                    "kind": "phase_marker_training_run", "arm": arm, "seed": seed,
+                    "model_id": config.model_id, "model_revision": QWEN25_7B_TOKENIZER_REVISION,
                     "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
-                    "config_hash": config_hash,
-                    "dataset_path": str(data_path),
+                    "config_hash": config_hash, "dataset_path": str(data_path),
                     "dataset_hash": sha256_json(data_path.read_bytes().hex()),
                     "data_artifact_id": materialization["artifact_id"],
                     "parent_hashes": [materialization["artifact_id"]],
                     "data_parent_hashes": [split_hash],
+                    "arguments": ["fixture"],
+                    "environment": {"fixture": True},
+                    "checkpoints": [
+                        {"path": "checkpoint-100", "hash": checkpoint_hash}
+                    ],
                     "saved_artifacts": ["adapter", "tokenizer", "trainer_state"],
                     "output_hash": sha256_json(output_records),
                 },
             )
+
+
+def _write_checkpoint_selections(root: Path, config: ExperimentConfig) -> None:
+    split_manifest = root / "splits" / "manifest.json"
+    split_id = json.loads(split_manifest.read_text(encoding="utf-8"))["artifact_id"]
+    validation_examples = root / "splits" / "validation.jsonl"
+    for seed in config.confirmatory_seeds:
+        for arm in config.arms:
+            training_path = root / "checkpoints" / "confirmatory" / f"seed-{seed}" / arm / "run-manifest.json"
+            checkpoint_path = training_path.parent / "checkpoint-100"
+            checkpoint_records = [
+                {"path": str(path.relative_to(checkpoint_path)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                for path in sorted(checkpoint_path.rglob("*"))
+                if path.is_file() and path.name != "run-manifest.json"
+            ]
+            checkpoint_hash = sha256_json(checkpoint_records)
+            materialization_id = json.loads(
+                (root / "training-data" / f"{arm}.manifest.json").read_text(encoding="utf-8")
+            )["artifact_id"]
+            training_hash = hashlib.sha256(training_path.read_bytes()).hexdigest()
+            candidate = {
+                "path": str(checkpoint_path), "checkpoint_hash": checkpoint_hash, "step": 100,
+                "strict_accuracy": 0.5, "mean_gold_answer_logprob": -1.0, "row_count": 600,
+            }
+            payload = {
+                "schema_version": 1, "kind": "phase_marker_checkpoint_selection",
+                "evidence_scope": "experiment", "backend": "vllm",
+                "config_hash": sha256_json(asdict(config)), "run_kind": "confirmatory",
+                "arm": arm, "seed": seed, "selected_on": "validation",
+                "criterion": {
+                    "primary": "maximize_strict_validation_exact_answer_accuracy",
+                    "tie_break_1": "higher_mean_gold_answer_logprob",
+                    "tie_break_2": "earliest_checkpoint_step",
+                },
+                "split_artifact_id": split_id,
+                "split_manifest_hash": hashlib.sha256(split_manifest.read_bytes()).hexdigest(),
+                "validation_examples_file": str(validation_examples),
+                "validation_examples_hash": hashlib.sha256(validation_examples.read_bytes()).hexdigest(),
+                "training_manifest_file": str(training_path), "training_manifest_hash": training_hash,
+                "materialization_artifact_id": materialization_id, "candidates": [candidate],
+                "selected_path": str(checkpoint_path), "selected_checkpoint_hash": checkpoint_hash,
+                "selected_step": 100,
+                "parent_hashes": [split_id, materialization_id, training_hash], "completed": True,
+            }
+            payload["artifact_id"] = sha256_json(payload)
+            _write_json(
+                root / "checkpoint-selections" / "confirmatory" / f"seed-{seed}" / f"{arm}.json",
+                payload,
+            )
+
+
+def _write_behavior_and_audit(root: Path, config: ExperimentConfig) -> tuple[Path, Path]:
+    split_id = _write_split(root, config)
+    generation_root = root / "raw-generations" / "confirmatory"
+    generation_root.mkdir(parents=True)
+    records = [
+        {"generation_id": f"audit:{source}:{index}", "source": source}
+        for source in ("gsm8k", "svamp", "math") for index in range(100)
+    ]
+    records_path = generation_root / "records.jsonl"
+    records_path.write_text(
+        "".join(canonical_json(row) + "\n" for row in records), encoding="utf-8"
+    )
+    split_manifest = root / "splits" / "manifest.json"
+    examples_path = root / "splits" / "test.jsonl"
+    behavior = {
+        "schema_version": 1, "kind": "phase_marker_behavior_generations",
+        "evidence_scope": "experiment_candidate", "backend": "vllm",
+        "config_hash": sha256_json(asdict(config)), "run_kind": "confirmatory",
+        "seeds": [101, 202, 303], "split_artifact_id": split_id,
+        "split_manifest_hash": hashlib.sha256(split_manifest.read_bytes()).hexdigest(),
+        "materialization_artifact_ids": {}, "checkpoint_artifact_ids": {},
+        "checkpoint_manifest_hashes": {}, "checkpoint_manifests": {},
+        "examples_file": str(examples_path),
+        "examples_hash": hashlib.sha256(examples_path.read_bytes()).hexdigest(),
+        "records_file": records_path.name,
+        "records_hash": hashlib.sha256(records_path.read_bytes()).hexdigest(),
+        "row_count": len(records), "record_hashes": [sha256_json(row) for row in records],
+        "exclusions": [], "parent_hashes": [split_id], "completed": True,
+    }
+    behavior["artifact_id"] = sha256_json(behavior)
+    behavior_path = generation_root / "manifest.json"
+    _write_json(behavior_path, behavior)
+    labels_path = root / "audit" / "manual-labels.tsv"
+    labels_path.parent.mkdir(parents=True)
+    labels_path.write_text(
+        "generation_id\tsource\tmanual_correct\n"
+        + "".join(
+            f"audit:{source}:{index}\t{source}\ttrue\n"
+            for source in ("gsm8k", "svamp", "math") for index in range(100)
+        ),
+        encoding="utf-8",
+    )
+    audit = {
+        "schema_version": 1, "kind": "phase_marker_manual_audit",
+        "evidence_scope": "experiment", "config_hash": sha256_json(asdict(config)),
+        "run_kind": "confirmatory", "seeds": [101, 202, 303],
+        "behavior_artifact_id": behavior["artifact_id"],
+        "behavior_manifest_hash": hashlib.sha256(behavior_path.read_bytes()).hexdigest(),
+        "labels_file": str(labels_path),
+        "labels_hash": hashlib.sha256(labels_path.read_bytes()).hexdigest(),
+        "row_count": 300, "source_counts": {"gsm8k": 100, "svamp": 100, "math": 100},
+        "disagreements": 0, "total": 300, "rate": 0.0, "passed": True,
+        "parent_hashes": [behavior["artifact_id"]], "completed": True,
+    }
+    audit["artifact_id"] = sha256_json(audit)
+    audit_path = root / "audit" / "confirmatory" / "manifest.json"
+    _write_json(audit_path, audit)
+    return behavior_path, audit_path
 
 
 def test_gate_result_is_frozen() -> None:
@@ -305,6 +438,100 @@ def test_command_manifest_binds_operator_supplied_approval_metadata(
     )
     assert all(job["approval_ready"] is True for job in jobs)
     assert all(job["approval"] == asdict(approval) for job in jobs)
+    assert all("phase_marker.behavior select" in job["selection_command"] for job in jobs)
+    assert all(
+        any(path.endswith(f"/{job['arm']}.json") for path in job["expected_outputs"])
+        for job in jobs
+    )
+
+
+@pytest.mark.parametrize("stage", pipeline_module.STAGES)
+def test_each_successful_stage_constructs_only_its_requested_commands(
+    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    artifact = "a" * 64
+    monkeypatch.setattr(pipeline_module, "_validate_split_manifest", lambda *_: SimpleNamespace(artifact_id=artifact))
+    monkeypatch.setattr(pipeline_module, "_validate_materializations", lambda *_: (artifact,) * 6)
+    monkeypatch.setattr(pipeline_module, "_validate_training_runs", lambda *_, **__: (artifact,))
+    monkeypatch.setattr(pipeline_module, "_validate_checkpoint_selections", lambda *_, **__: (artifact,))
+    monkeypatch.setattr(pipeline_module, "_validate_behavior_manifest", lambda *_, **__: artifact)
+    monkeypatch.setattr(pipeline_module, "_validate_audit_manifest", lambda *_, **__: artifact)
+    monkeypatch.setattr(pipeline_module, "_validate_synthetic_manifest", lambda *_: artifact)
+    monkeypatch.setattr(pipeline_module, "_validate_capture_inputs", lambda *_: (artifact,))
+    monkeypatch.setattr(pipeline_module, "_validate_activation_manifest", lambda *_: artifact)
+    monkeypatch.setattr(pipeline_module, "_validate_intervention_inputs", lambda *_: (artifact,))
+    monkeypatch.setattr(
+        pipeline_module,
+        "_validate_synthetic_preregistration",
+        lambda *_, **__: artifact,
+    )
+    _write_json(
+        tmp_path / "synthetic-preregistration.json",
+        {"seed": 42, "counts": {"train": 8, "validation": 4, "test": 4}},
+    )
+    approval = ApprovalMetadata(
+        hardware="1x H100", max_duration_hours=2, estimated_gpu_hours=2,
+        spend_cap_usd=10, estimated_spend_usd=8, evaluation_workload="bounded fixture",
+    )
+
+    result = pipeline_module._run_gate(
+        stage, config, tmp_path, kind="pilot", seeds=(42,), config_path=CONFIG_PATH,
+        approval=approval,
+    )
+
+    assert result.passed is True
+    assert result.next_commands
+
+
+def test_synthetic_command_rejects_preregistered_seed_mismatch(
+    tmp_path: Path, config: ExperimentConfig
+) -> None:
+    preregistration = {
+        "schema_version": 1, "kind": "phase_marker_synthetic_preregistration",
+        "config_hash": sha256_json(asdict(config)), "seed": 101,
+        "counts": {"train": 8, "validation": 4, "test": 4},
+        "family_balance": [
+            "modular_chain", "affine_chain", "two_source_numeric_composition",
+            "string_transformation_composition",
+        ],
+        "conditions": ["glyph", "dot", "repeated_glyph", "permuted_glyph", "random_symbol", "no_slot"],
+        "workspace_lengths": [12, 16, 64],
+    }
+    preregistration["protocol_hash"] = sha256_json(preregistration)
+    _write_json(
+        tmp_path / "synthetic-preregistration.json",
+        preregistration,
+    )
+    result = pipeline_module._run_gate(
+        "synthetic", config, tmp_path, kind="pilot", seeds=(42,),
+        config_path=CONFIG_PATH, approval=None,
+    )
+    assert result.passed is False
+    assert "seed" in result.reason
+
+
+def test_emitted_audit_and_analysis_commands_use_tsv_and_bound_manifest(
+    tmp_path: Path, config: ExperimentConfig
+) -> None:
+    audit = shlex.split(
+        pipeline_module._commands_for_stage(
+            "audit", config, tmp_path, kind="confirmatory", seeds=(101, 202, 303),
+            config_path=CONFIG_PATH, approval=None,
+        )[0]
+    )
+    analysis = shlex.split(
+        pipeline_module._commands_for_stage(
+            "statistics", config, tmp_path, kind="confirmatory", seeds=(101, 202, 303),
+            config_path=CONFIG_PATH, approval=None,
+        )[0]
+    )
+    assert audit[audit.index("--manual-labels") + 1].endswith("audit/manual-labels.tsv")
+    assert audit[audit.index("--output-root") + 1].endswith("audit/confirmatory")
+    assert analysis[analysis.index("--generations") + 1].endswith("raw-generations")
+    assert analysis[analysis.index("--manual-audit") + 1].endswith("audit/manual-labels.tsv")
+    assert analysis[analysis.index("--audit-manifest") + 1].endswith(
+        "audit/confirmatory/manifest.json"
+    )
 
 
 def test_train_gate_validates_real_split_and_materialization_manifests(
@@ -486,6 +713,22 @@ def test_behavior_gate_requires_training_completion_markers(
     assert "completion markers" in result.reason
 
 
+def test_behavior_gate_requires_complete_validation_selection_matrix(
+    tmp_path: Path, config: ExperimentConfig
+) -> None:
+    _write_split(tmp_path, config)
+    _write_materializations(tmp_path, config)
+    _write_training_runs(tmp_path, config)
+    _write_checkpoint_selections(tmp_path, config)
+    missing = tmp_path / "checkpoint-selections" / "confirmatory" / "seed-303" / "filler.json"
+    missing.unlink()
+
+    result = run_gate("behavior", config, tmp_path)
+
+    assert result.passed is False
+    assert "selection" in result.reason
+
+
 @pytest.mark.parametrize(
     "stage",
     ("render", "tokenize", "train", "behavior", "audit", "statistics", "capture", "intervene"),
@@ -582,59 +825,61 @@ def test_gate_cli_prints_only_and_never_executes(
 def test_statistics_gate_rejects_audit_with_wrong_config_hash(
     tmp_path: Path, config: ExperimentConfig
 ) -> None:
-    split_id = _write_split(tmp_path, config)
-    generation_root = tmp_path / "raw-generations" / "confirmatory"
-    generation_root.mkdir(parents=True)
-    (generation_root / "records.jsonl").write_text(
-        canonical_json({"generation_id": "g-1"}) + "\n", encoding="utf-8"
-    )
-    records_path = generation_root / "records.jsonl"
-    split_manifest = tmp_path / "splits" / "manifest.json"
-    examples_path = tmp_path / "splits" / "test.jsonl"
-    behavior = {
-        "schema_version": 1,
-        "kind": "phase_marker_behavior_generations",
-        "evidence_scope": "experiment_candidate",
-        "backend": "vllm",
-        "config_hash": sha256_json(asdict(config)),
-        "run_kind": "confirmatory",
-        "seeds": [101, 202, 303],
-        "split_artifact_id": split_id,
-        "split_manifest_hash": hashlib.sha256(split_manifest.read_bytes()).hexdigest(),
-        "materialization_artifact_ids": {},
-        "checkpoint_artifact_ids": {},
-        "checkpoint_manifest_hashes": {},
-        "checkpoint_manifests": {},
-        "examples_file": str(examples_path),
-        "examples_hash": hashlib.sha256(examples_path.read_bytes()).hexdigest(),
-        "records_file": "records.jsonl",
-        "records_hash": hashlib.sha256(records_path.read_bytes()).hexdigest(),
-        "row_count": 1,
-        "record_hashes": [sha256_json({"generation_id": "g-1"})],
-        "exclusions": [],
-        "parent_hashes": [split_id],
-        "completed": True,
-    }
-    behavior["artifact_id"] = sha256_json(behavior)
-    _write_json(generation_root / "manifest.json", behavior)
-    _write_json(
-        tmp_path / "audit" / "manifest.json",
-        {
-            "artifact_id": "d" * 64,
-            "kind": "phase_marker_manual_audit",
-            "config_hash": "0" * 64,
-            "run_kind": "confirmatory",
-            "seeds": [101, 202, 303],
-            "parent_hashes": [behavior["artifact_id"]],
-            "disagreements": 0,
-            "total": 100,
-            "rate": 0.0,
-            "passed": True,
-            "completed": True,
-        },
-    )
+    _, audit_path = _write_behavior_and_audit(tmp_path, config)
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit["config_hash"] = "0" * 64
+    audit.pop("artifact_id")
+    audit["artifact_id"] = sha256_json(audit)
+    _write_json(audit_path, audit)
 
     result = run_gate("statistics", config, tmp_path)
 
     assert not result.passed
     assert "config hash mismatch" in result.reason
+
+
+@pytest.mark.parametrize("tamper", ("plumbing", "one-row", "forged-artifact"))
+def test_statistics_gate_rejects_nonproduction_or_forged_audit(
+    tmp_path: Path, config: ExperimentConfig, tamper: str
+) -> None:
+    _, audit_path = _write_behavior_and_audit(tmp_path, config)
+    payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    if tamper == "plumbing":
+        payload["evidence_scope"] = "plumbing_only"
+        payload["artifact_id"] = sha256_json({key: value for key, value in payload.items() if key != "artifact_id"})
+    elif tamper == "one-row":
+        payload["row_count"] = payload["total"] = 1
+        payload["source_counts"] = {"gsm8k": 1}
+        payload["artifact_id"] = sha256_json({key: value for key, value in payload.items() if key != "artifact_id"})
+    else:
+        payload["artifact_id"] = "f" * 64
+    _write_json(audit_path, payload)
+
+    result = run_gate("statistics", config, tmp_path)
+
+    assert result.passed is False
+    assert any(word in result.reason for word in ("production", "300", "artifact"))
+
+
+def test_statistics_gate_rejects_label_not_bound_to_behavior_generation(
+    tmp_path: Path, config: ExperimentConfig
+) -> None:
+    _, audit_path = _write_behavior_and_audit(tmp_path, config)
+    payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    labels_path = Path(payload["labels_file"])
+    labels_path.write_text(
+        labels_path.read_text(encoding="utf-8").replace(
+            "audit:gsm8k:0\tgsm8k", "unbound:gsm8k:0\tgsm8k", 1
+        ),
+        encoding="utf-8",
+    )
+    payload["labels_hash"] = hashlib.sha256(labels_path.read_bytes()).hexdigest()
+    payload["artifact_id"] = sha256_json(
+        {key: value for key, value in payload.items() if key != "artifact_id"}
+    )
+    _write_json(audit_path, payload)
+
+    result = run_gate("statistics", config, tmp_path)
+
+    assert result.passed is False
+    assert "behavior generation" in result.reason

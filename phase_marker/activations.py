@@ -794,6 +794,13 @@ def _run_capture(args: argparse.Namespace) -> dict[str, object]:
         or parents["synthetic"].get("backend") != "production"
     ):
         raise ValueError("production capture requires production behavior and synthetic evidence")
+    if args.backend == "hf":
+        _validate_capture_bound_files(
+            parents["behavior"], args.behavior_manifest, "behavior"
+        )
+        _validate_capture_bound_files(
+            parents["synthetic"], args.synthetic_manifest, "synthetic"
+        )
     checkpoint = parents["checkpoint"]
     if checkpoint.get("model_id") != args.model_id or checkpoint.get("model_revision") != args.model_revision:
         raise ValueError("capture checkpoint model identity mismatch")
@@ -875,6 +882,46 @@ def _load_capture_parent(
     if payload.get("evidence_scope") == "plumbing_only" and label in {"behavior", "synthetic"}:
         raise ValueError(f"production capture rejects plumbing-only {label} evidence")
     return payload
+
+
+def _validate_capture_bound_files(
+    payload: Mapping[str, object], manifest_path: Path, label: str
+) -> None:
+    if label == "behavior":
+        bindings = (
+            (manifest_path.parent / str(payload["records_file"]), payload["records_hash"]),
+            (Path(str(payload["examples_file"])), payload["examples_hash"]),
+        )
+        for path, expected_hash in bindings:
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
+                raise ValueError(f"behavior bound file is missing or stale: {path}")
+        records_path = bindings[0][0]
+        rows = [
+            json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if (
+            not rows
+            or payload.get("row_count") != len(rows)
+            or payload.get("record_hashes") != [sha256_json(row) for row in rows]
+        ):
+            raise ValueError("behavior bound record count or hashes mismatch")
+        manifests = payload.get("checkpoint_manifests")
+        hashes = payload.get("checkpoint_manifest_hashes")
+        if not isinstance(manifests, Mapping) or not isinstance(hashes, Mapping):
+            raise ValueError("behavior checkpoint bindings are malformed")
+        for key, value in manifests.items():
+            path = Path(str(value))
+            if key not in hashes or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != hashes[key]:
+                raise ValueError("behavior checkpoint manifest is missing or stale")
+        return
+    data_hashes = payload.get("data_hashes")
+    if not isinstance(data_hashes, Mapping):
+        raise ValueError("synthetic data hashes are malformed")
+    for split, expected_hash in data_hashes.items():
+        path = manifest_path.parent / f"{split}.jsonl"
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
+            raise ValueError(f"synthetic bound file is missing or stale: {path}")
 
 
 if __name__ == "__main__":

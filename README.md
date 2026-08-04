@@ -100,10 +100,26 @@ never reports approval readiness.
 
 Behavior runs additionally require the immutable split manifest, exact example
 file, and one validation-selected checkpoint manifest for every requested
-seed/arm pair. Synthetic production builds require
+seed/arm pair. The approval manifest includes a separate `behavior select`
+workload for each adapter: it scores every training-manifest-declared
+checkpoint on the validation split only, ranks strict exact-answer accuracy,
+then teacher-forced mean gold-answer log probability, then earliest step. The
+selected PEFT adapter must name the frozen Qwen base model and revision;
+production behavior loads that base with vLLM LoRA enabled and supplies the
+selected adapter as a `LoRARequest`.
+
+The audit command reads the operator-owned TSV at
+`audit/manual-labels.tsv` and writes its schema-v1 evidence envelope below
+`audit/<pilot|confirmatory>/`. It requires exactly 300 unique behavior-bound
+generation IDs: 100 each from GSM8K, SVAMP, and MATH. Analysis accepts an
+explicit `--audit-manifest`; when omitted it resolves exactly one matching
+sibling audit envelope and rejects ambiguous or plumbing-only evidence.
+
+Synthetic production builds require
 `artifacts/phase-marker/synthetic-preregistration.json`, a schema-v1 envelope
 that fixes the seed, split counts, family balance, workspace conditions and
-lengths, and protocol hash. Capture and intervention commands consume explicit
+lengths, and protocol hash; its seed must match the requested run before a
+command is emitted. Capture and intervention commands consume explicit
 schema-v1 selection, batch/pair, checkpoint, and parent manifests; the
 `tiny-fixture` backends require `--allow-test-backend` and emit
 `evidence_scope=plumbing_only`, which production gates reject.

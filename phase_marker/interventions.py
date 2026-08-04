@@ -997,12 +997,33 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
     rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines() if line]
     required = {
         "pair_id", "recipient_id", "donor_id", "recipient_batch_path", "donor_batch_path",
+        "recipient_batch_hash", "donor_batch_hash",
         "target_token_ids", "method", "layer", "positions", "norm_match", "control_name",
     }
     if not rows or any(not isinstance(row, dict) or set(row) != required for row in rows):
         raise ValueError("aligned pair rows must use the exact schema")
     if pairs.get("row_count") != len(rows) or pairs.get("row_hashes") != [sha256_json(row) for row in rows]:
         raise ValueError("aligned pair row count or hashes mismatch")
+    allowed = {
+        "residual_patch": {"donor", "random_donor"},
+        "ablate": {"zero", "validation_mean", "within_batch_shuffle", "matched_non_marker_position"},
+        "kv_transplant": {"donor"},
+    }
+    for row in rows:
+        method = row["method"]
+        control = row["control_name"]
+        if method not in allowed or control not in allowed[method]:
+            raise ValueError("aligned pair method/control combination is not allowed")
+        for path_field, hash_field in (
+            ("recipient_batch_path", "recipient_batch_hash"),
+            ("donor_batch_path", "donor_batch_hash"),
+        ):
+            batch_path = Path(row[path_field])
+            if (
+                not batch_path.is_file()
+                or row[hash_field] != hashlib.sha256(batch_path.read_bytes()).hexdigest()
+            ):
+                raise ValueError("aligned pair batch path or hash mismatch")
     if args.backend == "tiny-fixture":
         manifest = _smoke(args.output_root)
     else:
@@ -1026,8 +1047,10 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
                 result = patch_residual_positions(model, recipient, donor, spec)
             elif row["method"] == "ablate":
                 result = ablate_positions(model, recipient, spec)
-            else:
+            elif row["method"] == "kv_transplant":
                 result = transplant_kv_positions(model, recipient, donor, spec)
+            else:  # pragma: no cover - prevalidation above is authoritative
+                raise ValueError(f"unknown intervention method {row['method']!r}")
             produced.extend(result.records)
         args.output_root.mkdir(parents=True, exist_ok=False)
         records_path = args.output_root / "records.jsonl"

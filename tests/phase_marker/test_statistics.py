@@ -3,10 +3,13 @@ from __future__ import annotations
 from collections import Counter
 import csv
 from dataclasses import asdict
+import hashlib
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
+import phase_marker.statistics as statistics_module
 
 from phase_marker.schema import ScoreRecord
 from phase_marker.statistics import (
@@ -27,6 +30,104 @@ from phase_marker.statistics import (
     read_manual_audit_tsv,
     write_confirmatory_outputs,
 )
+from phase_marker.config import ExperimentConfig
+from phase_marker.io import canonical_json, sha256_json
+from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
+
+
+def test_behavior_root_resolves_exactly_one_kind_manifest(tmp_path):
+    manifest = tmp_path / "raw-generations" / "confirmatory" / "manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('{"kind":"fixture"}\n', encoding="utf-8")
+
+    path, payload = statistics_module._load_behavior_envelope(tmp_path / "raw-generations")
+
+    assert path == manifest
+    assert payload == {"kind": "fixture"}
+
+
+def test_analyze_parser_accepts_optional_explicit_audit_manifest(tmp_path):
+    with pytest.raises(FileNotFoundError, match="behavior manifest"):
+        statistics_module.main(
+            (
+                "analyze", "--config", "configs/phase-marker-qwen25-7b.toml",
+                "--generations", str(tmp_path / "raw-generations"),
+                "--manual-audit", str(tmp_path / "audit" / "manual-labels.tsv"),
+                "--audit-manifest", str(tmp_path / "audit" / "confirmatory" / "manifest.json"),
+                "--output-root", str(tmp_path / "analysis"),
+            )
+        )
+
+
+def test_exact_task13_audit_and_analysis_paths_succeed_on_faithful_fixture(tmp_path):
+    config_path = Path("configs/phase-marker-qwen25-7b.toml")
+    config = ExperimentConfig.load(config_path)
+    config_hash = sha256_json(asdict(config))
+    scores = [
+        _score(
+            source, f"{source}-q{question}", seed, arm, prompt,
+            (question + seed + cell) % 3 != 0,
+        )
+        for source in ("gsm8k", "svamp", "math")
+        for question in range(25)
+        for seed in (101, 202, 303)
+        for cell, (arm, prompt) in enumerate((
+            ("semantic", "neutral"), ("glyph", "glyph"),
+            ("glyph", "dot"), ("dot", "dot"),
+        ))
+    ]
+    parent = "a" * 64
+    rows = [_envelope_from_score(score, parent) for score in scores]
+    generation_root = tmp_path / "raw-generations" / "confirmatory"
+    generation_root.mkdir(parents=True)
+    records_path = generation_root / "records.jsonl"
+    records_path.write_text(
+        "".join(canonical_json(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    examples = tmp_path / "examples.jsonl"
+    examples.write_text(canonical_json({"fixture": True}) + "\n", encoding="utf-8")
+    behavior = {
+        "schema_version": 1, "kind": "phase_marker_behavior_generations",
+        "evidence_scope": "experiment_candidate", "backend": "vllm",
+        "config_hash": config_hash, "run_kind": "confirmatory", "seeds": [101, 202, 303],
+        "split_artifact_id": parent, "split_manifest_hash": "b" * 64,
+        "materialization_artifact_ids": {}, "checkpoint_artifact_ids": {},
+        "checkpoint_manifest_hashes": {}, "checkpoint_manifests": {},
+        "examples_file": str(examples), "examples_hash": hashlib.sha256(examples.read_bytes()).hexdigest(),
+        "records_file": records_path.name, "records_hash": hashlib.sha256(records_path.read_bytes()).hexdigest(),
+        "row_count": len(rows), "record_hashes": [sha256_json(row) for row in rows],
+        "exclusions": [], "parent_hashes": [parent], "completed": True,
+    }
+    behavior["artifact_id"] = sha256_json(behavior)
+    (generation_root / "manifest.json").write_text(canonical_json(behavior) + "\n", encoding="utf-8")
+    labels = tmp_path / "audit" / "manual-labels.tsv"
+    selected = generate_manual_audit_template(scores, labels, seed=20260804)
+    by_id = {score.generation_id: score.correct for score in selected}
+    with labels.open(encoding="utf-8", newline="") as handle:
+        label_rows = list(csv.DictReader(handle, delimiter="\t"))
+        fieldnames = handle.seek(0) or list(label_rows[0])
+    with labels.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        for row in label_rows:
+            row["manual_correct"] = str(by_id[row["generation_id"]]).lower()
+            writer.writerow(row)
+
+    assert statistics_module.main((
+        "audit", "--config", str(config_path), "--kind", "confirmatory", "--seeds", "101", "202", "303",
+        "--generations", str(tmp_path / "raw-generations"), "--manual-labels", str(labels),
+        "--output-root", str(tmp_path / "audit" / "confirmatory"),
+    )) == 0
+    audit_manifest = json.loads(
+        (tmp_path / "audit" / "confirmatory" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert audit_manifest["evidence_scope"] == "experiment"
+    assert statistics_module.main((
+        "analyze", "--config", str(config_path),
+        "--generations", str(tmp_path / "raw-generations"),
+        "--manual-audit", str(labels), "--output-root", str(tmp_path / "analysis"),
+    )) == 0
+    assert (tmp_path / "analysis" / "manifest.json").is_file()
 
 
 def test_paired_bootstrap_aligns_full_keys_and_uses_local_seeded_rng():
@@ -452,6 +553,33 @@ def _score(
     )
 
 
+def _envelope_from_score(score: ScoreRecord, parent_hash: str) -> dict[str, object]:
+    decoding = {
+        "seed": score.seed, "adapter_seed": score.seed, "checkpoint": "/checkpoints/adapter",
+        "run_kind": "production", "config_hash": "c" * 64,
+        "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
+        "split_artifact_id": parent_hash, "split_parent_hashes": [],
+        "max_tokens": 64, "max_new_tokens": 64, "temperature": 0.0, "top_p": 1.0,
+        "n": 1, "completion_index": None, "completion_token_logprobs": [-0.1],
+        "evaluation_kind": "primary", "perturbation": None,
+    }
+    return {
+        "generation_id": score.generation_id, "source": score.source,
+        "question_hash": score.question_hash, "gold_answer": score.gold_answer,
+        "training_arm": score.training_arm, "seed": score.seed,
+        "checkpoint": "/checkpoints/adapter", "prompt_condition": score.prompt_condition,
+        "prompt_hash": "d" * 64, "raw_prompt": "solve",
+        "raw_completion": f"Final answer: {score.extracted_answer}",
+        "prompt_token_ids": [1], "completion_token_ids": [2], "decoding": decoding,
+        "parent_hashes": [parent_hash], "prompt_token_count": 1, "completion_token_count": 1,
+        "provenance": {
+            "run_kind": "production", "adapter_seed": score.seed, "config_hash": "c" * 64,
+            "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
+            "split_artifact_id": parent_hash, "split_parent_hashes": [],
+            "checkpoint": "/checkpoints/adapter", "parent_hashes": [parent_hash],
+        },
+        "score": asdict(score),
+    }
 def _model_records() -> list[ScoreRecord]:
     records = []
     for source_index, source in enumerate(("gsm8k", "svamp", "math")):

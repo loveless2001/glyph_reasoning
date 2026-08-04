@@ -684,9 +684,15 @@ def test_run_cli_tiny_fixture_emits_plumbing_only_envelope(tmp_path: Path):
     checkpoint = parent(
         "checkpoint", model_id=config.model_id, model_revision="deadbeef", checkpoint_path="/fixture"
     )
+    recipient_path = tmp_path / "recipient.pt"
+    donor_path = tmp_path / "donor.pt"
+    recipient_path.write_bytes(b"recipient")
+    donor_path.write_bytes(b"donor")
     row = {
         "pair_id": "pair-1", "recipient_id": "r", "donor_id": "d",
-        "recipient_batch_path": "/fixture/r.pt", "donor_batch_path": "/fixture/d.pt",
+        "recipient_batch_path": str(recipient_path), "donor_batch_path": str(donor_path),
+        "recipient_batch_hash": hashlib.sha256(recipient_path.read_bytes()).hexdigest(),
+        "donor_batch_hash": hashlib.sha256(donor_path.read_bytes()).hexdigest(),
         "target_token_ids": [4], "method": "residual_patch", "layer": 0,
         "positions": [2, 3], "norm_match": False, "control_name": "donor",
     }
@@ -711,3 +717,24 @@ def test_run_cli_tiny_fixture_emits_plumbing_only_envelope(tmp_path: Path):
     assert manifest["schema_version"] == 1
     assert manifest["evidence_scope"] == "plumbing_only"
     assert manifest["backend"] == "tiny-fixture"
+
+    row["method"] = "mystery_patch"
+    rows_path.write_text(canonical_json(row) + "\n", encoding="utf-8")
+    pairs_payload = json.loads(pairs.read_text(encoding="utf-8"))
+    pairs_payload["rows_hash"] = hashlib.sha256(rows_path.read_bytes()).hexdigest()
+    pairs_payload["row_hashes"] = [sha256_json(row)]
+    pairs_payload.pop("artifact_id")
+    pairs_payload["artifact_id"] = sha256_json(pairs_payload)
+    pairs.write_text(canonical_json(pairs_payload) + "\n", encoding="utf-8")
+    rejected_output = tmp_path / "unknown-output"
+    with pytest.raises(ValueError, match="method"):
+        main(
+            (
+                "run", "--config", str(config_path), "--validation-selection-manifest", str(selection),
+                "--aligned-pairs-manifest", str(pairs), "--activation-manifest", str(activation),
+                "--checkpoint-manifest", str(checkpoint), "--model-id", config.model_id,
+                "--model-revision", "deadbeef", "--backend", "tiny-fixture",
+                "--allow-test-backend", "--output-root", str(rejected_output),
+            )
+        )
+    assert not rejected_output.exists()

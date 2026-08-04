@@ -1082,6 +1082,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     analyze.add_argument("--config", type=Path, required=True)
     analyze.add_argument("--generations", type=Path, required=True)
     analyze.add_argument("--manual-audit", type=Path, required=True)
+    analyze.add_argument("--audit-manifest", type=Path)
     analyze.add_argument("--output-root", type=Path, required=True)
     analyze.add_argument("--allow-test-evidence", action="store_true")
     arguments = parser.parse_args(argv)
@@ -1111,13 +1112,11 @@ def _run_audit(arguments: argparse.Namespace) -> int:
         raise ValueError("manual audit requires exactly 300 labels and 100 per source")
     manual = read_manual_audit_tsv(arguments.manual_labels)
     result = apply_audit_gate(selected, manual, threshold=0.01)
-    if arguments.output_root.exists():
-        raise FileExistsError(f"refusing to overwrite audit output: {arguments.output_root}")
-    arguments.output_root.mkdir(parents=True)
+    _prepare_audit_output_root(arguments.output_root, arguments.manual_labels)
     manifest: dict[str, object] = {
         "schema_version": 1,
         "kind": "phase_marker_manual_audit",
-        "evidence_scope": behavior["evidence_scope"],
+        "evidence_scope": "experiment" if behavior["evidence_scope"] != "plumbing_only" else "plumbing_only",
         "config_hash": sha256_json(asdict(config)),
         "run_kind": arguments.kind,
         "seeds": list(arguments.seeds),
@@ -1151,12 +1150,17 @@ def _run_analyze(arguments: argparse.Namespace) -> int:
         behavior_path, behavior, config, arguments.allow_test_evidence,
         kind=kind, seeds=tuple(seeds)
     )
-    audit_path = arguments.manual_audit.parent / "manifest.json"
+    audit_path = _resolve_audit_manifest(
+        arguments.manual_audit, kind, arguments.audit_manifest
+    )
     audit = _statistics_read_object(audit_path, "audit manifest")
     if (
         set(audit) != _AUDIT_ENVELOPE_FIELDS
         or audit.get("schema_version") != 1
         or audit.get("kind") != "phase_marker_manual_audit"
+        or audit.get("evidence_scope") != (
+            "plumbing_only" if arguments.allow_test_evidence else "experiment"
+        )
         or audit.get("config_hash") != sha256_json(asdict(config))
         or audit.get("behavior_artifact_id") != behavior.get("artifact_id")
         or audit.get("labels_file") != str(arguments.manual_audit)
@@ -1213,8 +1217,46 @@ def _run_analyze(arguments: argparse.Namespace) -> int:
 
 
 def _load_behavior_envelope(generations: Path) -> tuple[Path, Mapping[str, object]]:
-    path = generations / "manifest.json" if generations.is_dir() else generations
+    if not generations.is_dir():
+        path = generations
+    elif (generations / "manifest.json").is_file():
+        path = generations / "manifest.json"
+    else:
+        candidates = tuple(sorted(generations.glob("*/manifest.json")))
+        if len(candidates) != 1:
+            raise ValueError(
+                "generations root must contain exactly one audit-bound kind manifest"
+            )
+        path = candidates[0]
     return path, _statistics_read_object(path, "behavior manifest")
+
+
+def _resolve_audit_manifest(
+    manual_audit: Path, kind: object, explicit: Path | None
+) -> Path:
+    if explicit is not None:
+        return explicit
+    if not isinstance(kind, str) or not kind:
+        raise ValueError("cannot infer audit manifest without a run kind")
+    candidates = tuple(
+        path for path in (
+            manual_audit.parent / "manifest.json",
+            manual_audit.parent / kind / "manifest.json",
+        ) if path.is_file()
+    )
+    if len(candidates) != 1:
+        raise ValueError("manual audit path does not resolve exactly one audit manifest")
+    return candidates[0]
+
+
+def _prepare_audit_output_root(output_root: Path, labels_path: Path) -> None:
+    if not output_root.exists():
+        output_root.mkdir(parents=True)
+        return
+    existing = {path.name for path in output_root.iterdir()}
+    allowed = labels_path.parent == output_root and existing == {labels_path.name}
+    if not allowed:
+        raise FileExistsError(f"refusing to overwrite audit output: {output_root}")
 
 
 def _validate_analysis_parent(
