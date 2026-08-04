@@ -13,9 +13,12 @@ import pytest
 import phase_marker.pipeline as pipeline_module
 
 from phase_marker.config import ExperimentConfig
+from phase_marker.behavior import _selection_generation
+from phase_marker.scoring import score_generation
 from phase_marker.io import canonical_json, sha256_json
 from phase_marker.pipeline import (
     ApprovalMetadata,
+    MechanismApprovalMetadata,
     GateResult,
     build_command_manifest,
     main,
@@ -257,19 +260,31 @@ def _write_checkpoint_selections(root: Path, config: ExperimentConfig) -> None:
             training_hash = hashlib.sha256(training_path.read_bytes()).hexdigest()
             candidate = {
                 "path": str(checkpoint_path), "checkpoint_hash": checkpoint_hash, "step": 100,
-                "strict_accuracy": 0.5, "mean_gold_answer_logprob": -1.0, "row_count": 600,
+                "strict_accuracy": 0.0, "mean_gold_answer_logprob": -1.0, "row_count": 600,
             }
             selection_path = (
-                root / "checkpoint-selections" / "confirmatory" / f"seed-{seed}" / f"{arm}.json"
+                root / "checkpoint-selections" / "confirmatory" / f"seed-{seed}" / arm / "manifest.json"
             )
-            evidence_path = selection_path.with_suffix(".evidence.jsonl")
+            evidence_path = selection_path.parent / "evidence.jsonl"
             validation_rows = [json.loads(line) for line in validation_examples.read_text().splitlines()]
             evidence_path.parent.mkdir(parents=True, exist_ok=True)
             evidence_path.write_text("".join(canonical_json({
-                "example_id": row["example_id"], "question_hash": row["question_hash"],
+                "dataset": row["source"], "example_id": row["example_id"],
+                "question_hash": row["question_hash"], "gold_answer": row["answer"],
                 "checkpoint_id": checkpoint_hash, "checkpoint_path": str(checkpoint_path),
-                "strict_correct": index % 2 == 0,
+                "raw_greedy_completion": "Final answer: definitely_not_the_gold_answer",
+                "scorer_inputs": {"source": row["source"], "gold_answer": row["answer"]},
+                "scorer_outputs": asdict(score_generation(_selection_generation(
+                    __import__("phase_marker.splits", fromlist=["DatasetExample"]).DatasetExample(**row),
+                    "Final answer: definitely_not_the_gold_answer", arm, seed, str(checkpoint_path),
+                ))),
+                "gold_continuation": f"\n{config.final_delimiter} {row['answer']}",
+                "gold_token_ids": [0],
+                "gold_token_pieces": [f"\n{config.final_delimiter} {row['answer']}"],
+                "gold_token_logprobs": [-1.0],
                 "gold_answer_logprob_contribution": -1.0,
+                "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
+                "tokenizer_snapshot_hash": QWEN25_7B_TOKENIZER_REVISION,
             }) + "\n" for index, row in enumerate(validation_rows)), encoding="utf-8")
             payload = {
                 "schema_version": 1, "kind": "phase_marker_checkpoint_selection",
@@ -373,6 +388,15 @@ def _write_behavior_and_audit(root: Path, config: ExperimentConfig) -> tuple[Pat
     return behavior_path, audit_path
 
 
+def _stub_behavior_gate(
+    monkeypatch: pytest.MonkeyPatch, behavior_path: Path
+) -> None:
+    artifact = json.loads(behavior_path.read_text(encoding="utf-8"))["artifact_id"]
+    monkeypatch.setattr(
+        pipeline_module, "_validate_behavior_manifest", lambda *_, **__: artifact
+    )
+
+
 def test_gate_result_is_frozen() -> None:
     result = GateResult("train", True, "ready", ("a" * 64,), ("command",))
     with pytest.raises(FrozenInstanceError):
@@ -471,7 +495,8 @@ def test_command_manifest_binds_operator_supplied_approval_metadata(
     assert all(job["approval"] == asdict(approval) for job in jobs)
     assert all("phase_marker.behavior select" in job["selection_command"] for job in jobs)
     assert all(
-        any(path.endswith(f"/{job['arm']}.json") for path in job["expected_outputs"])
+        any(path.endswith(f"/{job['arm']}/manifest.json") for path in job["expected_outputs"])
+        and any(path.endswith(f"/{job['arm']}/evidence.jsonl") for path in job["expected_outputs"])
         for job in jobs
     )
 
@@ -521,14 +546,46 @@ def test_each_successful_stage_constructs_only_its_requested_commands(
         training_jobs=6, checkpoint_selection_jobs=6, behavior_evaluation_jobs=1,
         manual_audit_rows=300, statistics_jobs=1, mechanism_jobs_excluded=True,
     )
+    mechanism_approval = MechanismApprovalMetadata(
+        schema_version=1, hardware="1x H100", capture_jobs=1, intervention_jobs=1,
+        capture_gpu_hours=1, intervention_gpu_hours=1, max_duration_hours=3,
+        estimated_spend_usd=8, spend_cap_usd=10,
+        selection_parent_hash=artifact, activation_parent_hash=artifact,
+        command_count=2, expected_output_count=4,
+    )
 
     result = pipeline_module._run_gate(
         stage, config, tmp_path, kind="pilot", seeds=(42,), config_path=CONFIG_PATH,
-        approval=approval,
+        approval=approval, mechanism_approval=mechanism_approval,
     )
 
     assert result.passed is True
     assert result.next_commands
+
+
+def test_general_approval_cannot_authorize_mechanism_command(
+    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = "a" * 64
+    monkeypatch.setattr(pipeline_module, "_validate_behavior_manifest", lambda *_, **__: artifact)
+    monkeypatch.setattr(pipeline_module, "_validate_synthetic_manifest", lambda *_: artifact)
+    monkeypatch.setattr(pipeline_module, "_validate_capture_inputs", lambda *_: (artifact,))
+    approval = ApprovalMetadata(
+        hardware="1x H100", max_duration_hours=4, training_gpu_hours=1,
+        selection_gpu_hours=1, behavior_gpu_hours=1, spend_cap_usd=10,
+        estimated_spend_usd=8, workload_schema_version=1, training_jobs=6,
+        checkpoint_selection_jobs=6, behavior_evaluation_jobs=1,
+        manual_audit_rows=300, statistics_jobs=1, mechanism_jobs_excluded=True,
+    )
+
+    result = pipeline_module._run_gate(
+        "capture", config, tmp_path, kind="pilot", seeds=(42,),
+        config_path=CONFIG_PATH, approval=approval,
+    )
+
+    assert result.passed is False
+    assert "separate mechanism approval" in result.reason
+    assert result.next_commands == ()
 
 
 def test_synthetic_command_rejects_preregistered_seed_mismatch(
@@ -768,7 +825,7 @@ def test_behavior_gate_requires_complete_validation_selection_matrix(
     _write_materializations(tmp_path, config)
     _write_training_runs(tmp_path, config)
     _write_checkpoint_selections(tmp_path, config)
-    missing = tmp_path / "checkpoint-selections" / "confirmatory" / "seed-303" / "filler.json"
+    missing = tmp_path / "checkpoint-selections" / "confirmatory" / "seed-303" / "filler" / "manifest.json"
     missing.unlink()
 
     result = run_gate("behavior", config, tmp_path)
@@ -784,7 +841,7 @@ def test_behavior_gate_rejects_omitted_declared_checkpoint_candidate(
     _write_materializations(tmp_path, config)
     _write_training_runs(tmp_path, config)
     _write_checkpoint_selections(tmp_path, config)
-    path = tmp_path / "checkpoint-selections/confirmatory/seed-101/glyph.json"
+    path = tmp_path / "checkpoint-selections/confirmatory/seed-101/glyph/manifest.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["candidates"] = []
     payload["artifact_id"] = sha256_json(
@@ -892,9 +949,10 @@ def test_gate_cli_prints_only_and_never_executes(
 
 
 def test_statistics_gate_rejects_audit_with_wrong_config_hash(
-    tmp_path: Path, config: ExperimentConfig
+    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, audit_path = _write_behavior_and_audit(tmp_path, config)
+    behavior_path, audit_path = _write_behavior_and_audit(tmp_path, config)
+    _stub_behavior_gate(monkeypatch, behavior_path)
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
     audit["config_hash"] = "0" * 64
     audit.pop("artifact_id")
@@ -909,9 +967,11 @@ def test_statistics_gate_rejects_audit_with_wrong_config_hash(
 
 @pytest.mark.parametrize("tamper", ("plumbing", "one-row", "forged-artifact"))
 def test_statistics_gate_rejects_nonproduction_or_forged_audit(
-    tmp_path: Path, config: ExperimentConfig, tamper: str
+    tmp_path: Path, config: ExperimentConfig, tamper: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, audit_path = _write_behavior_and_audit(tmp_path, config)
+    behavior_path, audit_path = _write_behavior_and_audit(tmp_path, config)
+    _stub_behavior_gate(monkeypatch, behavior_path)
     payload = json.loads(audit_path.read_text(encoding="utf-8"))
     if tamper == "plumbing":
         payload["evidence_scope"] = "plumbing_only"
@@ -931,9 +991,10 @@ def test_statistics_gate_rejects_nonproduction_or_forged_audit(
 
 
 def test_statistics_gate_rejects_label_not_bound_to_behavior_generation(
-    tmp_path: Path, config: ExperimentConfig
+    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, audit_path = _write_behavior_and_audit(tmp_path, config)
+    behavior_path, audit_path = _write_behavior_and_audit(tmp_path, config)
+    _stub_behavior_gate(monkeypatch, behavior_path)
     payload = json.loads(audit_path.read_text(encoding="utf-8"))
     labels_path = Path(payload["labels_file"])
     labels_path.write_text(
@@ -955,9 +1016,10 @@ def test_statistics_gate_rejects_label_not_bound_to_behavior_generation(
 
 
 def test_statistics_gate_rejects_flipped_label_with_forged_claimed_metrics(
-    tmp_path: Path, config: ExperimentConfig
+    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, audit_path = _write_behavior_and_audit(tmp_path, config)
+    behavior_path, audit_path = _write_behavior_and_audit(tmp_path, config)
+    _stub_behavior_gate(monkeypatch, behavior_path)
     payload = json.loads(audit_path.read_text(encoding="utf-8"))
     labels_path = Path(payload["labels_file"])
     labels_path.write_text(

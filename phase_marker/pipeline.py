@@ -20,6 +20,7 @@ from typing import Any
 
 from phase_marker.config import ExperimentConfig
 from phase_marker.io import canonical_json, sha256_json
+from phase_marker.schema import ArtifactManifest
 from phase_marker.splits import question_hash
 from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
 
@@ -143,6 +144,42 @@ class ApprovalMetadata:
         return self.training_gpu_hours + self.selection_gpu_hours + self.behavior_gpu_hours
 
 
+@dataclass(frozen=True)
+class MechanismApprovalMetadata:
+    schema_version: int
+    hardware: str
+    capture_jobs: int
+    intervention_jobs: int
+    capture_gpu_hours: float
+    intervention_gpu_hours: float
+    max_duration_hours: float
+    estimated_spend_usd: float
+    spend_cap_usd: float
+    selection_parent_hash: str
+    activation_parent_hash: str
+    command_count: int
+    expected_output_count: int
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or not self.hardware.strip():
+            raise ValueError("mechanism approval schema/hardware mismatch")
+        if (self.capture_jobs, self.intervention_jobs, self.command_count,
+                self.expected_output_count) != (1, 1, 2, 4):
+            raise ValueError("mechanism approval job/command/output counts mismatch")
+        hours = self.capture_gpu_hours + self.intervention_gpu_hours
+        if any(not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0
+               for value in (self.capture_gpu_hours, self.intervention_gpu_hours,
+                              self.max_duration_hours, self.estimated_spend_usd,
+                              self.spend_cap_usd)):
+            raise ValueError("mechanism approval estimates must be positive")
+        if hours > self.max_duration_hours or self.estimated_spend_usd > self.spend_cap_usd:
+            raise ValueError("mechanism approval exceeds duration or spend cap")
+        if not all(_is_sha256(value) for value in (
+            self.selection_parent_hash, self.activation_parent_hash
+        )):
+            raise ValueError("mechanism approval parent hashes must be sha256")
+
+
 class GateFailure(ValueError):
     """An immutable prerequisite is absent, malformed, or stale."""
 
@@ -214,7 +251,7 @@ def build_command_manifest(
             output_dir = artifact_root / "checkpoints" / kind / f"seed-{seed}" / arm
             manifest = output_dir / "run-manifest.json"
             selection_output = (
-                artifact_root / "checkpoint-selections" / kind / f"seed-{seed}" / f"{arm}.json"
+                artifact_root / "checkpoint-selections" / kind / f"seed-{seed}" / arm
             )
             arguments = (
                 "./.venv/bin/python",
@@ -264,7 +301,8 @@ def build_command_manifest(
                         str(output_dir / "adapter_config.json"),
                         str(output_dir / "adapter_model.safetensors"),
                         str(manifest),
-                        str(selection_output),
+                        str(selection_output / "manifest.json"),
+                        str(selection_output / "evidence.jsonl"),
                     ],
                 }
             )
@@ -295,6 +333,7 @@ def _run_gate(
     seeds: Sequence[int],
     config_path: Path,
     approval: ApprovalMetadata | None,
+    mechanism_approval: MechanismApprovalMetadata | None = None,
 ) -> GateResult:
     if stage not in STAGES:
         return GateResult(stage, False, f"unknown stage {stage!r}", (), ())
@@ -373,7 +412,13 @@ def _run_gate(
     except (GateFailure, OSError, UnicodeError) as error:
         return GateResult(stage, False, str(error), tuple(checked), ())
 
-    if stage in {"train", "behavior", "capture", "intervene"} and approval is None:
+    if stage in {"capture", "intervene"} and mechanism_approval is None:
+        return GateResult(
+            stage, False,
+            f"{stage} prerequisites passed but separate mechanism approval metadata is missing",
+            tuple(dict.fromkeys(checked)), (),
+        )
+    if stage in {"train", "behavior"} and approval is None:
         return GateResult(
             stage,
             False,
@@ -381,11 +426,19 @@ def _run_gate(
             tuple(dict.fromkeys(checked)),
             (),
         )
-    if approval is not None:
+    if approval is not None and stage not in {"capture", "intervene"}:
         try:
             _validate_approval_workload(approval, len(seeds) * len(config.arms))
         except ValueError as error:
             return GateResult(stage, False, str(error), tuple(dict.fromkeys(checked)), ())
+    if stage in {"capture", "intervene"}:
+        assert mechanism_approval is not None
+        required_parent = (
+            mechanism_approval.selection_parent_hash
+            if stage == "capture" else mechanism_approval.activation_parent_hash
+        )
+        if required_parent not in checked:
+            return GateResult(stage, False, "mechanism approval parent hash mismatch", tuple(dict.fromkeys(checked)), ())
     commands = _commands_for_stage(
         stage,
         config,
@@ -749,9 +802,14 @@ def _validate_behavior_manifest(
     if payload.get("record_hashes") != [sha256_json(row) for row in rows]:
         raise GateFailure(f"behavior record hashes mismatch: {path}")
     examples_file = payload.get("examples_file")
-    if not isinstance(examples_file, str) or not Path(examples_file).is_file():
+    canonical_examples = artifact_root / "splits" / "test.jsonl"
+    if (
+        not isinstance(examples_file, str)
+        or Path(examples_file).resolve() != canonical_examples.resolve()
+        or not canonical_examples.is_file()
+    ):
         raise GateFailure(f"behavior examples completion file is missing: {path}")
-    if payload.get("examples_hash") != _sha256_file(Path(examples_file)):
+    if payload.get("examples_hash") != _sha256_file(canonical_examples):
         raise GateFailure(f"behavior examples hash mismatch: {path}")
     split = _validate_split_manifest(artifact_root, config)
     if payload.get("split_artifact_id") != split.artifact_id:
@@ -776,6 +834,40 @@ def _validate_behavior_manifest(
             raise GateFailure(f"behavior checkpoint manifest is missing for {key}: {value}")
         if checkpoint_hashes[key] != _sha256_file(Path(value)):
             raise GateFailure(f"behavior checkpoint manifest hash mismatch for {key}")
+    canonical_rows = _jsonl_rows_required(canonical_examples, "canonical test examples")
+    example_keys = {(row.get("source"), row.get("question_hash")) for row in canonical_rows}
+    if len(example_keys) != len(canonical_rows):
+        raise GateFailure("canonical test example identities are not unique")
+    from phase_marker.behavior import build_behavior_matrix
+    split_manifest = ArtifactManifest(
+        split.artifact_id, "phase_marker_splits", _config_hash(config), (), len(canonical_rows), {}
+    )
+    expected_cells: Counter[tuple[object, ...]] = Counter()
+    for seed in seeds:
+        for cell in build_behavior_matrix(config, split_manifest):
+            repetitions = 5 if cell.kind == "sampled" else 1
+            for source, question in example_keys:
+                expected_cells[(seed, cell.training_arm, cell.prompt_condition, cell.kind,
+                                cell.perturbation, source, question)] += repetitions
+    actual_cells: Counter[tuple[object, ...]] = Counter()
+    for row in rows:
+        decoding = row.get("decoding")
+        if not isinstance(decoding, Mapping):
+            raise GateFailure("behavior record decoding evidence is malformed")
+        actual_cells[(
+            row.get("seed"), row.get("training_arm"), row.get("prompt_condition"),
+            decoding.get("evaluation_kind"), decoding.get("perturbation"),
+            row.get("source"), row.get("question_hash"),
+        )] += 1
+        selection_key = f"{row.get('seed')}:{row.get('training_arm')}"
+        selection_path = checkpoint_paths.get(selection_key)
+        if not isinstance(selection_path, str):
+            raise GateFailure("behavior record lacks selected checkpoint lineage")
+        selection_payload = _read_object(Path(selection_path), "checkpoint selection")
+        if row.get("checkpoint") != selection_payload.get("selected_path"):
+            raise GateFailure("behavior record checkpoint differs from validation selection")
+    if actual_cells != expected_cells:
+        raise GateFailure("behavior records do not match canonical test evaluation multiplicities")
     parents = _string_list(payload.get("parent_hashes"), "parent hashes", path)
     expected_parents = (split.artifact_id, *(str(checkpoint_ids[key]) for key in checkpoint_ids))
     if parents != expected_parents:
@@ -797,7 +889,7 @@ def _validate_checkpoint_selections(
     seeds: tuple[int, ...],
     expected_materializations: Mapping[str, str] | None,
 ) -> tuple[str, ...]:
-    paths = tuple(sorted((artifact_root / "checkpoint-selections" / kind).glob("seed-*/*.json")))
+    paths = tuple(sorted((artifact_root / "checkpoint-selections" / kind).glob("seed-*/*/manifest.json")))
     expected_count = len(seeds) * len(config.arms)
     if len(paths) != expected_count:
         raise GateFailure(
@@ -1270,7 +1362,7 @@ def _commands_for_stage(
             str(artifact_root / "splits" / "manifest.json"), "--examples",
             str(artifact_root / "splits" / "test.jsonl"), "--checkpoint-manifests",
             *(
-                str(artifact_root / "checkpoint-selections" / kind / f"seed-{seed}" / f"{arm}.json")
+                str(artifact_root / "checkpoint-selections" / kind / f"seed-{seed}" / arm / "manifest.json")
                 for seed in seeds for arm in config.arms
             ), "--backend", "vllm", "--output-root",
             str(artifact_root / "raw-generations" / kind),
@@ -1538,6 +1630,19 @@ def _add_approval_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--manual-audit-rows", type=int)
     parser.add_argument("--statistics-jobs", type=int)
     parser.add_argument("--mechanism-jobs-excluded", action="store_true", default=None)
+    parser.add_argument("--mechanism-schema-version", type=int)
+    parser.add_argument("--mechanism-hardware")
+    parser.add_argument("--capture-jobs", type=int)
+    parser.add_argument("--intervention-jobs", type=int)
+    parser.add_argument("--capture-gpu-hours", type=float)
+    parser.add_argument("--intervention-gpu-hours", type=float)
+    parser.add_argument("--mechanism-max-duration-hours", type=float)
+    parser.add_argument("--mechanism-estimated-spend-usd", type=float)
+    parser.add_argument("--mechanism-spend-cap-usd", type=float)
+    parser.add_argument("--mechanism-selection-parent-hash")
+    parser.add_argument("--mechanism-activation-parent-hash")
+    parser.add_argument("--mechanism-command-count", type=int)
+    parser.add_argument("--mechanism-expected-output-count", type=int)
 
 
 def _approval_from_arguments(arguments: argparse.Namespace) -> ApprovalMetadata | None:
@@ -1564,6 +1669,38 @@ def _approval_from_arguments(arguments: argparse.Namespace) -> ApprovalMetadata 
         manual_audit_rows=arguments.manual_audit_rows,
         statistics_jobs=arguments.statistics_jobs,
         mechanism_jobs_excluded=arguments.mechanism_jobs_excluded,
+    )
+
+
+def _mechanism_approval_from_arguments(
+    arguments: argparse.Namespace,
+) -> MechanismApprovalMetadata | None:
+    names = (
+        "mechanism_schema_version", "mechanism_hardware", "capture_jobs",
+        "intervention_jobs", "capture_gpu_hours", "intervention_gpu_hours",
+        "mechanism_max_duration_hours", "mechanism_estimated_spend_usd",
+        "mechanism_spend_cap_usd", "mechanism_selection_parent_hash",
+        "mechanism_activation_parent_hash", "mechanism_command_count",
+        "mechanism_expected_output_count",
+    )
+    values = tuple(getattr(arguments, name, None) for name in names)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        return None
+    return MechanismApprovalMetadata(
+        schema_version=arguments.mechanism_schema_version,
+        hardware=arguments.mechanism_hardware,
+        capture_jobs=arguments.capture_jobs, intervention_jobs=arguments.intervention_jobs,
+        capture_gpu_hours=arguments.capture_gpu_hours,
+        intervention_gpu_hours=arguments.intervention_gpu_hours,
+        max_duration_hours=arguments.mechanism_max_duration_hours,
+        estimated_spend_usd=arguments.mechanism_estimated_spend_usd,
+        spend_cap_usd=arguments.mechanism_spend_cap_usd,
+        selection_parent_hash=arguments.mechanism_selection_parent_hash,
+        activation_parent_hash=arguments.mechanism_activation_parent_hash,
+        command_count=arguments.mechanism_command_count,
+        expected_output_count=arguments.mechanism_expected_output_count,
     )
 
 
@@ -1632,6 +1769,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         seeds=tuple(arguments.seeds),
         config_path=arguments.config,
         approval=_approval_from_arguments(arguments),
+        mechanism_approval=_mechanism_approval_from_arguments(arguments),
     )
     print(canonical_json(asdict(result)))
     return 0 if result.passed else 1

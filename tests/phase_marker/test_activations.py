@@ -298,6 +298,29 @@ def test_capture_rejects_corrupt_batch_before_transformers_import(
         )
 
 
+@pytest.mark.parametrize("bad", (torch.tensor(1.0), torch.empty(0), torch.tensor([float("nan")])) )
+def test_activation_artifact_validator_rejects_scalar_empty_or_nonfinite(
+    tmp_path: Path, bad: torch.Tensor
+) -> None:
+    from phase_marker.activations import load_and_validate_activation_artifact
+
+    tensor_path = tmp_path / "selected-states.pt"
+    torch.save({"residual": bad, "attention": torch.ones(1, 1, 1, 1, 1)}, tensor_path)
+    manifest = {
+        "mode": "teacher_forced", "tensor_file": tensor_path.name,
+        "tensor_hash": hashlib.sha256(tensor_path.read_bytes()).hexdigest(),
+        "layers": [0], "positions": [0], "example_ids": ["x"], "conditions": ["glyph"],
+        "tensors": {
+            "residual": {"shape": list(bad.shape), "dtype": str(bad.dtype).removeprefix("torch.")},
+            "attention": {"shape": [1, 1, 1, 1, 1], "dtype": "float32"},
+        },
+    }
+    path = tmp_path / "manifest.json"
+    path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="semantics"):
+        load_and_validate_activation_artifact(path)
+
+
 def test_capture_cli_tiny_fixture_emits_plumbing_only_envelope(tmp_path: Path):
     from phase_marker.activations import main
 

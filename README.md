@@ -117,9 +117,12 @@ workload for each adapter: it scores every training-manifest-declared
 checkpoint on the validation split only, ranks strict exact-answer accuracy,
 then teacher-forced mean gold-answer log probability, then earliest step. The
 candidate set must match the declared checkpoints one-for-one. Each selection
-binds a hashed JSONL with per-example ID, question hash, checkpoint ID, strict
-score, and full gold-continuation log-probability contribution; consumers
-recompute the candidate aggregates. Production selection and behavior accept
+atomically publishes a bundle containing `manifest.json` and `evidence.jsonl`.
+Every evidence row binds the canonical example/gold answer, raw greedy
+completion, replayable scorer input/output, ordered gold-continuation token
+IDs, incrementally decoded pieces, and each teacher-forced token logprob under
+the pinned tokenizer snapshot. Consumers rerun scoring and token accounting
+before recomputing candidate aggregates and the winner. Production selection and behavior accept
 only the canonical sibling `validation.jsonl` and `test.jsonl` files from a
 fully recomputed split envelope. The selected PEFT adapter must name the frozen
 Qwen base model and revision;
@@ -141,6 +144,13 @@ command is emitted. Capture and intervention commands consume explicit
 schema-v1 selection, batch/pair, checkpoint, and parent manifests; the
 `tiny-fixture` backends require `--allow-test-backend` and emit
 `evidence_scope=plumbing_only`, which production gates reject.
+
+Capture and intervention cannot reuse the experiment approval above. They
+require a separate schema-v1 mechanism approval with exactly one capture and
+one intervention job, separate GPU-hour estimates, two commands/four outputs,
+hardware, duration/spend bounds, and the bound selection/activation parent
+hashes. Supplying only the mechanism-excluded experiment approval emits no
+mechanism command.
 
 Compact Markdown, TOML, JSON, and JSONL manifests/summaries remain eligible for
 version control. Large phase-marker checkpoints and activation/raw-generation

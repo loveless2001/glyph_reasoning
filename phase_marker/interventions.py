@@ -1042,23 +1042,14 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
                 raise ValueError("aligned pair batch path or hash mismatch")
     loaded_batches: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
     if args.backend == "hf":
-        tensor_name = activation.get("tensor_file")
-        tensor_hash = activation.get("tensor_hash")
-        if not isinstance(tensor_name, str) or not isinstance(tensor_hash, str):
-            raise ValueError("activation tensor binding is missing")
-        tensor_path = args.activation_manifest.parent / tensor_name
-        if not tensor_path.is_file() or hashlib.sha256(tensor_path.read_bytes()).hexdigest() != tensor_hash:
-            raise ValueError("activation tensor path or hash mismatch")
-        activation_tensors = torch.load(tensor_path, map_location="cpu", weights_only=True)
-        if not isinstance(activation_tensors, Mapping) or set(activation_tensors) != {"residual", "attention"}:
-            raise ValueError("activation tensor payload is malformed")
-        for name, tensor in activation_tensors.items():
-            if not isinstance(tensor, torch.Tensor) or tensor.dtype not in {
-                torch.float16, torch.bfloat16, torch.float32, torch.float64
-            }:
-                raise ValueError(f"activation {name} tensor is malformed")
-        if activation.get("checkpoint_artifact_id") != checkpoint.get("artifact_id"):
-            raise ValueError("activation/checkpoint lineage mismatch")
+        from phase_marker.activations import load_and_validate_activation_artifact
+
+        validated_activation, _ = load_and_validate_activation_artifact(
+            args.activation_manifest,
+            expected_checkpoint_id=str(checkpoint.get("artifact_id")),
+        )
+        if validated_activation.get("artifact_id") != activation.get("artifact_id"):
+            raise ValueError("activation parent envelope changed during validation")
         for row in rows:
             recipient = torch.load(row["recipient_batch_path"], map_location="cpu", weights_only=True)
             donor = torch.load(row["donor_batch_path"], map_location="cpu", weights_only=True)

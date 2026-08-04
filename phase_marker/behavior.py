@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 import tempfile
 from typing import Any, Protocol
@@ -214,44 +215,50 @@ class VLLMGenerationBackend:
         tokenize: Callable[[str], Sequence[int]],
         final_delimiter: str,
     ) -> tuple[float, ...]:
+        return tuple(
+            sum(logprobs) for _, logprobs in self.gold_answer_token_evidence(
+                requests, gold_answers, tokenize=tokenize,
+                final_delimiter=final_delimiter,
+            )
+        )
+
+    def gold_answer_token_evidence(
+        self,
+        requests: Sequence[GenerationRequest],
+        gold_answers: Sequence[str],
+        *,
+        tokenize: Callable[[str], Sequence[int]],
+        final_delimiter: str,
+    ) -> tuple[tuple[tuple[int, ...], tuple[float, ...]], ...]:
+        """Return exact ordered teacher-forced token IDs and their logprobs."""
         if len(requests) != len(gold_answers) or not requests:
             raise ValueError("gold-answer scoring requires one answer per request")
         from vllm import SamplingParams
 
         llm = self._ensure_llm()
         lora_request = self._lora_request()
-        answer_logprobs: list[float] = []
+        result_rows = []
         for request, answer in zip(requests, gold_answers, strict=True):
             suffix_ids = tuple(tokenize(f"\n{final_delimiter} {answer}"))
-            if not suffix_ids:
-                raise ValueError("gold-answer continuation tokenized to zero tokens")
             prompt_ids = (*request.prompt_token_ids, *suffix_ids)
             results = llm.generate(
                 prompt_token_ids=[list(prompt_ids)],
-                sampling_params=SamplingParams(
-                    temperature=0.0, max_tokens=1, prompt_logprobs=1
-                ),
-                use_tqdm=False,
-                lora_request=lora_request,
+                sampling_params=SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=1),
+                use_tqdm=False, lora_request=lora_request,
             )
-            if len(results) != 1:
-                raise ValueError("vLLM returned a missing gold-answer score")
-            prompt_logprobs = getattr(results[0], "prompt_logprobs", None)
-            if not isinstance(prompt_logprobs, list) or len(prompt_logprobs) != len(prompt_ids):
+            prompt_logprobs = getattr(results[0], "prompt_logprobs", None) if len(results) == 1 else None
+            if not suffix_ids or not isinstance(prompt_logprobs, list) or len(prompt_logprobs) != len(prompt_ids):
                 raise ValueError("vLLM omitted teacher-forced gold-answer logprobs")
-            total = 0.0
-            start = len(request.prompt_token_ids)
-            for position, token_id in enumerate(suffix_ids, start=start):
+            values: list[float] = []
+            for position, token_id in enumerate(suffix_ids, start=len(request.prompt_token_ids)):
                 entry = prompt_logprobs[position]
-                if not isinstance(entry, Mapping) or token_id not in entry:
-                    raise ValueError("vLLM omitted a gold-answer token logprob")
-                value = entry[token_id]
+                value = entry.get(token_id) if isinstance(entry, Mapping) else None
                 logprob = getattr(value, "logprob", value)
                 if not isinstance(logprob, (int, float)) or isinstance(logprob, bool):
                     raise ValueError("vLLM returned a malformed gold-answer logprob")
-                total += float(logprob)
-            answer_logprobs.append(total)
-        return tuple(answer_logprobs)
+                values.append(float(logprob))
+            result_rows.append((suffix_ids, tuple(values)))
+        return tuple(result_rows)
 
 
 def select_validation_checkpoint(
@@ -285,6 +292,26 @@ def select_validation_checkpoint(
             -float(candidate["mean_gold_answer_logprob"]),
             int(candidate["step"]),
         ),
+    )
+
+
+def _selection_generation(
+    example: DatasetExample,
+    raw_completion: str,
+    arm: str,
+    seed: int,
+    checkpoint: str,
+    generation_id: str | None = None,
+    prompt_condition: str = "validation",
+) -> GenerationRecord:
+    return GenerationRecord(
+        generation_id=generation_id or f"selection:{checkpoint}:{example.example_id}",
+        source=example.source, question_hash=example.question_hash,
+        gold_answer=example.answer, training_arm=arm, seed=seed,
+        checkpoint=checkpoint, prompt_condition=prompt_condition,
+        prompt_hash=sha256_json(example.question), raw_prompt=example.question,
+        raw_completion=raw_completion, prompt_token_ids=(), completion_token_ids=(),
+        decoding={}, parent_hashes=(),
     )
 
 
@@ -806,7 +833,7 @@ _CHECKPOINT_SELECTION_FIELDS = frozenset(
 
 
 def _run_selection(arguments: argparse.Namespace) -> int:
-    if arguments.output.exists() or arguments.output.with_suffix(".evidence.jsonl").exists():
+    if arguments.output.exists():
         raise FileExistsError(f"refusing to overwrite checkpoint selection: {arguments.output}")
     if arguments.backend == "tiny-fixture" and not arguments.allow_test_backend:
         raise SystemExit("--allow-test-backend is required for tiny-fixture")
@@ -894,8 +921,15 @@ def _run_selection(arguments: argparse.Namespace) -> int:
     for checkpoint, checkpoint_hash, step in candidate_inputs:
         if arguments.backend == "tiny-fixture":
             accuracy, mean_logprob = 0.0, 0.0
-            contributions = (0.0,) * len(examples)
-            strict_results = (False,) * len(examples)
+            raw_completions = tuple("Final answer: 0" for _ in examples)
+            scored = [
+                score_generation(_selection_generation(example, raw, arguments.arm, arguments.seed, str(checkpoint)))
+                for example, raw in zip(examples, raw_completions, strict=True)
+            ]
+            token_rows = tuple(
+                ((0,), (f"\n{config.final_delimiter} {example.answer}",), (0.0,))
+                for example in examples
+            )
         else:
             assert tokenizer is not None
             requests = build_generation_requests(
@@ -919,7 +953,8 @@ def _run_selection(arguments: argparse.Namespace) -> int:
             )
             scored = [score_generation(record) for record in records]
             accuracy = sum(row.correct for row in scored) / len(scored)
-            contributions = backend.gold_answer_logprobs(
+            raw_completions = tuple(output.text for output in outputs)
+            teacher_forced = backend.gold_answer_token_evidence(
                 requests,
                 tuple(example.answer for example in examples),
                 tokenize=lambda value: tokenizer.encode(
@@ -927,16 +962,42 @@ def _run_selection(arguments: argparse.Namespace) -> int:
                 ),
                 final_delimiter=config.final_delimiter,
             )
-            strict_results = tuple(row.correct for row in scored)
-            mean_logprob = sum(contributions) / len(contributions)
-        for example, strict_result, contribution in zip(
-            examples, strict_results, contributions, strict=True
+            token_rows_list = []
+            for (token_ids, token_logprobs), example in zip(teacher_forced, examples, strict=True):
+                pieces: list[str] = []
+                previous = ""
+                for width in range(1, len(token_ids) + 1):
+                    decoded = tokenizer.decode(
+                        list(token_ids[:width]), skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    pieces.append(decoded[len(previous):])
+                    previous = decoded
+                continuation = f"\n{config.final_delimiter} {example.answer}"
+                if previous != continuation:
+                    raise ValueError("tokenizer does not exactly reproduce the gold continuation")
+                token_rows_list.append((token_ids, tuple(pieces), token_logprobs))
+            token_rows = tuple(token_rows_list)
+            mean_logprob = sum(sum(row[2]) for row in token_rows) / len(token_rows)
+        accuracy = sum(row.correct for row in scored) / len(scored)
+        for example, raw_completion, score, token_row in zip(
+            examples, raw_completions, scored, token_rows, strict=True
         ):
+            token_ids, token_pieces, token_logprobs = token_row
+            continuation = f"\n{config.final_delimiter} {example.answer}"
             evidence_rows.append({
-                "example_id": example.example_id, "question_hash": example.question_hash,
+                "dataset": example.source, "example_id": example.example_id,
+                "question_hash": example.question_hash, "gold_answer": example.answer,
                 "checkpoint_id": checkpoint_hash, "checkpoint_path": str(checkpoint),
-                "strict_correct": strict_result,
-                "gold_answer_logprob_contribution": contribution,
+                "raw_greedy_completion": raw_completion,
+                "scorer_inputs": {"source": example.source, "gold_answer": example.answer},
+                "scorer_outputs": asdict(score),
+                "gold_continuation": continuation,
+                "gold_token_ids": list(token_ids), "gold_token_pieces": list(token_pieces),
+                "gold_token_logprobs": list(token_logprobs),
+                "gold_answer_logprob_contribution": sum(token_logprobs),
+                "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
+                "tokenizer_snapshot_hash": QWEN25_7B_TOKENIZER_REVISION,
             })
         metrics.append({
             "path": str(checkpoint), "checkpoint_hash": checkpoint_hash, "step": step,
@@ -962,7 +1023,7 @@ def _run_selection(arguments: argparse.Namespace) -> int:
         "training_manifest_file": str(arguments.training_manifest),
         "training_manifest_hash": _file_hash(arguments.training_manifest),
         "materialization_artifact_id": materialization_id, "candidates": metrics,
-        "evidence_file": str(arguments.output.with_suffix(".evidence.jsonl")),
+        "evidence_file": str(arguments.output / "evidence.jsonl"),
         "evidence_hash": "",
         "selected_path": selected["path"],
         "selected_checkpoint_hash": selected["checkpoint_hash"],
@@ -971,11 +1032,19 @@ def _run_selection(arguments: argparse.Namespace) -> int:
         "completed": True,
     }
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
-    evidence_path = arguments.output.with_suffix(".evidence.jsonl")
-    write_jsonl_atomic(evidence_path, evidence_rows)
-    manifest["evidence_hash"] = _file_hash(evidence_path)
-    manifest["artifact_id"] = sha256_json(manifest)
-    arguments.output.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    with tempfile.TemporaryDirectory(
+        dir=arguments.output.parent, prefix=f".{arguments.output.name}-staging-"
+    ) as temporary:
+        staging = Path(temporary) / "publish"
+        staging.mkdir()
+        evidence_path = staging / "evidence.jsonl"
+        write_jsonl_atomic(evidence_path, evidence_rows)
+        manifest["evidence_hash"] = _file_hash(evidence_path)
+        manifest["artifact_id"] = sha256_json(manifest)
+        (staging / "manifest.json").write_text(
+            canonical_json(manifest) + "\n", encoding="utf-8"
+        )
+        staging.replace(arguments.output)
     print(canonical_json(manifest))
     return 0
 
@@ -1225,9 +1294,16 @@ def _load_checkpoint_selections(
             raise ValueError(f"checkpoint selection winner does not match frozen criterion: {path}")
         evidence = tuple(read_jsonl(Path(str(payload["evidence_file"]))))
         examples = tuple(read_jsonl(Path(str(payload["validation_examples_file"]))))
-        expected_example_keys = {
-            (row.get("example_id"), row.get("question_hash")) for row in examples
+        expected_examples = {
+            (row.get("example_id"), row.get("question_hash")): _example_from_row(row)
+            for row in examples
         }
+        evidence_keys = [
+            (row.get("checkpoint_id"), row.get("example_id"), row.get("question_hash"))
+            for row in evidence
+        ]
+        if len(evidence_keys) != len(set(evidence_keys)):
+            raise ValueError(f"checkpoint selection evidence contains duplicate rows: {path}")
         for candidate in candidates:
             assert isinstance(candidate, Mapping)
             candidate_rows = [
@@ -1237,14 +1313,64 @@ def _load_checkpoint_selections(
             ]
             if {
                 (row.get("example_id"), row.get("question_hash")) for row in candidate_rows
-            } != expected_example_keys or len(candidate_rows) != len(expected_example_keys):
+            } != set(expected_examples) or len(candidate_rows) != len(expected_examples):
                 raise ValueError(f"checkpoint selection per-example evidence mismatch: {path}")
-            strict = [row.get("strict_correct") for row in candidate_rows]
-            contributions = [row.get("gold_answer_logprob_contribution") for row in candidate_rows]
+            strict: list[bool] = []
+            contributions: list[float] = []
+            for row in candidate_rows:
+                if set(row) != {
+                    "dataset", "example_id", "question_hash", "gold_answer",
+                    "checkpoint_id", "checkpoint_path", "raw_greedy_completion",
+                    "scorer_inputs", "scorer_outputs", "gold_continuation",
+                    "gold_token_ids", "gold_token_pieces", "gold_token_logprobs",
+                    "gold_answer_logprob_contribution", "tokenizer_revision",
+                    "tokenizer_snapshot_hash",
+                }:
+                    raise ValueError(f"checkpoint selection evidence schema mismatch: {path}")
+                example = expected_examples[(row.get("example_id"), row.get("question_hash"))]
+                if (
+                    row.get("dataset") != example.source
+                    or row.get("gold_answer") != example.answer
+                    or row.get("tokenizer_revision") != QWEN25_7B_TOKENIZER_REVISION
+                    or row.get("tokenizer_snapshot_hash") != QWEN25_7B_TOKENIZER_REVISION
+                    or row.get("scorer_inputs") != {"source": example.source, "gold_answer": example.answer}
+                    or not isinstance(row.get("raw_greedy_completion"), str)
+                ):
+                    raise ValueError(f"checkpoint selection canonical evidence mismatch: {path}")
+                replayed = score_generation(_selection_generation(
+                    example, str(row["raw_greedy_completion"]), str(payload["arm"]),
+                    int(payload["seed"]), str(candidate["path"]),
+                    generation_id=(
+                        str(row["scorer_outputs"].get("generation_id"))
+                        if isinstance(row.get("scorer_outputs"), Mapping) else None
+                    ),
+                    prompt_condition=(
+                        str(row["scorer_outputs"].get("prompt_condition"))
+                        if isinstance(row.get("scorer_outputs"), Mapping) else "validation"
+                    ),
+                ))
+                if row.get("scorer_outputs") != asdict(replayed):
+                    raise ValueError(f"checkpoint selection scorer replay mismatch: {path}")
+                token_ids = row.get("gold_token_ids")
+                pieces = row.get("gold_token_pieces")
+                logprobs = row.get("gold_token_logprobs")
+                if (
+                    not isinstance(token_ids, list) or not token_ids
+                    or any(not isinstance(value, int) or isinstance(value, bool) for value in token_ids)
+                    or not isinstance(pieces, list) or any(not isinstance(value, str) for value in pieces)
+                    or not isinstance(logprobs, list)
+                    or len(token_ids) != len(pieces) or len(token_ids) != len(logprobs)
+                    or any(not isinstance(value, (int, float)) or isinstance(value, bool)
+                           or not math.isfinite(value) or value > 0 for value in logprobs)
+                    or "".join(pieces) != row.get("gold_continuation")
+                    or row.get("gold_continuation") != f"\n{config.final_delimiter} {example.answer}"
+                    or row.get("gold_answer_logprob_contribution") != sum(logprobs)
+                ):
+                    raise ValueError(f"checkpoint selection token evidence mismatch: {path}")
+                strict.append(replayed.correct)
+                contributions.append(float(sum(logprobs)))
             if (
-                any(not isinstance(value, bool) for value in strict)
-                or any(not isinstance(value, (int, float)) or isinstance(value, bool) for value in contributions)
-                or candidate.get("row_count") != len(candidate_rows)
+                candidate.get("row_count") != len(candidate_rows)
                 or candidate.get("strict_accuracy") != sum(strict) / len(strict)
                 or candidate.get("mean_gold_answer_logprob") != sum(contributions) / len(contributions)
             ):

@@ -1333,8 +1333,28 @@ def _validate_analysis_parent(
     ):
         raise ValueError("behavior records count or hashes mismatch")
     examples_path = Path(str(behavior.get("examples_file")))
-    if behavior.get("examples_hash") != _statistics_file_hash(examples_path):
+    split_manifest_path = examples_path.parent / "manifest.json"
+    if (
+        examples_path.name != "test.jsonl"
+        or not split_manifest_path.is_file()
+        or behavior.get("examples_hash") != _statistics_file_hash(examples_path)
+        or behavior.get("split_manifest_hash") != _statistics_file_hash(split_manifest_path)
+    ):
         raise ValueError("behavior examples hash mismatch")
+    split_payload = _statistics_read_object(split_manifest_path, "split manifest")
+    if behavior.get("split_artifact_id") != split_payload.get("artifact_id"):
+        raise ValueError("behavior canonical split artifact mismatch")
+    if not allow_test:
+        from phase_marker.pipeline import GateFailure, _validate_behavior_manifest
+        try:
+            artifact_root = split_manifest_path.parent.parent
+            validated_id = _validate_behavior_manifest(
+                artifact_root, config, kind=kind, seeds=tuple(int(seed) for seed in seeds)
+            )
+        except GateFailure as error:
+            raise ValueError(str(error)) from error
+        if validated_id != behavior.get("artifact_id"):
+            raise ValueError("behavior strict canonical validation mismatch")
     manifests = behavior.get("checkpoint_manifests")
     manifest_hashes = behavior.get("checkpoint_manifest_hashes")
     if (

@@ -449,6 +449,60 @@ def save_activation_artifact(
     return manifest
 
 
+def load_and_validate_activation_artifact(
+    manifest_path: Path,
+    *,
+    expected_checkpoint_id: str | None = None,
+) -> tuple[Mapping[str, object], Mapping[str, torch.Tensor]]:
+    """Safely load and fully validate a canonical activation tensor artifact."""
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, Mapping):
+        raise ValueError("activation manifest must be an object")
+    tensor_file = manifest.get("tensor_file")
+    if not isinstance(tensor_file, str) or Path(tensor_file).name != tensor_file:
+        raise ValueError("activation tensor filename is malformed")
+    tensor_path = manifest_path.parent / tensor_file
+    if (
+        not tensor_path.is_file()
+        or manifest.get("tensor_hash") != hashlib.sha256(tensor_path.read_bytes()).hexdigest()
+    ):
+        raise ValueError("activation tensor path or hash mismatch")
+    if expected_checkpoint_id is not None and manifest.get("checkpoint_artifact_id") != expected_checkpoint_id:
+        raise ValueError("activation/checkpoint lineage mismatch")
+    if manifest.get("mode") not in CAPTURE_MODES:
+        raise ValueError("activation capture mode mismatch")
+    raw = torch.load(tensor_path, map_location="cpu", weights_only=True)
+    if not isinstance(raw, Mapping) or set(raw) != {"residual", "attention"}:
+        raise ValueError("activation tensor names must be exactly residual and attention")
+    tensors: dict[str, torch.Tensor] = {}
+    metadata = manifest.get("tensors")
+    if not isinstance(metadata, Mapping) or set(metadata) != set(raw):
+        raise ValueError("activation tensor metadata mismatch")
+    layers = manifest.get("layers")
+    positions = manifest.get("positions")
+    example_ids = manifest.get("example_ids")
+    conditions = manifest.get("conditions")
+    if not all(isinstance(value, list) and value for value in (layers, positions, example_ids, conditions)):
+        raise ValueError("activation dimensions must be nonempty")
+    if len(example_ids) != len(conditions):
+        raise ValueError("activation example/condition dimensions mismatch")
+    prefix = (len(layers), len(positions), len(example_ids))
+    for name, value in raw.items():
+        if (
+            not isinstance(value, torch.Tensor) or value.numel() == 0
+            or value.dtype not in {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+            or not torch.isfinite(value).all().item()
+            or value.ndim != (4 if name == "residual" else 5)
+            or tuple(value.shape[:3]) != prefix
+        ):
+            raise ValueError(f"activation {name} tensor semantics mismatch")
+        declared = metadata[name]
+        if not isinstance(declared, Mapping) or declared.get("shape") != list(value.shape) or declared.get("dtype") != _dtype_name(value.dtype):
+            raise ValueError(f"activation {name} metadata mismatch")
+        tensors[name] = value
+    return manifest, tensors
+
+
 def _hidden_from_layer_output(output: object) -> torch.Tensor:
     hidden = output[0] if isinstance(output, (tuple, list)) else output
     if not isinstance(hidden, torch.Tensor) or hidden.ndim != 3:

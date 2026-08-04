@@ -59,7 +59,9 @@ def test_analyze_parser_accepts_optional_explicit_audit_manifest(tmp_path):
         )
 
 
-def test_exact_task13_audit_and_analysis_paths_succeed_on_faithful_fixture(tmp_path):
+def test_exact_task13_audit_and_analysis_paths_succeed_on_faithful_fixture(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
     config_path = Path("configs/phase-marker-qwen25-7b.toml")
     config = ExperimentConfig.load(config_path)
     config_hash = sha256_json(asdict(config))
@@ -84,13 +86,17 @@ def test_exact_task13_audit_and_analysis_paths_succeed_on_faithful_fixture(tmp_p
     records_path.write_text(
         "".join(canonical_json(row) + "\n" for row in rows), encoding="utf-8"
     )
-    examples = tmp_path / "examples.jsonl"
+    examples = tmp_path / "splits" / "test.jsonl"
+    examples.parent.mkdir()
     examples.write_text(canonical_json({"fixture": True}) + "\n", encoding="utf-8")
+    split_manifest = examples.parent / "manifest.json"
+    split_manifest.write_text(canonical_json({"artifact_id": parent}) + "\n", encoding="utf-8")
     behavior = {
         "schema_version": 1, "kind": "phase_marker_behavior_generations",
         "evidence_scope": "experiment_candidate", "backend": "vllm",
         "config_hash": config_hash, "run_kind": "confirmatory", "seeds": [101, 202, 303],
-        "split_artifact_id": parent, "split_manifest_hash": "b" * 64,
+        "split_artifact_id": parent,
+        "split_manifest_hash": hashlib.sha256(split_manifest.read_bytes()).hexdigest(),
         "materialization_artifact_ids": {}, "checkpoint_artifact_ids": {},
         "checkpoint_manifest_hashes": {}, "checkpoint_manifests": {},
         "examples_file": str(examples), "examples_hash": hashlib.sha256(examples.read_bytes()).hexdigest(),
@@ -100,6 +106,10 @@ def test_exact_task13_audit_and_analysis_paths_succeed_on_faithful_fixture(tmp_p
     }
     behavior["artifact_id"] = sha256_json(behavior)
     (generation_root / "manifest.json").write_text(canonical_json(behavior) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        __import__("phase_marker.pipeline", fromlist=["_validate_behavior_manifest"]),
+        "_validate_behavior_manifest", lambda *_, **__: behavior["artifact_id"],
+    )
     labels = tmp_path / "audit" / "manual-labels.tsv"
     selected = generate_manual_audit_template(scores, labels, seed=20260804)
     by_id = {score.generation_id: score.correct for score in selected}

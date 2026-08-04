@@ -16,6 +16,8 @@ from phase_marker.behavior import (
     GenerationOutput,
     GenerationRequest,
     VLLMGenerationBackend,
+    _selection_generation,
+    _load_checkpoint_selections,
     build_generation_requests,
     build_behavior_matrix,
     records_from_outputs,
@@ -26,6 +28,7 @@ from phase_marker.behavior import (
 from phase_marker.config import ExperimentConfig
 from phase_marker.io import canonical_json, sha256_json
 from phase_marker.schema import ArtifactManifest, GenerationRecord
+from phase_marker.scoring import score_generation
 from phase_marker.splits import DatasetExample
 from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
 
@@ -483,7 +486,7 @@ def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing
     }
     training_path = run_root / "run-manifest.json"
     training_path.write_text(canonical_json(training) + "\n", encoding="utf-8")
-    output = tmp_path / "selection.json"
+    output = tmp_path / "selection"
 
     assert behavior_main(
         (
@@ -493,12 +496,29 @@ def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing
             "--backend", "tiny-fixture", "--allow-test-backend", "--output", str(output),
         )
     ) == 0
-    manifest = json.loads(output.read_text(encoding="utf-8"))
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert (output / "evidence.jsonl").is_file()
     assert manifest["schema_version"] == 1
     assert manifest["selected_on"] == "validation"
     assert manifest["evidence_scope"] == "plumbing_only"
     assert [row["step"] for row in manifest["candidates"]] == [200, 100]
     assert manifest["selected_step"] == 100
+
+    evidence_path = output / "evidence.jsonl"
+    evidence_rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    evidence_rows[0]["scorer_outputs"]["correct"] = True
+    evidence_path.write_text(
+        "".join(canonical_json(row) + "\n" for row in evidence_rows), encoding="utf-8"
+    )
+    manifest["evidence_hash"] = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    manifest["artifact_id"] = sha256_json(
+        {key: value for key, value in manifest.items() if key != "artifact_id"}
+    )
+    (output / "manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="scorer replay"):
+        _load_checkpoint_selections(
+            (output / "manifest.json",), config, "pilot", (42,), allow_test=True
+        )
 
 
 def test_provenance_envelope_rejects_empty_or_mismatched_production_lineage(
@@ -585,9 +605,20 @@ def test_run_cli_tiny_fixture_emits_versioned_plumbing_manifest(
         checkpoint_hash = sha256_json({"checkpoint": arm})
         evidence_path = tmp_path / f"{arm}.evidence.jsonl"
         evidence_path.write_text(canonical_json({
-            "example_id": example["example_id"], "question_hash": example["question_hash"],
+            "dataset": example["source"], "example_id": example["example_id"],
+            "question_hash": example["question_hash"], "gold_answer": example["answer"],
             "checkpoint_id": checkpoint_hash, "checkpoint_path": selected_path,
-            "strict_correct": False, "gold_answer_logprob_contribution": 0.0,
+            "raw_greedy_completion": "Final answer: 0",
+            "scorer_inputs": {"source": example["source"], "gold_answer": example["answer"]},
+            "scorer_outputs": asdict(score_generation(_selection_generation(
+                DatasetExample(**example), "Final answer: 0", arm, 42, selected_path,
+            ))),
+            "gold_continuation": f"\n{config.final_delimiter} {example['answer']}",
+            "gold_token_ids": [0],
+            "gold_token_pieces": [f"\n{config.final_delimiter} {example['answer']}"],
+            "gold_token_logprobs": [0.0], "gold_answer_logprob_contribution": 0.0,
+            "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
+            "tokenizer_snapshot_hash": QWEN25_7B_TOKENIZER_REVISION,
         }) + "\n", encoding="utf-8")
         payload = {
             "schema_version": 1,
