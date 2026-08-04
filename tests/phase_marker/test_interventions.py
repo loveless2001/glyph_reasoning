@@ -46,7 +46,14 @@ class TinyBackbone(nn.Module):
         self.layers = nn.ModuleList(TinyLayer(6) for _ in range(2))
         self.norm = TinyNorm()
 
-    def forward(self, input_ids: torch.Tensor) -> SimpleNamespace:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> SimpleNamespace:
+        del attention_mask, position_ids
         hidden = self.embed_tokens(input_ids)
         for layer in self.layers:
             hidden = layer(hidden)[0]
@@ -97,12 +104,15 @@ class TinyCacheLM(nn.Module):
         *,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
         use_cache: bool = False,
         past_key_values: FakeDynamicCache | None = None,
     ) -> SimpleNamespace:
         del attention_mask
         if position_ids is not None and position_ids.shape != input_ids.shape:
             raise AlignmentError("query position_ids were not sliced with input_ids")
+        if cache_position is not None and cache_position.shape != (input_ids.shape[1],):
+            raise AlignmentError("cache_position was not sliced with input_ids")
         hidden = self.embed(input_ids)
         if past_key_values is None:
             values = hidden[:, None, :, :]
@@ -189,6 +199,23 @@ def test_norm_matching_preserves_recipient_selected_row_mean_and_centered_norm()
     assert torch.equal(patched[:, 1], recipient[:, 1])
 
 
+def test_norm_matching_rejects_zero_centered_source_for_nonzero_recipient_norm():
+    recipient = torch.tensor([[[1.0, 2.0, 3.0]]])
+    donor = torch.tensor([[[5.0, 5.0, 5.0]]])
+
+    with pytest.raises(AlignmentError, match="zero-centered source"):
+        replace_positions(recipient, donor, positions=(0,), norm_match=True)
+
+
+def test_norm_matching_allows_both_centered_norms_to_be_zero():
+    recipient = torch.tensor([[[2.0, 2.0, 2.0]]])
+    donor = torch.tensor([[[5.0, 5.0, 5.0]]])
+
+    patched = replace_positions(recipient, donor, positions=(0,), norm_match=True)
+
+    assert torch.equal(patched, recipient)
+
+
 def test_patch_records_metrics_transfer_ranks_and_exact_provenance_without_mutation(
     recipient_batch, donor_batch
 ):
@@ -268,10 +295,179 @@ def test_shuffle_and_random_donor_controls_use_the_same_intervention_path():
         ),
     )
 
-    assert shuffled.record.control_name == "within_batch_shuffle"
-    assert random_donor.record.control_name == "random_donor"
+    assert {record.control_name for record in shuffled.records} == {
+        "within_batch_shuffle"
+    }
+    assert {record.control_name for record in random_donor.records} == {"random_donor"}
     assert not torch.equal(shuffled.baseline_logits, shuffled.intervened_logits)
     assert not torch.equal(random_donor.baseline_logits, random_donor.intervened_logits)
+
+
+def test_batch_interventions_emit_one_record_per_actual_random_donor_pair():
+    model = TinyCausalLM().eval()
+    recipient = {
+        "input_ids": torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]]),
+        "example_ids": ("recipient:a", "recipient:b"),
+        "parent_hashes": ("r" * 64,),
+        "target_token_ids": torch.tensor([4, 5]),
+    }
+    donor = {
+        "input_ids": torch.tensor([[6, 7, 8, 9], [9, 8, 7, 6]]),
+        "example_ids": ("donor:a", "donor:b"),
+        "parent_hashes": ("d" * 64,),
+        "target_token_ids": torch.tensor([7, 8]),
+    }
+
+    result = patch_residual_positions(
+        model,
+        recipient,
+        donor,
+        spec(
+            positions=(1,),
+            target_token_ids=(4, 5),
+            control_name="random_donor",
+        ),
+    )
+
+    assert [record.recipient_id for record in result.records] == [
+        "recipient:a",
+        "recipient:b",
+    ]
+    assert [record.donor_id for record in result.records] == ["donor:b", "donor:a"]
+    expected_donor_ranks = []
+    for row, donor_target in zip(
+        result.baseline_logits[:, -1, :], (8, 7), strict=True
+    ):
+        expected_donor_ranks.append(
+            1 + int((row > row[donor_target]).sum().item())
+        )
+    assert [record.baseline_donor_target_rank for record in result.records] == (
+        expected_donor_ranks
+    )
+    with pytest.raises(ValueError, match="exactly one record"):
+        _ = result.record
+    assert result.baseline_logits.shape[0] == result.intervened_logits.shape[0] == 2
+
+
+def test_within_batch_shuffle_records_each_rolled_source_identity():
+    model = TinyCausalLM().eval()
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]]),
+        "example_ids": ("recipient:a", "recipient:b"),
+        "parent_hashes": ("r" * 64,),
+        "target_token_ids": torch.tensor([4, 5]),
+    }
+
+    result = ablate_positions(
+        model,
+        batch,
+        spec(
+            method="ablate",
+            positions=(1,),
+            target_token_ids=(4, 5),
+            control_name="within_batch_shuffle",
+        ),
+    )
+
+    assert [record.donor_id for record in result.records] == [
+        "control:within_batch_shuffle:recipient:b",
+        "control:within_batch_shuffle:recipient:a",
+    ]
+    assert all(record.baseline_donor_target_rank is None for record in result.records)
+
+
+def test_intervention_ids_bind_norm_targets_and_actual_pairing(recipient_batch, donor_batch):
+    model = TinyCausalLM().eval()
+    base = patch_residual_positions(model, recipient_batch, donor_batch, spec())
+    normed = patch_residual_positions(
+        model, recipient_batch, donor_batch, spec(norm_match=True)
+    )
+    other_recipient_target = patch_residual_positions(
+        model, recipient_batch, donor_batch, spec(target_token_ids=(5,))
+    )
+    other_donor = {**donor_batch, "target_token_ids": torch.tensor([8])}
+    other_donor_target = patch_residual_positions(
+        model, recipient_batch, other_donor, spec()
+    )
+
+    ids = {
+        base.record.intervention_id,
+        normed.record.intervention_id,
+        other_recipient_target.record.intervention_id,
+        other_donor_target.record.intervention_id,
+    }
+    assert len(ids) == 4
+
+
+def test_public_operations_reject_misleading_method_or_control_labels(
+    recipient_batch, donor_batch
+):
+    residual_model = TinyCausalLM().eval()
+    with pytest.raises(ValueError, match="residual_patch.*method"):
+        patch_residual_positions(
+            residual_model, recipient_batch, donor_batch, spec(method="kv_transplant")
+        )
+    with pytest.raises(ValueError, match="ablate.*control"):
+        ablate_positions(
+            residual_model,
+            recipient_batch,
+            spec(method="ablate", control_name="donor"),
+        )
+
+    cache_model = TinyCacheLM().eval()
+    recipient = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "example_ids": ("recipient:cache",),
+        "parent_hashes": ("a" * 64,),
+        "target_token_ids": torch.tensor([2]),
+    }
+    donor = {
+        "input_ids": torch.tensor([[5, 6, 7, 4]]),
+        "example_ids": ("donor:cache",),
+        "parent_hashes": ("b" * 64,),
+        "target_token_ids": torch.tensor([9]),
+    }
+    with pytest.raises(ValueError, match="kv_transplant.*control"):
+        transplant_kv_positions(
+            cache_model,
+            recipient,
+            donor,
+            spec(method="kv_transplant", control_name="zero", positions=(1,)),
+        )
+
+
+@pytest.mark.parametrize("field", ["attention_mask", "position_ids"])
+def test_donor_recipient_alignment_checks_optional_sequence_tensors(
+    recipient_batch, donor_batch, field
+):
+    model = TinyCausalLM().eval()
+    recipient = {**recipient_batch, field: torch.tensor([[0, 1, 1, 1, 1, 1]])}
+    donor = {**donor_batch, field: torch.tensor([[1, 1, 1, 1, 1, 1]])}
+
+    with pytest.raises(AlignmentError, match=field):
+        patch_residual_positions(model, recipient, donor, spec())
+
+
+def test_donor_recipient_alignment_requires_optional_tensor_presence_on_both_sides(
+    recipient_batch, donor_batch
+):
+    model = TinyCausalLM().eval()
+    recipient = {**recipient_batch, "attention_mask": torch.ones(1, 6, dtype=torch.long)}
+
+    with pytest.raises(AlignmentError, match="attention_mask.*presence"):
+        patch_residual_positions(model, recipient, donor_batch, spec())
+
+
+def test_optional_alignment_tensors_must_share_the_input_device(
+    recipient_batch, donor_batch
+):
+    model = TinyCausalLM().eval()
+    meta_mask = torch.ones(1, 6, dtype=torch.long, device="meta")
+    recipient = {**recipient_batch, "attention_mask": meta_mask}
+    donor = {**donor_batch, "attention_mask": meta_mask.clone()}
+
+    with pytest.raises(AlignmentError, match="attention_mask.*input_ids device"):
+        patch_residual_positions(model, recipient, donor, spec())
 
 
 def test_hooks_are_removed_when_intervened_forward_raises(recipient_batch, donor_batch):
@@ -321,6 +517,7 @@ def test_public_kv_transplant_preserves_inputs_and_records_donor_answer_transfer
     recipient = {
         "input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
         "position_ids": torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        "cache_position": torch.tensor([0, 1, 2, 3], dtype=torch.long),
         "example_ids": ("recipient:cache",),
         "parent_hashes": ("a" * 64,),
         "target_token_ids": torch.tensor([2]),
@@ -328,6 +525,7 @@ def test_public_kv_transplant_preserves_inputs_and_records_donor_answer_transfer
     donor = {
         "input_ids": torch.tensor([[5, 6, 7, 4]], dtype=torch.long),
         "position_ids": torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        "cache_position": torch.tensor([0, 1, 2, 3], dtype=torch.long),
         "example_ids": ("donor:cache",),
         "parent_hashes": ("b" * 64,),
         "target_token_ids": torch.tensor([9]),
@@ -359,6 +557,10 @@ def test_smoke_cli_writes_provenance_bound_metrics(tmp_path: Path):
     assert manifest["model"] == "tiny_local_torch_qwen_layout"
     assert manifest["device"] == "cpu"
     assert manifest["metrics"]["selected_target_logprob_delta"] != 0.0
+    assert manifest["metrics"]["random_control_replacement_changed"] is True
+    assert manifest["metrics"]["non_marker_control_replacement_changed"] is True
+    assert abs(manifest["metrics"]["random_control_target_logprob_delta"]) <= 1e-7
+    assert abs(manifest["metrics"]["non_marker_control_target_logprob_delta"]) <= 1e-7
     assert (tmp_path / "records.jsonl").is_file()
     records = [
         __import__("json").loads(line)
@@ -366,6 +568,7 @@ def test_smoke_cli_writes_provenance_bound_metrics(tmp_path: Path):
     ]
     assert [record["control_name"] for record in records] == [
         "donor",
+        "random_donor",
         "random_donor",
         "matched_non_marker_position",
     ]

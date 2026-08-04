@@ -68,9 +68,15 @@ class InterventionSpec:
 
 @dataclass(frozen=True)
 class InterventionResult:
-    record: InterventionRecord
+    records: tuple[InterventionRecord, ...]
     baseline_logits: torch.Tensor
     intervened_logits: torch.Tensor
+
+    @property
+    def record(self) -> InterventionRecord:
+        if len(self.records) != 1:
+            raise ValueError("record convenience access requires exactly one record")
+        return self.records[0]
 
 
 def replace_positions(
@@ -101,10 +107,15 @@ def replace_positions(
         source_centered = replacement - replacement.mean(dim=-1, keepdim=True)
         source_norm = source_centered.norm(dim=-1, keepdim=True)
         target_norm = target_centered.norm(dim=-1, keepdim=True)
+        epsilon = torch.finfo(source_centered.dtype).eps
+        if torch.any((source_norm <= epsilon) & (target_norm > epsilon)):
+            raise AlignmentError(
+                "cannot norm-match a zero-centered source to a nonzero recipient norm"
+            )
         scaled = torch.where(
-            source_norm > torch.finfo(source_centered.dtype).eps,
+            source_norm > epsilon,
             source_centered * target_norm / source_norm.clamp_min(
-                torch.finfo(source_centered.dtype).eps
+                epsilon
             ),
             torch.zeros_like(source_centered),
         )
@@ -121,6 +132,11 @@ def patch_residual_positions(
     spec: InterventionSpec,
 ) -> InterventionResult:
     """Patch one decoder layer and one selected token region from an aligned donor."""
+    _validate_operation(
+        spec,
+        operation="residual_patch",
+        controls=frozenset(("donor", "random_donor")),
+    )
     layer = _decoder_layer(model, spec.layers[0])
     recipient_inputs, recipient_ids, recipient_parents = _batch_parts(recipient_batch)
     donor_inputs, donor_ids, donor_parents = _batch_parts(donor_batch)
@@ -128,6 +144,11 @@ def patch_residual_positions(
     batch_size = _batch_size(recipient_inputs)
     target_ids = _target_ids(spec.target_token_ids, batch_size, "recipient")
     donor_target_ids = _batch_target_ids(donor_batch, batch_size, "donor")
+    source_donor_ids = donor_ids
+    source_donor_targets = donor_target_ids
+    if spec.control_name == "random_donor":
+        source_donor_ids = _roll_tuple(donor_ids)
+        source_donor_targets = donor_target_ids.roll(1, dims=0)
 
     with torch.no_grad():
         baseline_logits = _logits(model(**recipient_inputs))
@@ -164,10 +185,10 @@ def patch_residual_positions(
         intervened_logits,
         spec,
         recipient_ids,
-        donor_ids,
+        source_donor_ids,
         recipient_parents + donor_parents,
         target_ids,
-        donor_target_ids,
+        source_donor_targets,
     )
 
 
@@ -178,6 +199,13 @@ def ablate_positions(
     validation_mean: torch.Tensor | None = None,
 ) -> InterventionResult:
     """Apply a zero, validation-mean, shuffle, or matched-position control."""
+    _validate_operation(
+        spec,
+        operation="ablate",
+        controls=frozenset(
+            ("zero", "validation_mean", "within_batch_shuffle", "matched_non_marker_position")
+        ),
+    )
     layer = _decoder_layer(model, spec.layers[0])
     model_inputs, recipient_ids, parents = _batch_parts(batch)
     batch_size = _batch_size(model_inputs)
@@ -207,12 +235,19 @@ def ablate_positions(
             intervened_logits = _logits(model(**model_inputs))
         finally:
             handle.remove()
+    if spec.control_name == "within_batch_shuffle":
+        donor_ids = tuple(
+            f"control:within_batch_shuffle:{source_id}"
+            for source_id in _roll_tuple(recipient_ids)
+        )
+    else:
+        donor_ids = (f"control:{spec.control_name}",) * batch_size
     return _result(
         baseline_logits,
         intervened_logits,
         spec,
         recipient_ids,
-        (f"control:{spec.control_name}",),
+        donor_ids,
         parents,
         target_ids,
         None,
@@ -258,6 +293,7 @@ def transplant_kv_positions(
     spec: InterventionSpec,
 ) -> InterventionResult:
     """Transplant aligned prefix KV rows, then score the recipient query token."""
+    _validate_operation(spec, operation="kv_transplant", controls=frozenset(("donor",)))
     recipient_inputs, recipient_ids, recipient_parents = _batch_parts(recipient_batch)
     donor_inputs, donor_ids, donor_parents = _batch_parts(donor_batch)
     _validate_aligned_inputs(recipient_inputs, donor_inputs)
@@ -306,6 +342,21 @@ def _decoder_layer(model: nn.Module, index: int) -> nn.Module:
     if index >= len(layers):
         raise IndexError(f"layer {index} is outside decoder layer count {len(layers)}")
     return layers[index]
+
+
+def _validate_operation(
+    spec: InterventionSpec, *, operation: str, controls: frozenset[str]
+) -> None:
+    if spec.method != operation:
+        raise ValueError(f"{operation} operation requires method={operation!r}")
+    if spec.control_name not in controls:
+        raise ValueError(
+            f"{operation} operation does not support control={spec.control_name!r}"
+        )
+
+
+def _roll_tuple(values: tuple[str, ...]) -> tuple[str, ...]:
+    return values[-1:] + values[:-1]
 
 
 def _capture_layer_output(
@@ -417,6 +468,32 @@ def _validate_aligned_inputs(
         raise AlignmentError("donor and recipient input sequences must be aligned")
     if recipient_ids.dtype != donor_ids.dtype or recipient_ids.device != donor_ids.device:
         raise AlignmentError("donor and recipient input ids must share dtype and device")
+    for field in ("attention_mask", "position_ids", "cache_position"):
+        recipient_value = recipient.get(field)
+        donor_value = donor.get(field)
+        if (recipient_value is None) != (donor_value is None):
+            raise AlignmentError(f"{field} presence must match for donor and recipient")
+        if recipient_value is None:
+            continue
+        if not isinstance(recipient_value, torch.Tensor) or not isinstance(
+            donor_value, torch.Tensor
+        ):
+            raise AlignmentError(f"{field} must be a tensor on both aligned batches")
+        if recipient_value.shape != donor_value.shape:
+            raise AlignmentError(f"{field} shapes differ")
+        if recipient_value.dtype != donor_value.dtype:
+            raise AlignmentError(f"{field} dtypes differ")
+        if recipient_value.device != donor_value.device:
+            raise AlignmentError(f"{field} devices differ")
+        if recipient_value.device != recipient_ids.device:
+            raise AlignmentError(f"{field} must share the input_ids device")
+        if field == "cache_position":
+            if recipient_value.ndim != 1 or recipient_value.shape[0] != recipient_ids.shape[1]:
+                raise AlignmentError("cache_position must have shape [sequence]")
+        elif recipient_value.shape != recipient_ids.shape:
+            raise AlignmentError(f"{field} must align exactly with input_ids shape")
+        if not torch.equal(recipient_value, donor_value):
+            raise AlignmentError(f"{field} values differ")
 
 
 def _batch_target_ids(
@@ -469,51 +546,76 @@ def _result(
     target_ids: torch.Tensor,
     donor_target_ids: torch.Tensor | None,
 ) -> InterventionResult:
-    baseline_logprob, baseline_rank, baseline_correct = _score_target(baseline, target_ids)
-    intervened_logprob, intervened_rank, intervened_correct = _score_target(
+    baseline_logprobs, baseline_ranks, baseline_correct = _score_target(baseline, target_ids)
+    intervened_logprobs, intervened_ranks, intervened_correct = _score_target(
         intervened, target_ids
     )
-    baseline_donor_rank = (
+    baseline_donor_ranks = (
         None if donor_target_ids is None else _score_target(baseline, donor_target_ids)[1]
     )
-    intervened_donor_rank = (
+    intervened_donor_ranks = (
         None if donor_target_ids is None else _score_target(intervened, donor_target_ids)[1]
     )
-    payload = {
-        "recipient_id": _combined_id(recipient_ids),
-        "donor_id": _combined_id(donor_ids),
-        "method": spec.method,
-        "control_name": spec.control_name,
-        "layers": spec.layers,
-        "positions": spec.positions,
-        "parent_hashes": parent_hashes,
-    }
-    record = InterventionRecord(
-        intervention_id=sha256_json(payload),
-        recipient_id=payload["recipient_id"],
-        donor_id=payload["donor_id"],
-        method=spec.method,
-        control_name=spec.control_name,
-        layers=spec.layers,
-        positions=spec.positions,
-        baseline_target_logprob=baseline_logprob,
-        intervened_target_logprob=intervened_logprob,
-        baseline_target_rank=baseline_rank,
-        intervened_target_rank=intervened_rank,
-        baseline_donor_target_rank=baseline_donor_rank,
-        intervened_donor_target_rank=intervened_donor_rank,
-        baseline_correct=baseline_correct,
-        intervened_correct=intervened_correct,
-        parent_hashes=parent_hashes,
-    )
+    if len(recipient_ids) != len(donor_ids) or len(recipient_ids) != target_ids.numel():
+        raise AlignmentError("record provenance must align one-to-one with batch examples")
+    records: list[InterventionRecord] = []
+    for index, (recipient_id, donor_id) in enumerate(
+        zip(recipient_ids, donor_ids, strict=True)
+    ):
+        recipient_target_id = int(target_ids[index].item())
+        donor_target_id = (
+            None if donor_target_ids is None else int(donor_target_ids[index].item())
+        )
+        payload = {
+            "recipient_id": recipient_id,
+            "donor_id": donor_id,
+            "method": spec.method,
+            "control_name": spec.control_name,
+            "layers": spec.layers,
+            "positions": spec.positions,
+            "norm_match": spec.norm_match,
+            "recipient_target_token_id": recipient_target_id,
+            "donor_target_token_id": donor_target_id,
+            "parent_hashes": parent_hashes,
+        }
+        records.append(
+            InterventionRecord(
+                intervention_id=sha256_json(payload),
+                recipient_id=recipient_id,
+                donor_id=donor_id,
+                method=spec.method,
+                control_name=spec.control_name,
+                layers=spec.layers,
+                positions=spec.positions,
+                baseline_target_logprob=float(baseline_logprobs[index].item()),
+                intervened_target_logprob=float(intervened_logprobs[index].item()),
+                baseline_target_rank=int(baseline_ranks[index].item()),
+                intervened_target_rank=int(intervened_ranks[index].item()),
+                baseline_donor_target_rank=(
+                    None
+                    if baseline_donor_ranks is None
+                    else int(baseline_donor_ranks[index].item())
+                ),
+                intervened_donor_target_rank=(
+                    None
+                    if intervened_donor_ranks is None
+                    else int(intervened_donor_ranks[index].item())
+                ),
+                baseline_correct=bool(baseline_correct[index].item()),
+                intervened_correct=bool(intervened_correct[index].item()),
+                parent_hashes=parent_hashes,
+            )
+        )
     return InterventionResult(
-        record=record,
+        records=tuple(records),
         baseline_logits=baseline.detach().cpu().clone(),
         intervened_logits=intervened.detach().cpu().clone(),
     )
 
 
-def _score_target(logits: torch.Tensor, target_ids: torch.Tensor) -> tuple[float, int, bool]:
+def _score_target(
+    logits: torch.Tensor, target_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     next_logits = logits[:, -1, :].float()
     ids = target_ids.to(next_logits.device)
     if ids.max().item() >= next_logits.shape[-1]:
@@ -522,14 +624,10 @@ def _score_target(logits: torch.Tensor, target_ids: torch.Tensor) -> tuple[float
     logprobs = next_logits.log_softmax(dim=-1).gather(1, ids[:, None]).squeeze(1)
     ranks = 1 + (next_logits > selected[:, None]).sum(dim=-1)
     return (
-        float(logprobs.mean().item()),
-        int(torch.round(ranks.float().mean()).item()),
-        bool(torch.all(next_logits.argmax(dim=-1) == ids).item()),
+        logprobs.detach().cpu(),
+        ranks.detach().cpu(),
+        (next_logits.argmax(dim=-1) == ids).detach().cpu(),
     )
-
-
-def _combined_id(ids: tuple[str, ...]) -> str:
-    return ids[0] if len(ids) == 1 else f"batch:{sha256_json(ids)}"
 
 
 def _validate_positions(positions: tuple[int, ...], sequence_length: int) -> None:
@@ -601,6 +699,10 @@ def _prefix_and_query(
     prefix: dict[str, object] = {}
     query: dict[str, object] = {}
     for key, value in model_inputs.items():
+        if isinstance(value, torch.Tensor) and value.ndim == 1 and value.shape[0] == input_ids.shape[1]:
+            prefix[key] = value[:-1].clone()
+            query[key] = value[-1:].clone()
+            continue
         if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[1] == input_ids.shape[1]:
             prefix[key] = value[:, :-1].clone()
             query[key] = value.clone() if key == "attention_mask" else value[:, -1:].clone()
@@ -614,6 +716,7 @@ class _SmokeLayer(nn.Module):
     def __init__(self, hidden_size: int, *, mix: bool) -> None:
         super().__init__()
         self.projection = nn.Linear(hidden_size, hidden_size, bias=False)
+        nn.init.zeros_(self.projection.weight)
         self.mix = mix
 
     def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor]:
@@ -625,8 +728,8 @@ class _SmokeLayer(nn.Module):
 class _SmokeBackbone(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(17, 6)
-        self.layers = nn.ModuleList((_SmokeLayer(6, mix=False), _SmokeLayer(6, mix=True)))
+        self.embed_tokens = nn.Embedding(17, 2)
+        self.layers = nn.ModuleList((_SmokeLayer(2, mix=False), _SmokeLayer(2, mix=True)))
         self.norm = nn.Identity()
 
     def forward(self, input_ids: torch.Tensor) -> SimpleNamespace:
@@ -640,7 +743,25 @@ class _SmokeModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.model = _SmokeBackbone()
-        self.lm_head = nn.Linear(6, 17, bias=False)
+        self.lm_head = nn.Linear(2, 17, bias=False)
+        with torch.no_grad():
+            self.model.embed_tokens.weight.zero_()
+            embeddings = {
+                1: (1.0, 3.0),
+                2: (2.0, 4.0),
+                3: (1.0, 1.0),
+                4: (2.0, 2.0),
+                7: (4.0, 1.0),
+                8: (5.0, 2.0),
+                9: (1.0, 5.0),
+                10: (2.0, 6.0),
+                11: (1.0, 7.0),
+                12: (2.0, 8.0),
+            }
+            for token_id, value in embeddings.items():
+                self.model.embed_tokens.weight[token_id] = torch.tensor(value)
+            self.lm_head.weight.zero_()
+            self.lm_head.weight[4, 0] = 1.0
 
     def forward(self, **kwargs: Any) -> SimpleNamespace:
         return SimpleNamespace(logits=self.lm_head(self.model(**kwargs).last_hidden_state))
@@ -650,14 +771,14 @@ def _smoke(output_root: Path) -> dict[str, object]:
     torch.manual_seed(101)
     model = _SmokeModel().eval()
     recipient = {
-        "input_ids": torch.tensor([[1, 2, 1, 2, 5, 6]]),
+        "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6]]),
         "example_ids": ("smoke:recipient",),
         "parent_hashes": ("1" * 64,),
         "target_token_ids": torch.tensor([4]),
         "matched_positions": (0, 1),
     }
     donor = {
-        "input_ids": torch.tensor([[7, 8, 9, 10, 5, 6]]),
+        "input_ids": torch.tensor([[1, 2, 7, 8, 5, 6]]),
         "example_ids": ("smoke:donor",),
         "parent_hashes": ("2" * 64,),
         "target_token_ids": torch.tensor([11]),
@@ -673,6 +794,9 @@ def _smoke(output_root: Path) -> dict[str, object]:
     }
     random_donor = {
         **random_recipient,
+        "input_ids": torch.tensor(
+            [[1, 2, 9, 10, 5, 6], [1, 2, 11, 12, 5, 6]]
+        ),
         "example_ids": ("smoke:random-a", "smoke:random-b"),
         "parent_hashes": ("3" * 64,),
     }
@@ -689,18 +813,58 @@ def _smoke(output_root: Path) -> dict[str, object]:
         recipient,
         InterventionSpec("ablate", (0,), (2, 3), False, (4,), "matched_non_marker_position"),
     )
+    layer = model.model.layers[0]
+    random_recipient_state = _capture_layer_output(
+        model, layer, {"input_ids": random_recipient["input_ids"]}
+    )
+    random_donor_state = _capture_layer_output(
+        model, layer, {"input_ids": random_donor["input_ids"]}
+    )
+    random_source = _control_source(
+        "random_donor",
+        random_recipient_state,
+        random_donor_state,
+        (2, 3),
+        random_recipient,
+        None,
+    )
+    recipient_state = _capture_layer_output(
+        model, layer, {"input_ids": recipient["input_ids"]}
+    )
+    matched_source = _control_source(
+        "matched_non_marker_position",
+        recipient_state,
+        None,
+        (2, 3),
+        recipient,
+        None,
+    )
+    random_delta = sum(
+        record.intervened_target_logprob - record.baseline_target_logprob
+        for record in random_control.records
+    ) / len(random_control.records)
     metrics = {
         "selected_target_logprob_delta": selected.record.intervened_target_logprob
         - selected.record.baseline_target_logprob,
-        "random_control_target_logprob_delta": random_control.record.intervened_target_logprob
-        - random_control.record.baseline_target_logprob,
+        "random_control_target_logprob_delta": random_delta,
         "non_marker_control_target_logprob_delta": matched.record.intervened_target_logprob
         - matched.record.baseline_target_logprob,
+        "random_control_replacement_changed": not torch.equal(
+            random_source[:, (2, 3), :], random_recipient_state[:, (2, 3), :]
+        ),
+        "non_marker_control_replacement_changed": not torch.equal(
+            matched_source[:, (2, 3), :], recipient_state[:, (2, 3), :]
+        ),
     }
     output_root.mkdir(parents=True, exist_ok=True)
     records_path = output_root / "records.jsonl"
+    records = tuple(
+        record
+        for result in (selected, random_control, matched)
+        for record in result.records
+    )
     records_path.write_text(
-        "".join(canonical_json(asdict(result.record)) + "\n" for result in (selected, random_control, matched)),
+        "".join(canonical_json(asdict(record)) + "\n" for record in records),
         encoding="utf-8",
     )
     manifest: dict[str, object] = {
