@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
 from pathlib import Path
@@ -102,15 +102,11 @@ class VLLMGenerationBackend:
         _validate_requests(requests)
         if not requests:
             return ()
+        decoding = _vllm_sampling_parameters(requests)
         if self._llm is None:
             from vllm import LLM  # Imported only when the production backend is used.
 
             self._llm = LLM(model=self._model, **self._llm_kwargs)
-        decoding = dict(requests[0].decoding)
-        if any(dict(request.decoding) != decoding for request in requests):
-            raise ValueError("a vLLM batch requires identical decoding settings")
-        decoding.pop("checkpoint", None)
-        decoding.pop("fake_answer", None)
         from vllm import SamplingParams
 
         results = self._llm.generate(
@@ -168,12 +164,11 @@ def records_from_outputs(
     parent_hashes: tuple[str, ...],
 ) -> list[GenerationRecord]:
     """Convert ordered raw backend output into independently rescorable records."""
-    if len(examples) != len(requests):
-        raise ValueError("examples and requests must have the same length")
+    expanded_examples = _expand_examples(cell, examples, requests)
     _validate_requests(requests)
     _validate_outputs(requests, outputs)
     rows: list[GenerationRecord] = []
-    for example, request, output in zip(examples, requests, outputs):
+    for example, request, output in zip(expanded_examples, requests, outputs):
         seed = request.decoding.get("seed")
         checkpoint = request.decoding.get("checkpoint")
         if not isinstance(seed, int) or isinstance(seed, bool):
@@ -211,6 +206,65 @@ def records_from_outputs(
     return rows
 
 
+def build_generation_requests(
+    cell: EvaluationCell,
+    examples: Sequence[DatasetExample],
+    config: ExperimentConfig,
+    *,
+    checkpoint: str = "unconfigured://checkpoint",
+    tokenize: Callable[[str], Sequence[int]] | None = None,
+) -> tuple[GenerationRequest, ...]:
+    """Expand each sampled prompt into five independently persisted requests."""
+    if not checkpoint:
+        raise ValueError("checkpoint must be nonempty")
+    marker_set = MarkerSet(*config.phase_markers)
+    encoder = tokenize or _fake_tokenize
+    completion_count = 5 if cell.kind == "sampled" else 1
+    requests: list[GenerationRequest] = []
+    for example in examples:
+        prompt = (
+            render_perturbation(example.question, cell.perturbation, marker_set)
+            if cell.perturbation
+            else render_prompt(example.question, cell.prompt_condition, marker_set)
+        )
+        for completion_index in range(completion_count):
+            decoding: dict[str, object] = {
+                "seed": config.pilot_seed,
+                "checkpoint": checkpoint,
+                "max_tokens": 64,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "n": 1,
+                "fake_answer": example.answer,
+            }
+            if cell.kind == "sampled":
+                decoding.update(
+                    {
+                        "temperature": 0.7,
+                        "top_p": 0.95,
+                        "completion_index": completion_index,
+                    }
+                )
+            completion_suffix = (
+                f":completion-{completion_index}" if cell.kind == "sampled" else ""
+            )
+            requests.append(
+                GenerationRequest(
+                    generation_id=(
+                        f"{cell.kind}:{cell.training_arm}:{cell.prompt_condition}:"
+                        f"{cell.perturbation or 'base'}:{cell.decoding_name}:{example.example_id}"
+                        f"{completion_suffix}"
+                    ),
+                    prompt=prompt,
+                    prompt_token_ids=tuple(encoder(prompt)),
+                    max_new_tokens=64,
+                    decoding=decoding,
+                )
+            )
+    _validate_requests(requests)
+    return tuple(requests)
+
+
 def serialize_generation_record(record: GenerationRecord) -> dict[str, object]:
     """Add explicit token counts without changing the immutable raw record schema."""
     row = asdict(record)
@@ -236,8 +290,50 @@ def _validate_outputs(
         raise ValueError("generation output IDs must be complete and in request order")
 
 
+def _vllm_sampling_parameters(requests: Sequence[GenerationRequest]) -> dict[str, object]:
+    """Remove per-record lineage before requiring one common vLLM batch setting."""
+    _validate_requests(requests)
+    ignored = {"checkpoint", "fake_answer", "completion_index"}
+    parameters = {
+        key: value for key, value in requests[0].decoding.items() if key not in ignored
+    }
+    for request in requests[1:]:
+        candidate = {
+            key: value for key, value in request.decoding.items() if key not in ignored
+        }
+        if candidate != parameters:
+            raise ValueError("a vLLM batch requires identical decoding settings")
+    return parameters
+
+
+def _expand_examples(
+    cell: EvaluationCell,
+    examples: Sequence[DatasetExample],
+    requests: Sequence[GenerationRequest],
+) -> tuple[DatasetExample, ...]:
+    if cell.kind != "sampled":
+        if len(examples) != len(requests):
+            raise ValueError("examples and requests must have the same length")
+        return tuple(examples)
+    if len(requests) != len(examples) * 5:
+        raise ValueError("sampled cells require five requests per example")
+    expanded: list[DatasetExample] = []
+    groups = (requests[index : index + 5] for index in range(0, len(requests), 5))
+    for example, group in zip(examples, groups):
+        indexes = [request.decoding.get("completion_index") for request in group]
+        if indexes != list(range(5)):
+            raise ValueError("sampled request completion indexes must be ordered 0 through 4")
+        expanded.extend((example,) * 5)
+    return tuple(expanded)
+
+
 def _text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _fake_tokenize(text: str) -> tuple[int, ...]:
+    """Deterministic dry-run token IDs; production callers inject the real tokenizer."""
+    return tuple(text.encode("utf-8"))
 
 
 def _vllm_logprobs(candidate: object) -> tuple[float, ...]:
@@ -268,43 +364,6 @@ def _dry_run_examples(limit: int) -> tuple[DatasetExample, ...]:
     )
 
 
-def _dry_run_requests(
-    cell: EvaluationCell, examples: Sequence[DatasetExample], config: ExperimentConfig
-) -> tuple[GenerationRequest, ...]:
-    markers = MarkerSet(*config.phase_markers)
-    requests: list[GenerationRequest] = []
-    for example in examples:
-        prompt = (
-            render_perturbation(example.question, cell.perturbation, markers)
-            if cell.perturbation
-            else render_prompt(example.question, cell.prompt_condition, markers)
-        )
-        decoding: dict[str, object] = {
-            "seed": config.pilot_seed,
-            "checkpoint": f"fake://{cell.training_arm}",
-            "max_tokens": 64,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "n": 1,
-            "fake_answer": example.answer,
-        }
-        if cell.decoding_name == "sampled":
-            decoding.update({"temperature": 0.7, "top_p": 0.95, "n": 5})
-        requests.append(
-            GenerationRequest(
-                generation_id=(
-                    f"{cell.kind}:{cell.training_arm}:{cell.prompt_condition}:"
-                    f"{cell.perturbation or 'base'}:{cell.decoding_name}:{example.example_id}"
-                ),
-                prompt=prompt,
-                prompt_token_ids=tuple(prompt.encode("utf-8")),
-                max_new_tokens=64,
-                decoding=decoding,
-            )
-        )
-    return tuple(requests)
-
-
 def _dry_run(arguments: argparse.Namespace) -> int:
     if arguments.backend != "fake":
         raise SystemExit("dry-run supports only the non-model fake backend")
@@ -321,7 +380,9 @@ def _dry_run(arguments: argparse.Namespace) -> int:
     backend = FakeGenerationBackend()
     rows: list[dict[str, object]] = []
     for cell in build_behavior_matrix(config, split_manifest):
-        requests = _dry_run_requests(cell, examples, config)
+        requests = build_generation_requests(
+            cell, examples, config, checkpoint=f"fake://{cell.training_arm}"
+        )
         records = records_from_outputs(
             cell,
             examples,

@@ -3,9 +3,12 @@ from dataclasses import asdict
 import pytest
 
 from phase_marker.behavior import (
+    _vllm_sampling_parameters,
     EvaluationCell,
+    FakeGenerationBackend,
     GenerationOutput,
     GenerationRequest,
+    build_generation_requests,
     build_behavior_matrix,
     records_from_outputs,
     serialize_generation_record,
@@ -120,3 +123,53 @@ def test_records_reject_missing_duplicate_or_reordered_output_ids():
             (GenerationOutput("other", "Final answer: 2", (2,), ()),),
             (),
         )
+
+
+def test_sampled_cells_expand_to_five_deterministic_independent_completions(config):
+    cell = EvaluationCell("sampled", "glyph", "glyph", None, "sampled")
+    examples = (
+        DatasetExample("gsm8k", "test", "one", "1 + 1", "2", "question-1"),
+        DatasetExample("gsm8k", "test", "two", "2 + 2", "4", "question-2"),
+    )
+
+    requests = build_generation_requests(cell, examples, config)
+
+    assert len(requests) == 10
+    assert [request.generation_id for request in requests] == [
+        f"sampled:glyph:glyph:base:sampled:{example.example_id}:completion-{index}"
+        for example in examples
+        for index in range(5)
+    ]
+    assert [request.decoding["completion_index"] for request in requests] == [
+        index for _ in examples for index in range(5)
+    ]
+    assert all(request.decoding["n"] == 1 for request in requests)
+    assert all(request.decoding["temperature"] == 0.7 for request in requests)
+    assert all(request.decoding["top_p"] == 0.95 for request in requests)
+    assert requests == build_generation_requests(cell, examples, config)
+
+    outputs = FakeGenerationBackend().generate(requests)
+    records = records_from_outputs(cell, examples, requests, outputs, ("parent" * 8,))
+    assert len(records) == 10
+    assert [record.generation_id for record in records] == [
+        request.generation_id for request in requests
+    ]
+    assert [record.gold_answer for record in records] == ["2"] * 5 + ["4"] * 5
+
+
+def test_vllm_batching_ignores_per_completion_provenance_not_sampling_settings(config):
+    cell = EvaluationCell("sampled", "glyph", "glyph", None, "sampled")
+    examples = (
+        DatasetExample("gsm8k", "test", "one", "1 + 1", "2", "question-1"),
+        DatasetExample("gsm8k", "test", "two", "2 + 2", "4", "question-2"),
+    )
+
+    parameters = _vllm_sampling_parameters(build_generation_requests(cell, examples, config))
+
+    assert parameters == {
+        "seed": 42,
+        "max_tokens": 64,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "n": 1,
+    }
