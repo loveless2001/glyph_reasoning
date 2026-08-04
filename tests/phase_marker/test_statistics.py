@@ -66,27 +66,16 @@ def test_paired_bootstrap_rejects_unaligned_or_duplicate_analysis_rows():
         paired_bootstrap_delta(duplicate, left, seed=7)
 
 
-def test_scored_envelope_loader_preserves_all_five_sampled_completion_seeds(tmp_path):
+def test_scored_envelope_loader_keeps_adapter_and_decoding_seeds_separate(tmp_path):
     path = tmp_path / "sampled.jsonl"
-    rows = []
-    for completion_index in range(5):
-        score = _score(
-            "gsm8k",
-            "question-a",
-            42 + completion_index,
-            "glyph",
-            "glyph",
-            completion_index % 2 == 0,
-            generation_id=f"completion-{completion_index}",
+    rows = [
+        _scored_envelope(
+            completion_index=index,
+            adapter_seed=101,
+            decoding_seed=101 + index,
         )
-        rows.append(
-            {
-                "generation_id": score.generation_id,
-                "raw_completion": f"Final answer: {int(score.correct)}",
-                "decoding": {"completion_index": completion_index, "n": 1},
-                "score": asdict(score),
-            }
-        )
+        for index in range(5)
+    ]
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
     loaded = load_score_records(path)
@@ -95,7 +84,62 @@ def test_scored_envelope_loader_preserves_all_five_sampled_completion_seeds(tmp_
     assert [record.generation_id for record in loaded] == [
         f"completion-{index}" for index in range(5)
     ]
-    assert [record.seed for record in loaded] == [42, 43, 44, 45, 46]
+    assert [record.seed for record in loaded] == [101] * 5
+    assert [record.adapter_seed for record in loaded] == [101] * 5
+    assert [record.decoding_seed for record in loaded] == [101, 102, 103, 104, 105]
+    assert [record.completion_index for record in loaded] == [0, 1, 2, 3, 4]
+    assert all(record.evaluation_kind == "sampled" for record in loaded)
+
+
+def test_scored_envelope_loader_rejects_adapter_seed_lineage_mismatch(tmp_path):
+    path = tmp_path / "mismatched.jsonl"
+    row = _scored_envelope(completion_index=0, adapter_seed=101, decoding_seed=101)
+    row["provenance"]["adapter_seed"] = 202
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="adapter seed"):
+        load_score_records(path)
+
+
+def test_mixed_model_rejects_sampled_completions_as_pseudoreplicated_seed_rows(tmp_path):
+    path = tmp_path / "sampled.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps(
+                _scored_envelope(
+                    completion_index=index,
+                    adapter_seed=101,
+                    decoding_seed=101 + index,
+                )
+            )
+            + "\n"
+            for index in range(5)
+        ),
+        encoding="utf-8",
+    )
+    sampled = load_score_records(path)
+
+    with pytest.raises(ValueError, match="duplicate analysis cell"):
+        fit_hierarchical_logit([*_model_records(), *sampled])
+
+
+def test_primary_paired_analysis_rejects_even_one_sampled_observation(tmp_path):
+    path = tmp_path / "partial-sampled.jsonl"
+    path.write_text(
+        json.dumps(
+            _scored_envelope(
+                completion_index=0,
+                adapter_seed=101,
+                decoding_seed=101,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    sampled = load_score_records(path)[0]
+
+    with pytest.raises(UnpairedComparisonError, match="primary greedy"):
+        paired_bootstrap_delta([sampled], [sampled], seed=7)
 
 
 def test_manual_audit_template_is_exactly_300_stable_source_stratified_rows(tmp_path):
@@ -207,8 +251,11 @@ def test_contrasts_preserve_seed_rows_scope_holm_and_apply_inconclusive_rule():
 
 
 def test_confirmatory_outputs_label_two_uncertainties_and_are_machine_readable(tmp_path):
+    synthetic_records = [
+        record for record in _contrast_records() if record.seed in (101, 202)
+    ]
     results = build_contrast_results(
-        _contrast_records(),
+        synthetic_records,
         (ContrastSpec("glyph-v-semantic", "glyph", "glyph", "semantic", "neutral"),),
         bootstrap_seed=13,
         draws=500,
@@ -219,35 +266,133 @@ def test_confirmatory_outputs_label_two_uncertainties_and_are_machine_readable(t
         converged=True,
         diagnostics={"optimizer_success": True},
     )
-    audit = AuditResult(True, 3, 300, 0.01, 0.01)
+    auto = _audit_records()
+    manual = _manual_labels(auto, disagreements=3)
 
-    paths = write_confirmatory_outputs(tmp_path, results, model, audit, synthetic=True)
+    paths = write_confirmatory_outputs(
+        tmp_path, results, model, auto, manual, synthetic=True
+    )
 
     markdown = paths["markdown"].read_text(encoding="utf-8")
     latex = paths["latex"].read_text(encoding="utf-8")
     summary = json.loads(paths["summary"].read_text(encoding="utf-8"))
     assert "Evaluation-sample 95% paired bootstrap CI" in markdown
     assert "Three-seed variation" in markdown
+    assert "Synthetic/test-only analysis" in markdown
     assert "Evaluation-sample 95\\% paired bootstrap CI" in latex
     assert "Three-seed variation" in latex
+    assert "Synthetic/test-only analysis" in latex
     assert summary["synthetic_smoke"] is True
     assert summary["experiment_outcomes"] is False
-    assert len(summary["contrasts"][0]["per_seed_deltas"]) == 3
+    assert summary["analysis_mode"] == "synthetic_test_only"
+    assert summary["audit"]["disagreements"] == 3
+    assert len(summary["contrasts"][0]["per_seed_deltas"]) == 2
+    assert summary["contrasts"][0]["interval"]["draws"] == 500
     assert paths["model_diagnostics"].exists()
     assert paths["audit_status"].exists()
 
 
 def test_failed_audit_writes_status_but_blocks_all_confirmatory_tables(tmp_path):
     model = ModelSummary("formula", {}, True, {"optimizer_success": True})
-    failed = AuditResult(False, 4, 300, 4 / 300, 0.01)
+    auto = _audit_records()
+    manual = _manual_labels(auto, disagreements=4)
 
     with pytest.raises(AuditGateError, match="blocks confirmatory tables"):
-        write_confirmatory_outputs(tmp_path, (), model, failed)
+        write_confirmatory_outputs(tmp_path, (), model, auto, manual, synthetic=True)
 
     assert (tmp_path / "audit-status.json").exists()
     assert not (tmp_path / "contrast-table.md").exists()
     assert not (tmp_path / "contrast-table.tex").exists()
     assert not (tmp_path / "summary.json").exists()
+
+
+def test_confirmatory_outputs_reject_passing_but_undersized_audit(tmp_path):
+    model = ModelSummary("formula", {}, True, {"optimizer_success": True})
+    auto = [
+        _score(
+            "gsm8k",
+            "only-question",
+            101,
+            "glyph",
+            "glyph",
+            True,
+            generation_id="only-audit-row",
+        )
+    ]
+
+    with pytest.raises(AuditGateError, match="exactly 300"):
+        write_confirmatory_outputs(
+            tmp_path,
+            (),
+            model,
+            auto,
+            {"only-audit-row": True},
+            synthetic=True,
+        )
+
+    assert not (tmp_path / "contrast-table.md").exists()
+
+
+def test_confirmatory_outputs_reject_unstratified_300_row_audit(tmp_path):
+    model = ModelSummary("formula", {}, True, {"optimizer_success": True})
+    auto = _audit_records({"gsm8k": 150, "math": 150})
+
+    with pytest.raises(AuditGateError, match="100 rows for each"):
+        write_confirmatory_outputs(
+            tmp_path,
+            (),
+            model,
+            auto,
+            _manual_labels(auto),
+            synthetic=True,
+        )
+
+    assert not (tmp_path / "contrast-table.md").exists()
+
+
+def test_non_synthetic_outputs_require_exactly_10000_bootstrap_draws(tmp_path):
+    results = build_contrast_results(
+        _contrast_records(),
+        (ContrastSpec("glyph-v-semantic", "glyph", "glyph", "semantic", "neutral"),),
+        bootstrap_seed=13,
+        draws=9_999,
+    )
+    auto = _audit_records()
+
+    with pytest.raises(ValueError, match="exactly 10,000"):
+        write_confirmatory_outputs(
+            tmp_path,
+            results,
+            ModelSummary("formula", {}, True, {"optimizer_success": True}),
+            auto,
+            _manual_labels(auto),
+        )
+
+    assert not (tmp_path / "contrast-table.md").exists()
+
+
+def test_non_synthetic_outputs_require_three_confirmatory_adapter_seeds(tmp_path):
+    two_seed_records = [
+        record for record in _contrast_records() if record.seed in (101, 202)
+    ]
+    results = build_contrast_results(
+        two_seed_records,
+        (ContrastSpec("glyph-v-semantic", "glyph", "glyph", "semantic", "neutral"),),
+        bootstrap_seed=13,
+        draws=10_000,
+    )
+    auto = _audit_records()
+
+    with pytest.raises(ValueError, match="adapter seeds.*101, 202, 303"):
+        write_confirmatory_outputs(
+            tmp_path,
+            results,
+            ModelSummary("formula", {}, True, {"optimizer_success": True}),
+            auto,
+            _manual_labels(auto),
+        )
+
+    assert not (tmp_path / "contrast-table.md").exists()
 
 
 def _score(
@@ -338,3 +483,98 @@ def _contrast_records() -> list[ScoreRecord]:
                         )
                     )
     return records
+
+
+def _scored_envelope(
+    *, completion_index: int, adapter_seed: int, decoding_seed: int
+) -> dict[str, object]:
+    score = _score(
+        "gsm8k",
+        "question-a",
+        adapter_seed,
+        "glyph",
+        "glyph",
+        completion_index % 2 == 0,
+        generation_id=f"completion-{completion_index}",
+    )
+    parent_hash = "a" * 64
+    split_parent_hash = "b" * 64
+    decoding = {
+        "seed": decoding_seed,
+        "adapter_seed": adapter_seed,
+        "checkpoint": "/checkpoints/glyph",
+        "run_kind": "production",
+        "config_hash": "c" * 64,
+        "tokenizer_revision": "Qwen/Qwen2.5-7B-Instruct@revision",
+        "split_artifact_id": parent_hash,
+        "split_parent_hashes": [split_parent_hash],
+        "max_tokens": 64,
+        "max_new_tokens": 64,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "n": 1,
+        "completion_index": completion_index,
+        "completion_token_logprobs": [-0.1],
+        "evaluation_kind": "sampled",
+        "perturbation": None,
+    }
+    return {
+        "generation_id": score.generation_id,
+        "source": score.source,
+        "question_hash": score.question_hash,
+        "gold_answer": score.gold_answer,
+        "training_arm": score.training_arm,
+        "seed": adapter_seed,
+        "checkpoint": "/checkpoints/glyph",
+        "prompt_condition": score.prompt_condition,
+        "prompt_hash": "d" * 64,
+        "raw_prompt": "Solve the problem",
+        "raw_completion": f"Final answer: {score.extracted_answer}",
+        "prompt_token_ids": [1, 2],
+        "completion_token_ids": [3],
+        "decoding": decoding,
+        "parent_hashes": [parent_hash, split_parent_hash],
+        "prompt_token_count": 2,
+        "completion_token_count": 1,
+        "provenance": {
+            "run_kind": "production",
+            "adapter_seed": adapter_seed,
+            "config_hash": "c" * 64,
+            "tokenizer_revision": "Qwen/Qwen2.5-7B-Instruct@revision",
+            "split_artifact_id": parent_hash,
+            "split_parent_hashes": [split_parent_hash],
+            "checkpoint": "/checkpoints/glyph",
+            "parent_hashes": [parent_hash, split_parent_hash],
+        },
+        "score": asdict(score),
+    }
+
+
+def _audit_records(
+    counts: dict[str, int] | None = None,
+) -> list[ScoreRecord]:
+    counts = counts or {"gsm8k": 100, "math": 100, "svamp": 100}
+    return [
+        _score(
+            source,
+            f"audit-question-{index}",
+            (101, 202, 303)[index % 3],
+            "glyph",
+            "glyph",
+            index % 2 == 0,
+            generation_id=f"audit:{source}:{index}",
+        )
+        for source, count in counts.items()
+        for index in range(count)
+    ]
+
+
+def _manual_labels(
+    records: list[ScoreRecord], *, disagreements: int = 0
+) -> dict[str, bool]:
+    return {
+        record.generation_id: (
+            not record.correct if index < disagreements else record.correct
+        )
+        for index, record in enumerate(records)
+    }

@@ -7,6 +7,7 @@ analysis machinery and must never be interpreted as experiment outcomes.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import csv
 from dataclasses import asdict, dataclass, replace
 import json
@@ -45,6 +46,8 @@ AUDIT_FIELDS = (
     "manual_correct",
 )
 _NORMAL_95 = 1.959963984540054
+CONFIRMATORY_ADAPTER_SEEDS = (101, 202, 303)
+CONFIRMATORY_BOOTSTRAP_DRAWS = 10_000
 
 
 class UnpairedComparisonError(ValueError):
@@ -90,6 +93,56 @@ class AuditResult:
 
 
 @dataclass(frozen=True)
+class ScoredObservation:
+    """A score plus distinct adapter and within-run decoding provenance."""
+
+    score: ScoreRecord
+    adapter_seed: int
+    decoding_seed: int
+    completion_index: int | None
+    evaluation_kind: str
+
+    @property
+    def generation_id(self) -> str:
+        return self.score.generation_id
+
+    @property
+    def source(self) -> str:
+        return self.score.source
+
+    @property
+    def question_hash(self) -> str:
+        return self.score.question_hash
+
+    @property
+    def training_arm(self) -> str:
+        return self.score.training_arm
+
+    @property
+    def seed(self) -> int:
+        return self.score.seed
+
+    @property
+    def prompt_condition(self) -> str:
+        return self.score.prompt_condition
+
+    @property
+    def gold_answer(self) -> str:
+        return self.score.gold_answer
+
+    @property
+    def extracted_answer(self) -> str | None:
+        return self.score.extracted_answer
+
+    @property
+    def correct(self) -> bool:
+        return self.score.correct
+
+
+AnalysisRecord = ScoreRecord | ScoredObservation
+
+
+@dataclass(frozen=True)
 class ContrastSpec:
     name: str
     left_training_arm: str
@@ -111,32 +164,87 @@ class ContrastResult:
     holm_adjusted_p: float | None
 
 
-def load_score_records(path: Path) -> list[ScoreRecord]:
-    """Load direct scores or Task-7 raw/scored envelopes without collapsing rows."""
-    records: list[ScoreRecord] = []
+def load_score_records(path: Path) -> list[ScoredObservation]:
+    """Load Task-7 scored envelopes without conflating adapter and decoding seeds."""
+    records: list[ScoredObservation] = []
     generation_ids: set[str] = set()
     for line_number, row in enumerate(read_jsonl(path), start=1):
-        candidate = row.get("score", row)
+        candidate = row.get("score")
         if not isinstance(candidate, Mapping):
-            raise ValueError(f"{path}:{line_number}: score must be an object")
+            raise ValueError(f"{path}:{line_number}: scored envelope lacks a score object")
         record = _score_from_mapping(candidate, path=path, line_number=line_number)
         if record.generation_id in generation_ids:
             raise ValueError(
                 f"{path}:{line_number}: duplicate generation_id {record.generation_id!r}"
             )
         generation_ids.add(record.generation_id)
-        for field in ("generation_id", "source", "question_hash", "seed"):
-            if field in row and row[field] != getattr(record, field):
+        for field in (
+            "generation_id",
+            "source",
+            "question_hash",
+            "training_arm",
+            "seed",
+            "prompt_condition",
+        ):
+            if row.get(field) != getattr(record, field):
                 raise ValueError(
                     f"{path}:{line_number}: envelope {field} does not match score"
                 )
-        records.append(record)
+        decoding = row.get("decoding")
+        provenance = row.get("provenance")
+        if not isinstance(decoding, Mapping) or not isinstance(provenance, Mapping):
+            raise ValueError(
+                f"{path}:{line_number}: scored envelope lacks decoding or provenance"
+            )
+        adapter_seeds = (
+            row.get("seed"),
+            record.seed,
+            provenance.get("adapter_seed"),
+            decoding.get("adapter_seed"),
+        )
+        if any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in adapter_seeds
+        ) or len(set(adapter_seeds)) != 1:
+            raise ValueError(
+                f"{path}:{line_number}: generation, score, provenance, and decoding "
+                "adapter seed values must match"
+            )
+        decoding_seed = decoding.get("seed")
+        if not isinstance(decoding_seed, int) or isinstance(decoding_seed, bool):
+            raise ValueError(f"{path}:{line_number}: decoding seed must be an integer")
+        evaluation_kind = decoding.get("evaluation_kind")
+        if evaluation_kind not in {"primary", "sampled", "perturbation"}:
+            raise ValueError(f"{path}:{line_number}: invalid evaluation kind")
+        completion_index = decoding.get("completion_index")
+        if evaluation_kind == "sampled":
+            if (
+                not isinstance(completion_index, int)
+                or isinstance(completion_index, bool)
+                or completion_index not in range(5)
+            ):
+                raise ValueError(
+                    f"{path}:{line_number}: sampled completion index must be 0 through 4"
+                )
+        elif completion_index is not None:
+            raise ValueError(
+                f"{path}:{line_number}: non-sampled rows cannot have a completion index"
+            )
+        records.append(
+            ScoredObservation(
+                score=record,
+                adapter_seed=record.seed,
+                decoding_seed=decoding_seed,
+                completion_index=completion_index,
+                evaluation_kind=str(evaluation_kind),
+            )
+        )
     return records
 
 
 def paired_bootstrap_delta(
-    left: Sequence[ScoreRecord],
-    right: Sequence[ScoreRecord],
+    left: Sequence[AnalysisRecord],
+    right: Sequence[AnalysisRecord],
     seed: int,
     draws: int = 10_000,
 ) -> Interval:
@@ -185,7 +293,7 @@ def paired_bootstrap_delta(
     )
 
 
-def fit_hierarchical_logit(records: Sequence[ScoreRecord]) -> ModelSummary:
+def fit_hierarchical_logit(records: Sequence[AnalysisRecord]) -> ModelSummary:
     """Fit the pre-registered Bayesian binomial mixed model by VB."""
     _validate_model_records(records)
     data = pd.DataFrame(
@@ -253,11 +361,11 @@ def fit_hierarchical_logit(records: Sequence[ScoreRecord]) -> ModelSummary:
 
 
 def generate_manual_audit_template(
-    records: Sequence[ScoreRecord],
+    records: Sequence[AnalysisRecord],
     path: Path,
     *,
     seed: int,
-) -> tuple[ScoreRecord, ...]:
+) -> tuple[AnalysisRecord, ...]:
     """Write the fixed 100-per-source, 300-row manual audit TSV."""
     sources = sorted({record.source for record in records})
     if len(sources) != 3:
@@ -325,8 +433,8 @@ def read_manual_audit_tsv(path: Path) -> dict[str, bool]:
 
 
 def apply_audit_gate(
-    auto_scores: Sequence[ScoreRecord],
-    manual_scores: Sequence[ScoreRecord] | Mapping[str, bool],
+    auto_scores: Sequence[AnalysisRecord],
+    manual_scores: Sequence[AnalysisRecord] | Mapping[str, bool],
     threshold: float = 0.01,
 ) -> AuditResult:
     """Pass at or below the disagreement threshold; block only above it."""
@@ -369,7 +477,7 @@ def effect_is_inconclusive(interval: Interval) -> bool:
 
 
 def build_contrast_results(
-    records: Sequence[ScoreRecord],
+    records: Sequence[AnalysisRecord],
     contrasts: Sequence[ContrastSpec],
     *,
     bootstrap_seed: int,
@@ -451,11 +559,12 @@ def write_confirmatory_outputs(
     output_root: Path,
     results: Sequence[ContrastResult],
     model: ModelSummary,
-    audit: AuditResult,
+    auto_scores: Sequence[AnalysisRecord],
+    manual_scores: Sequence[AnalysisRecord] | Mapping[str, bool],
     *,
     synthetic: bool = False,
 ) -> dict[str, Path]:
-    """Write gated Markdown, LaTeX, JSON, model, and audit artifacts."""
+    """Recompute the fixed audit, then write gated analysis artifacts."""
     output_root.mkdir(parents=True, exist_ok=True)
     paths = {
         "markdown": output_root / "contrast-table.md",
@@ -464,15 +573,50 @@ def write_confirmatory_outputs(
         "model_diagnostics": output_root / "model-diagnostics.json",
         "audit_status": output_root / "audit-status.json",
     }
-    _atomic_json(paths["audit_status"], asdict(audit))
+    audit = apply_audit_gate(auto_scores, manual_scores, threshold=0.01)
+    source_counts = Counter(record.source for record in auto_scores)
+    analysis_mode = "synthetic_test_only" if synthetic else "confirmatory"
+    population_error: str | None = None
+    if len(auto_scores) != 300:
+        population_error = (
+            f"confirmatory audit requires exactly 300 matched identities, "
+            f"found {len(auto_scores)}"
+        )
+    elif source_counts != Counter({"gsm8k": 100, "math": 100, "svamp": 100}):
+        population_error = (
+            "confirmatory audit requires exactly 100 rows for each of "
+            f"gsm8k, math, and svamp; found {dict(sorted(source_counts.items()))!r}"
+        )
+    protocol_error = _confirmatory_protocol_error(results) if not synthetic else None
+    reason = population_error or protocol_error
+    if reason is None and not audit.passed:
+        reason = (
+            f"audit disagreement {audit.rate:.4f} exceeds {audit.threshold:.4f}"
+        )
+    _atomic_json(
+        paths["audit_status"],
+        {
+            **asdict(audit),
+            "population_valid": population_error is None,
+            "protocol_valid": protocol_error is None,
+            "analysis_eligible": audit.passed and reason is None,
+            "analysis_mode": analysis_mode,
+            "source_counts": dict(sorted(source_counts.items())),
+            "reason": reason,
+        },
+    )
+    if population_error is not None:
+        _remove_confirmatory_outputs(paths)
+        raise AuditGateError(population_error + " and blocks confirmatory tables")
     if not audit.passed:
-        for name, path in paths.items():
-            if name != "audit_status":
-                path.unlink(missing_ok=True)
+        _remove_confirmatory_outputs(paths)
         raise AuditGateError(
             f"audit disagreement {audit.rate:.4f} exceeds {audit.threshold:.4f} "
             "and blocks confirmatory tables"
         )
+    if protocol_error is not None:
+        _remove_confirmatory_outputs(paths)
+        raise ValueError(protocol_error)
 
     _atomic_text(paths["markdown"], _render_markdown(results, synthetic))
     _atomic_text(paths["latex"], _render_latex(results, synthetic))
@@ -480,6 +624,7 @@ def write_confirmatory_outputs(
     _atomic_json(
         paths["summary"],
         {
+            "analysis_mode": analysis_mode,
             "synthetic_smoke": synthetic,
             "experiment_outcomes": not synthetic,
             "audit": asdict(audit),
@@ -490,11 +635,40 @@ def write_confirmatory_outputs(
     return paths
 
 
+def _remove_confirmatory_outputs(paths: Mapping[str, Path]) -> None:
+    for name, path in paths.items():
+        if name != "audit_status":
+            path.unlink(missing_ok=True)
+
+
+def _confirmatory_protocol_error(
+    results: Sequence[ContrastResult],
+) -> str | None:
+    for result in results:
+        if result.interval.draws != CONFIRMATORY_BOOTSTRAP_DRAWS:
+            return (
+                "non-synthetic confirmatory intervals require exactly 10,000 "
+                f"bootstrap draws; {result.spec.name!r} has {result.interval.draws}"
+            )
+        seeds = tuple(seed for seed, _ in result.per_seed_deltas)
+        if seeds != CONFIRMATORY_ADAPTER_SEEDS:
+            return (
+                "non-synthetic confirmatory seed summaries require adapter seeds "
+                f"(101, 202, 303); {result.spec.name!r} has {seeds!r}"
+            )
+    return None
+
+
 def _unique_pair_rows(
-    records: Sequence[ScoreRecord], label: str
-) -> dict[tuple[str, str, int], ScoreRecord]:
-    rows: dict[tuple[str, str, int], ScoreRecord] = {}
+    records: Sequence[AnalysisRecord], label: str
+) -> dict[tuple[str, str, int], AnalysisRecord]:
+    rows: dict[tuple[str, str, int], AnalysisRecord] = {}
     for record in records:
+        if isinstance(record, ScoredObservation) and record.evaluation_kind != "primary":
+            raise UnpairedComparisonError(
+                f"{label} primary greedy analysis cannot include "
+                f"{record.evaluation_kind!r} observations"
+            )
         key = (record.source, record.question_hash, record.seed)
         if key in rows:
             raise UnpairedComparisonError(
@@ -505,7 +679,7 @@ def _unique_pair_rows(
 
 
 def _unique_generation_labels(
-    records: Sequence[ScoreRecord], label: str
+    records: Sequence[AnalysisRecord], label: str
 ) -> dict[str, bool]:
     labels: dict[str, bool] = {}
     for record in records:
@@ -517,12 +691,37 @@ def _unique_generation_labels(
     return labels
 
 
-def _validate_model_records(records: Sequence[ScoreRecord]) -> None:
+def _validate_model_records(records: Sequence[AnalysisRecord]) -> None:
     if not records:
         raise ValueError("hierarchical model requires score records")
     generation_ids = [record.generation_id for record in records]
     if len(generation_ids) != len(set(generation_ids)):
         raise ValueError("hierarchical model generation IDs must be unique")
+    analysis_cells = [
+        (
+            record.source,
+            record.question_hash,
+            record.seed,
+            record.training_arm,
+            record.prompt_condition,
+        )
+        for record in records
+    ]
+    if len(analysis_cells) != len(set(analysis_cells)):
+        raise ValueError(
+            "hierarchical model contains a duplicate analysis cell; sampled "
+            "completions cannot be treated as independent adapter-seed rows"
+        )
+    non_primary = [
+        record.evaluation_kind
+        for record in records
+        if isinstance(record, ScoredObservation) and record.evaluation_kind != "primary"
+    ]
+    if non_primary:
+        raise ValueError(
+            "hierarchical model accepts primary greedy observations only; "
+            f"found {sorted(set(non_primary))!r}"
+        )
     dimensions = {
         "training arms": {record.training_arm for record in records},
         "prompt conditions": {record.prompt_condition for record in records},
@@ -569,7 +768,7 @@ def _render_markdown(
     if synthetic:
         lines.extend(
             [
-                "> **Synthetic smoke only:** these values are not experiment outcomes.",
+                "> **Synthetic/test-only analysis:** these values are not experiment outcomes.",
                 "",
             ]
         )
@@ -598,7 +797,9 @@ def _render_markdown(
 def _render_latex(results: Sequence[ContrastResult], synthetic: bool) -> str:
     lines = []
     if synthetic:
-        lines.append("% Synthetic smoke only; these values are not experiment outcomes.")
+        lines.append(
+            "% Synthetic/test-only analysis; these values are not experiment outcomes."
+        )
     lines.extend(
         [
             "\\begin{tabular}{lrrrrl}",
@@ -825,7 +1026,12 @@ def _run_smoke(output_root: Path) -> int:
         threshold=0.01,
     )
     paths = write_confirmatory_outputs(
-        output_root, results, model, audit, synthetic=True
+        output_root,
+        results,
+        model,
+        selected,
+        {record.generation_id: record.correct for record in selected},
+        synthetic=True,
     )
     print("synthetic smoke only: no experiment outcomes")
     print(
