@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 import json
 from pathlib import Path
 import shutil
+import shlex
 from typing import Callable
 
 import pytest
@@ -86,6 +87,38 @@ def test_pilot_plan_contains_only_six_training_and_six_selection_commands(
     assert "phase_marker.behavior run" not in serialized
     assert "phase_marker.activations" not in serialized
     assert "phase_marker.interventions" not in serialized
+
+
+def test_pilot_plan_commands_are_portable_workspace_relative_bytes(
+    prepared_artifacts: Path,
+) -> None:
+    """Would fail if a frozen remote job retained its host worktree prefix."""
+    plan = _plan(prepared_artifacts)
+    host_prefix = prepared_artifacts.parent.parent.as_posix()
+
+    for job in plan.jobs:
+        training = shlex.split(job.training_command)
+        selection = shlex.split(job.selection_command)
+        assert host_prefix not in job.training_command
+        assert host_prefix not in job.selection_command
+        assert training[training.index("--config") + 1] == (
+            "configs/phase-marker-qwen25-7b.toml"
+        )
+        assert training[training.index("--data") + 1] == (
+            f"artifacts/phase-marker/training-data/{job.arm}.jsonl"
+        )
+        assert training[training.index("--output-dir") + 1] == (
+            f"artifacts/phase-marker/checkpoints/pilot/seed-42/{job.arm}"
+        )
+        assert selection[selection.index("--split-manifest") + 1] == (
+            "artifacts/phase-marker/splits/manifest.json"
+        )
+        assert selection[selection.index("--training-manifest") + 1] == (
+            f"artifacts/phase-marker/checkpoints/pilot/seed-42/{job.arm}/run-manifest.json"
+        )
+        assert selection[selection.index("--output") + 1] == (
+            f"artifacts/phase-marker/checkpoint-selections/pilot/seed-42/{job.arm}"
+        )
 
 
 def test_pilot_plan_rejects_missing_or_extra_manifest_jobs(

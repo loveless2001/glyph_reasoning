@@ -653,6 +653,26 @@ def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing
     assert manifest["origin_verification"] == "execution_receipt_or_rerun_required"
     assert [row["step"] for row in manifest["candidates"]] == [200, 100]
     assert manifest["selected_step"] == 100
+    one = _load_checkpoint_selections(
+        (output / "manifest.json",),
+        config,
+        "pilot",
+        (42,),
+        allow_test=True,
+        tokenizer=_DeterministicTokenizer(),
+        expected_identities=frozenset({(42, "glyph")}),
+    )
+    assert set(one) == {(42, "glyph")}
+    one_without_model_cache = _load_checkpoint_selections(
+        (output / "manifest.json",),
+        config,
+        "pilot",
+        (42,),
+        allow_test=True,
+        expected_identities=frozenset({(42, "glyph")}),
+        replay_tokenizer=False,
+    )
+    assert set(one_without_model_cache) == {(42, "glyph")}
 
     evidence_path = output / "evidence.jsonl"
     evidence_rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]

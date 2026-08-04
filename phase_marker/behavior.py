@@ -1285,8 +1285,15 @@ def _load_checkpoint_selections(
     *,
     allow_test: bool,
     tokenizer: EvidenceTokenizer | None = None,
+    expected_identities: frozenset[tuple[int, str]] | None = None,
+    replay_tokenizer: bool = True,
 ) -> dict[tuple[int, str], dict[str, object]]:
-    expected = {(seed, arm) for seed in seeds for arm in config.arms}
+    if not isinstance(replay_tokenizer, bool):
+        raise TypeError("checkpoint selection tokenizer replay must be explicit")
+    full_expected = {(seed, arm) for seed in seeds for arm in config.arms}
+    expected = full_expected if expected_identities is None else set(expected_identities)
+    if not expected or not expected.issubset(full_expected):
+        raise ValueError("checkpoint selection identities are outside the frozen matrix")
     result: dict[tuple[int, str], dict[str, object]] = {}
     token_replays: list[tuple[Path, str, tuple[int, ...], tuple[str, ...]]] = []
     config_hash = sha256_json(asdict(config))
@@ -1457,12 +1464,15 @@ def _load_checkpoint_selections(
         raise ValueError(
             f"checkpoint selections must cover exact seed/arm matrix: missing={sorted(expected-set(result))}"
         )
-    if evidence_tokenizer is None:
+    if replay_tokenizer and evidence_tokenizer is None:
         evidence_tokenizer = (
             _CodepointEvidenceTokenizer()
             if allow_test else _load_pinned_local_tokenizer(config.model_id)
         )
-    for path, continuation, token_ids, pieces in token_replays:
+    for path, continuation, token_ids, pieces in (
+        token_replays if replay_tokenizer else ()
+    ):
+        assert evidence_tokenizer is not None
         try:
             replayed_ids = tuple(evidence_tokenizer.encode(
                 continuation, add_special_tokens=False

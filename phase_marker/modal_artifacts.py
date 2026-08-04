@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import chdir, contextmanager
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import hashlib
 import importlib
 import json
@@ -13,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Protocol
 import uuid
 
@@ -136,6 +139,10 @@ class VolumeClient(Protocol):
 
 class _CachePublicationRollbackError(RuntimeError):
     """A visible cache publication could not be restored to quarantine."""
+
+
+class _JobPublicationRollbackError(RuntimeError):
+    """A visible job publication could not be restored to its attempt."""
 
 
 @dataclass(frozen=True)
@@ -371,9 +378,975 @@ def promote_validated_output(
         if target.exists():
             raise FileExistsError("canonical output already exists")
         staged.replace(target)
-    finally:
+    except Exception as error:
+        try:
+            lock.unlink(missing_ok=True)
+        except Exception as lock_error:
+            try:
+                _restore_failed_job_promotion(
+                    error=lock_error,
+                    published=False,
+                    target=target,
+                    attempt_root=root,
+                    lock=lock,
+                )
+            except _JobPublicationRollbackError:
+                raise
+            error.add_note(
+                "promotion lock cleanup also failed: "
+                f"{type(lock_error).__name__}: {lock_error}"
+            )
+        raise
+    try:
         lock.unlink(missing_ok=True)
+    except Exception as error:
+        _restore_failed_job_promotion(
+            error=error,
+            published=True,
+            target=target,
+            attempt_root=root,
+            lock=lock,
+        )
+        raise
     return target
+
+
+def _restore_failed_job_promotion(
+    *,
+    error: Exception,
+    published: bool,
+    target: Path,
+    attempt_root: Path,
+    lock: Path,
+) -> None:
+    failures: list[str] = []
+    if published:
+        try:
+            target.replace(Path(attempt_root) / "failed-promotion")
+        except Exception as rollback_error:
+            failures.append(
+                "producer rollback failed: "
+                f"{type(rollback_error).__name__}: {rollback_error}"
+            )
+    if lock.exists():
+        try:
+            lock.replace(Path(attempt_root) / "failed-promotion.lock")
+        except Exception as rollback_error:
+            failures.append(
+                "lock quarantine failed: "
+                f"{type(rollback_error).__name__}: {rollback_error}"
+            )
+    if failures:
+        compound = _JobPublicationRollbackError(
+            "job publication rollback failed; refusing to commit ambiguous state"
+        )
+        compound.add_note(f"original failure: {type(error).__name__}: {error}")
+        for failure in failures:
+            compound.add_note(failure)
+        raise compound from error
+
+
+def execute_pilot_job(
+    *,
+    stage: str,
+    plan_payload: Mapping[str, object],
+    job_payload: Mapping[str, object],
+    code_root: Path,
+    input_root: Path,
+    model_root: Path,
+    run_root: Path,
+    volume: VolumeClient,
+    environ: Mapping[str, str] | None = None,
+    producer_validator: Callable[..., None] | None = None,
+    bf16_probe: Callable[[], bool] | None = None,
+) -> dict[str, object]:
+    """Run one frozen pilot producer and publish only its validated output tree."""
+    if stage not in {"train", "selection"}:
+        raise ValueError("pilot job stage is invalid")
+    _validate_pilot_plan_payload(plan_payload)
+    job = _validate_stage_job_payload(stage, plan_payload, job_payload)
+
+    code = Path(code_root).resolve()
+    if hash_source_tree(code) != plan_payload["source_hash"]:
+        raise ValueError("pilot job source hash does not match the plan")
+    lock = code / "requirements-modal-phase-marker.txt"
+    if not lock.is_file() or _file_sha256(lock) != plan_payload["dependency_lock_hash"]:
+        raise ValueError("pilot job dependency lock hash does not match the plan")
+
+    bundle_root = Path(input_root) / "bundles" / str(plan_payload["bundle_id"])
+    bundle = load_input_bundle(bundle_root / "bundle-manifest.json")
+    if bundle.bundle_id != plan_payload["bundle_id"]:
+        raise ValueError("pilot job bundle identity does not match the plan")
+    validate_bundle_at_root(bundle, bundle_root)
+
+    snapshot, cache_manifest = _validated_model_cache(model_root)
+
+    attempt_id = create_attempt_id()
+    run = Path(run_root).resolve() / "runs" / str(plan_payload["run_id"])
+    training_root = run / _producer_relative_path("train", str(job["arm"]))
+    attempt_root = run / "attempts" / attempt_id
+    if attempt_root.exists():
+        raise FileExistsError("fresh pilot attempt namespace already exists")
+    workspace = attempt_root / "workspace"
+    command = str(job["training_command"] if stage == "train" else job["selection_command"])
+    started = datetime.now(timezone.utc)
+    started_clock = time.monotonic()
+    log_path = attempt_root / "logs" / f"{stage}.log"
+    producer = workspace / _producer_relative_path(stage, str(job["arm"]))
+    canonical = run / _producer_relative_path(stage, str(job["arm"]))
+    command_env = dict(os.environ if environ is None else environ)
+    observed_gpu: str | None = None
+    exit_status = 1
+    published = False
+    attempt_receipt_path: Path | None = None
+    canonical_receipt_path: Path | None = None
+    try:
+        prepared = prepare_ephemeral_workspace(
+            code_root=code,
+            input_root=bundle_root,
+            run_root=run,
+            bundle=bundle,
+            stage=stage,
+            arm=str(job["arm"]),
+            attempt_id=attempt_id,
+            canonical_training_root=(
+                training_root if stage == "selection" else None
+            ),
+        )
+        if prepared.resolve() != workspace.resolve():
+            raise ValueError("pilot attempt workspace path is noncanonical")
+        _require_one_visible_cuda_device(command_env)
+        observed_gpu = _observe_gpu_name()
+        supports_bf16 = _torch_bf16_supported if bf16_probe is None else bf16_probe
+        if supports_bf16() is not True:
+            raise RuntimeError("pilot job requires BF16 support")
+        command_env.update(
+            {
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "HF_HUB_CACHE": str(snapshot.parents[2]),
+            }
+        )
+        exit_status = run_exact_command(
+            command, workspace=workspace, log_path=log_path, env=command_env
+        )
+        if exit_status != 0:
+            raise RuntimeError(
+                f"{stage} job for {job['arm']} exited with status {exit_status}"
+            )
+        validator = _validate_job_producer if producer_validator is None else producer_validator
+        if producer_validator is None:
+            with _offline_model_cache(snapshot.parents[2]):
+                validator(stage, producer, plan_payload, job)
+        else:
+            validator(stage, producer, plan_payload, job)
+        records = _source_output_records(producer)
+        if not records:
+            raise ValueError("pilot job producer output is empty")
+        receipt = _job_attempt_receipt(
+            stage=stage,
+            plan_payload=plan_payload,
+            job=job,
+            attempt_id=attempt_id,
+            command=command,
+            cache_artifact_id=cache_manifest.artifact_id,
+            observed_gpu=observed_gpu,
+            started=started,
+            elapsed_seconds=max(0.0, time.monotonic() - started_clock),
+            exit_status=0,
+            validated=True,
+            promoted=True,
+            records=records,
+            failure_reason=None,
+        )
+        promote_validated_output(producer, workspace.parent, canonical, receipt)
+        published = True
+        attempt_receipt_path = _write_attempt_receipt_in_namespace(run, receipt)
+        canonical_receipt_path = _link_canonical_receipt(
+            run, receipt, attempt_receipt_path
+        )
+        volume.commit()
+        return _receipt_payload(receipt, include_artifact_id=True)
+    except Exception as error:
+        if isinstance(error, _JobPublicationRollbackError):
+            _append_failure_log(log_path, error)
+            raise
+        try:
+            _quarantine_failed_job_publication(
+                attempt_root=workspace.parent,
+                canonical=canonical,
+                published=published,
+                attempt_receipt_path=attempt_receipt_path,
+                canonical_receipt_path=canonical_receipt_path,
+            )
+            _append_failure_log(log_path, error)
+            records = _source_output_records(producer) if producer.is_dir() else ()
+            failed = _job_attempt_receipt(
+                stage=stage,
+                plan_payload=plan_payload,
+                job=job,
+                attempt_id=attempt_id,
+                command=command,
+                cache_artifact_id=cache_manifest.artifact_id,
+                observed_gpu=observed_gpu,
+                started=started,
+                elapsed_seconds=max(0.0, time.monotonic() - started_clock),
+                exit_status=exit_status,
+                validated=False,
+                promoted=False,
+                records=records,
+                failure_reason=f"{type(error).__name__}: {error}",
+            )
+            _write_attempt_receipt_in_namespace(run, failed)
+            volume.commit()
+        except Exception as persistence_error:
+            error.add_note(
+                "pilot job failure persistence also failed: "
+                f"{type(persistence_error).__name__}: {persistence_error}"
+            )
+        raise
+
+
+def _job_attempt_receipt(
+    *,
+    stage: str,
+    plan_payload: Mapping[str, object],
+    job: Mapping[str, object],
+    attempt_id: str,
+    command: str,
+    cache_artifact_id: str,
+    observed_gpu: str | None,
+    started: datetime,
+    elapsed_seconds: float,
+    exit_status: int,
+    validated: bool,
+    promoted: bool,
+    records: tuple[tuple[str, str], ...],
+    failure_reason: str | None,
+) -> AttemptReceipt:
+    receipt = AttemptReceipt(
+        schema_version=1,
+        run_id=str(plan_payload["run_id"]),
+        bundle_id=str(plan_payload["bundle_id"]),
+        stage=stage,
+        arm=str(job["arm"]),
+        seed=int(job["seed"]),
+        attempt_id=attempt_id,
+        command=command,
+        command_hash=hashlib.sha256(command.encode("utf-8")).hexdigest(),
+        source_hash=str(plan_payload["source_hash"]),
+        dependency_lock_hash=str(plan_payload["dependency_lock_hash"]),
+        model_cache_artifact_id=cache_artifact_id,
+        requested_gpu="H100",
+        observed_gpu=observed_gpu,
+        started_at=started.isoformat(),
+        finished_at=datetime.now(timezone.utc).isoformat(),
+        elapsed_seconds=elapsed_seconds,
+        timeout_seconds=14_400,
+        exit_status=exit_status,
+        validated=validated,
+        promoted=promoted,
+        expected_outputs=tuple(path for path, _ in records),
+        output_hashes=tuple(digest for _, digest in records),
+        failure_reason=failure_reason,
+        artifact_id="",
+    )
+    return AttemptReceipt(
+        **{**asdict(receipt), "artifact_id": receipt.recomputed_artifact_id()}
+    )
+
+
+def _append_failure_log(log_path: Path, error: Exception) -> None:
+    path = Path(log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as handle:
+        handle.write(f"\n{type(error).__name__}: {error}\n".encode("utf-8"))
+
+
+def _quarantine_failed_job_publication(
+    *,
+    attempt_root: Path,
+    canonical: Path,
+    published: bool,
+    attempt_receipt_path: Path | None,
+    canonical_receipt_path: Path | None,
+) -> None:
+    """Remove this attempt's uncommitted canonical names without deleting evidence."""
+    if not published and attempt_receipt_path is None and canonical_receipt_path is None:
+        return
+    quarantine = Path(attempt_root) / "failed-publication"
+    quarantine.mkdir(parents=True, exist_ok=False)
+    if canonical_receipt_path is not None:
+        canonical_receipt_path.replace(quarantine / "canonical-receipt.json")
+    if attempt_receipt_path is not None:
+        attempt_receipt_path.replace(quarantine / "success-receipt.json")
+    if published:
+        canonical.replace(quarantine / "producer")
+
+
+def _validate_stage_job_payload(
+    stage: str,
+    plan_payload: Mapping[str, object],
+    job_payload: Mapping[str, object],
+) -> dict[str, object]:
+    if not isinstance(job_payload, Mapping) or set(job_payload) != _PLAN_JOB_FIELDS:
+        raise ValueError("pilot job payload fields are invalid")
+    normalized = dict(job_payload)
+    outputs = normalized.get("expected_outputs")
+    if isinstance(outputs, tuple):
+        normalized["expected_outputs"] = list(outputs)
+    jobs = plan_payload["jobs"]
+    assert isinstance(jobs, list)
+    matches = [item for item in jobs if isinstance(item, Mapping) and item.get("arm") == normalized.get("arm")]
+    if len(matches) != 1 or dict(matches[0]) != normalized:
+        raise ValueError("pilot job payload does not match the approved plan")
+    command = normalized["training_command"] if stage == "train" else normalized["selection_command"]
+    expected = (
+        _workspace_training_command(str(normalized["arm"]))
+        if stage == "train"
+        else _workspace_selection_command(str(normalized["arm"]))
+    )
+    if shlex.split(str(command), posix=True) != expected:
+        raise ValueError("pilot job command does not match the approved plan")
+    return normalized
+
+
+def _observe_gpu_name() -> str:
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        shell=False,
+    )
+    names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(names) != 1 or "H100" not in names[0]:
+        raise RuntimeError("pilot job requires exactly one observed H100 GPU")
+    return names[0]
+
+
+def _require_one_visible_cuda_device(environ: Mapping[str, str]) -> None:
+    visible = environ.get("CUDA_VISIBLE_DEVICES")
+    devices = [] if visible is None else [item.strip() for item in visible.split(",")]
+    if len(devices) != 1 or not devices[0] or devices[0] == "-1":
+        raise RuntimeError("pilot job requires exactly one visible CUDA device")
+
+
+def _torch_bf16_supported() -> bool:
+    import torch
+
+    return bool(torch.cuda.is_bf16_supported())
+
+
+def _validate_job_producer(
+    stage: str,
+    producer: Path,
+    plan_payload: Mapping[str, object],
+    job_payload: Mapping[str, object],
+    *,
+    replay_tokenizer: bool = True,
+) -> None:
+    outputs = job_payload["expected_outputs"]
+    assert isinstance(outputs, list)
+    selected = outputs[:3] if stage == "train" else outputs[3:]
+    root = _producer_relative_path(stage, str(job_payload["arm"]))
+    for value in selected:
+        path = Path(str(value))
+        try:
+            relative = path.relative_to(root)
+        except ValueError as error:
+            raise ValueError("pilot job expected output escapes its producer root") from error
+        if not (producer / relative).is_file():
+            raise ValueError(f"pilot job expected output is missing: {relative.as_posix()}")
+
+    producer_path = Path(producer).resolve()
+    relative_producer = _producer_relative_path(stage, str(job_payload["arm"]))
+    workspace = producer_path.parents[len(relative_producer.parts) - 1]
+    if (workspace / relative_producer).resolve() != producer_path:
+        raise ValueError("pilot job producer is outside its approved workspace path")
+
+    from phase_marker.config import ExperimentConfig
+    from phase_marker.pipeline import (
+        _validate_materializations,
+        _validate_split_manifest,
+        _validate_training_runs,
+    )
+
+    artifact_root = Path(_ARTIFACT_ROOT)
+    config_path = Path("configs/phase-marker-qwen25-7b.toml")
+    identity = frozenset({(int(job_payload["seed"]), str(job_payload["arm"]))})
+    with chdir(workspace):
+        config = ExperimentConfig.load(config_path)
+        if sha256_json(asdict(config)) != plan_payload["config_hash"]:
+            raise ValueError("pilot job producer configuration does not match the plan")
+        split = _validate_split_manifest(artifact_root, config)
+        materialization_ids = _validate_materializations(
+            artifact_root, config, split.artifact_id
+        )
+        if (
+            split.artifact_id != plan_payload["split_artifact_id"]
+            or list(materialization_ids)
+            != plan_payload["materialization_artifact_ids"]
+        ):
+            raise ValueError("pilot producer input lineage does not match the plan")
+        expected_materializations = dict(
+            zip(config.arms, materialization_ids, strict=True)
+        )
+        training_ids = _validate_training_runs(
+            artifact_root,
+            config,
+            split.artifact_id,
+            kind="pilot",
+            seeds=(42,),
+            expected_materializations=expected_materializations,
+            expected_identities=identity,
+        )
+        if len(training_ids) != 1:
+            raise ValueError("pilot training producer validation was not singular")
+        if stage == "selection":
+            from phase_marker.behavior import (
+                _load_checkpoint_selections,
+                _validate_production_behavior_inputs,
+            )
+
+            selections = _load_checkpoint_selections(
+                (relative_producer / "manifest.json",),
+                config,
+                "pilot",
+                (42,),
+                allow_test=False,
+                expected_identities=identity,
+                replay_tokenizer=replay_tokenizer,
+            )
+            _validate_production_behavior_inputs(
+                artifact_root / "splits/manifest.json",
+                split.artifact_id,
+                config,
+                selections,
+            )
+
+
+def validate_canonical_job_semantics(
+    *,
+    stage: str,
+    producer_files: Mapping[str, bytes],
+    canonical_training_files: Mapping[str, bytes] | None,
+    plan_payload: Mapping[str, object],
+    job_payload: Mapping[str, object],
+    local_input_root: Path,
+) -> None:
+    """Re-run per-identity producer/consumer semantics in an isolated local view."""
+    _validate_pilot_plan_payload(plan_payload)
+    job = _validate_stage_job_payload(stage, plan_payload, job_payload)
+    local = Path(local_input_root).resolve()
+    bundle = build_input_bundle(local)
+    if bundle.bundle_id != plan_payload["bundle_id"]:
+        raise ValueError("local resume inputs no longer match the approved bundle")
+    validate_bundle_at_root(bundle, local)
+    if stage == "selection" and not canonical_training_files:
+        raise ValueError("canonical selection lacks its semantic training parent")
+    if stage == "train" and canonical_training_files is not None:
+        raise ValueError("training semantic validation received an unexpected parent")
+
+    with tempfile.TemporaryDirectory(prefix="phase-marker-resume-") as temporary:
+        workspace = Path(temporary)
+        for relative in INPUT_ALLOWLIST:
+            source = local / relative
+            destination = workspace / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        producer = workspace / _producer_relative_path(stage, str(job["arm"]))
+        _write_semantic_file_view(producer, producer_files)
+        if canonical_training_files is not None:
+            training = workspace / _producer_relative_path("train", str(job["arm"]))
+            _write_semantic_file_view(training, canonical_training_files)
+        _validate_job_producer(
+            stage,
+            producer,
+            plan_payload,
+            job,
+            replay_tokenizer=False,
+        )
+
+
+def _write_semantic_file_view(root: Path, files: Mapping[str, bytes]) -> None:
+    if not isinstance(files, Mapping) or not files:
+        raise ValueError("canonical semantic producer files are missing")
+    for relative, content in files.items():
+        candidate = PurePosixPath(relative)
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or candidate.is_absolute()
+            or "." in candidate.parts
+            or ".." in candidate.parts
+            or not isinstance(content, bytes)
+        ):
+            raise ValueError("canonical semantic producer file record is invalid")
+        destination = Path(root).joinpath(*candidate.parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+
+
+def _validated_model_cache(model_root: Path) -> tuple[Path, ModelCacheManifest]:
+    snapshot = (
+        Path(model_root).resolve()
+        / "canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+    manifest = load_model_cache_manifest(
+        snapshot.parent / f"{QWEN25_7B_TOKENIZER_REVISION}.manifest.json"
+    )
+    validate_model_cache_manifest(snapshot, manifest)
+    return snapshot, manifest
+
+
+@contextmanager
+def _offline_model_cache(cache_root: Path) -> object:
+    values = {
+        "HF_HUB_CACHE": str(Path(cache_root).resolve()),
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+    }
+    missing = object()
+    previous: dict[str, object] = {
+        name: os.environ.get(name, missing) for name in values
+    }
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is missing:
+                os.environ.pop(name, None)
+            else:
+                assert isinstance(value, str)
+                os.environ[name] = value
+
+
+def _write_attempt_receipt_in_namespace(run_root: Path, receipt: AttemptReceipt) -> Path:
+    _validate_receipt(receipt)
+    path = Path(run_root) / "receipts" / "attempts" / f"{receipt.attempt_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = canonical_json(_receipt_payload(receipt, include_artifact_id=True)) + "\n"
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+        os.link(temporary, path)
+    except FileExistsError as error:
+        raise FileExistsError("attempt receipt already exists") from error
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return path
+
+
+def _link_canonical_receipt(
+    run_root: Path, receipt: AttemptReceipt, attempt_receipt: Path,
+) -> Path:
+    path = (
+        Path(run_root) / "receipts" / "canonical" / receipt.stage / f"{receipt.arm}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(attempt_receipt, path)
+    except FileExistsError as error:
+        raise FileExistsError("canonical receipt already exists") from error
+    return path
+
+
+def load_attempt_receipt_payload(payload: Mapping[str, object]) -> AttemptReceipt:
+    """Parse one receipt mapping and revalidate its content-addressed identity."""
+    fields = frozenset(AttemptReceipt.__dataclass_fields__)
+    if not isinstance(payload, Mapping) or set(payload) != fields:
+        raise ValueError("attempt receipt fields are invalid")
+    normalized = dict(payload)
+    for name in ("expected_outputs", "output_hashes"):
+        value = normalized[name]
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("attempt receipt output records are invalid")
+        normalized[name] = tuple(value)
+    try:
+        receipt = AttemptReceipt(**normalized)
+    except TypeError as error:
+        raise ValueError("attempt receipt fields are invalid") from error
+    _validate_receipt(receipt)
+    return receipt
+
+
+def validate_job_receipt_payload(
+    *,
+    receipt_payload: Mapping[str, object],
+    plan_payload: Mapping[str, object],
+    job_payload: Mapping[str, object],
+    stage: str,
+) -> dict[str, object]:
+    """Fail closed unless a successful receipt binds the exact plan, job, and stage."""
+    _validate_pilot_plan_payload(plan_payload)
+    job = _validate_stage_job_payload(stage, plan_payload, job_payload)
+    receipt = load_attempt_receipt_payload(receipt_payload)
+    command = str(job["training_command"] if stage == "train" else job["selection_command"])
+    if (
+        receipt.run_id != plan_payload["run_id"]
+        or receipt.bundle_id != plan_payload["bundle_id"]
+        or receipt.stage != stage
+        or receipt.arm != job["arm"]
+        or receipt.seed != job["seed"]
+        or receipt.command != command
+        or receipt.command_hash != hashlib.sha256(command.encode("utf-8")).hexdigest()
+        or receipt.source_hash != plan_payload["source_hash"]
+        or receipt.dependency_lock_hash != plan_payload["dependency_lock_hash"]
+        or receipt.requested_gpu != "H100"
+        or receipt.observed_gpu is None
+        or "H100" not in receipt.observed_gpu
+        or receipt.timeout_seconds != 14_400
+        or receipt.exit_status != 0
+        or receipt.validated is not True
+        or receipt.promoted is not True
+        or receipt.failure_reason is not None
+    ):
+        raise ValueError(f"{stage} receipt does not match approved job {job['arm']}")
+    required = (
+        {"adapter_config.json", "adapter_model.safetensors", "run-manifest.json"}
+        if stage == "train"
+        else {"manifest.json", "evidence.jsonl"}
+    )
+    if not required.issubset(set(receipt.expected_outputs)):
+        raise ValueError(f"{stage} receipt producer outputs are incomplete for {job['arm']}")
+    return _receipt_payload(receipt, include_artifact_id=True)
+
+
+def validate_canonical_job_output(
+    *,
+    receipt_payload: Mapping[str, object],
+    producer_files: Mapping[str, bytes],
+    plan_payload: Mapping[str, object],
+    job_payload: Mapping[str, object],
+    stage: str,
+) -> dict[str, object]:
+    """Revalidate one canonical receipt, complete producer tree, and producer manifest."""
+    validated = validate_job_receipt_payload(
+        receipt_payload=receipt_payload,
+        plan_payload=plan_payload,
+        job_payload=job_payload,
+        stage=stage,
+    )
+    receipt = load_attempt_receipt_payload(validated)
+    if not isinstance(producer_files, Mapping) or not producer_files:
+        raise ValueError("canonical producer files are missing")
+    actual: list[tuple[str, str]] = []
+    for path, content in producer_files.items():
+        candidate = PurePosixPath(path)
+        if (
+            not isinstance(path, str)
+            or not path
+            or candidate.is_absolute()
+            or "." in candidate.parts
+            or ".." in candidate.parts
+            or not isinstance(content, bytes)
+        ):
+            raise ValueError("canonical producer file record is invalid")
+        actual.append((path, hashlib.sha256(content).hexdigest()))
+    actual_records = tuple(sorted(actual))
+    receipt_records = tuple(
+        zip(receipt.expected_outputs, receipt.output_hashes, strict=True)
+    )
+    if actual_records != receipt_records:
+        raise ValueError("canonical producer files do not match their receipt")
+
+    manifest_name = "run-manifest.json" if stage == "train" else "manifest.json"
+    try:
+        manifest = json.loads(producer_files[manifest_name].decode("utf-8"))
+    except (KeyError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("canonical producer manifest is missing or invalid") from error
+    if not isinstance(manifest, Mapping):
+        raise ValueError("canonical producer manifest is missing or invalid")
+    expected_kind = (
+        "phase_marker_training_run"
+        if stage == "train"
+        else "phase_marker_checkpoint_selection"
+    )
+    job = _validate_stage_job_payload(stage, plan_payload, job_payload)
+    if (
+        manifest.get("kind") != expected_kind
+        or manifest.get("arm") != job["arm"]
+        or manifest.get("seed") != job["seed"]
+        or manifest.get("config_hash") != plan_payload["config_hash"]
+        or manifest.get("model_revision") != plan_payload["model_revision"]
+        or (
+            stage == "train"
+            and manifest.get("tokenizer_revision") != plan_payload["model_revision"]
+        )
+        or (stage == "selection" and manifest.get("run_kind") != "pilot")
+        or (stage == "selection" and manifest.get("completed") is not True)
+    ):
+        raise ValueError("canonical producer manifest identity is invalid")
+    return validated
+
+
+_STAGE_A_SUMMARY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "stage",
+        "run_id",
+        "training_receipt_ids",
+        "selection_receipt_ids",
+        "behavior_gate_checked_artifact_ids",
+        "next_command",
+        "stopped_before_behavior",
+        "artifact_id",
+    }
+)
+
+
+def validate_stage_a_summary(
+    summary: Mapping[str, object],
+    *,
+    plan_payload: Mapping[str, object],
+    training_receipts: tuple[Mapping[str, object], ...],
+    selection_receipts: tuple[Mapping[str, object], ...],
+) -> dict[str, object]:
+    """Validate the compact, inert Stage A stop envelope."""
+    _validate_pilot_plan_payload(plan_payload)
+    if not isinstance(summary, Mapping) or set(summary) != _STAGE_A_SUMMARY_FIELDS:
+        raise ValueError("Stage A summary fields are invalid")
+    training_ids = [receipt.get("artifact_id") for receipt in training_receipts]
+    selection_ids = [receipt.get("artifact_id") for receipt in selection_receipts]
+    checked = summary["behavior_gate_checked_artifact_ids"]
+    if (
+        summary["schema_version"] != 1
+        or summary["stage"] != "stage-a"
+        or summary["run_id"] != plan_payload["run_id"]
+        or summary["training_receipt_ids"] != training_ids
+        or summary["selection_receipt_ids"] != selection_ids
+        or not isinstance(checked, list)
+        or not all(_is_sha256(value) for value in checked)
+        or not isinstance(summary["next_command"], str)
+        or not summary["next_command"]
+        or summary["stopped_before_behavior"] is not True
+        or not _is_sha256(summary["artifact_id"])
+    ):
+        raise ValueError("Stage A summary identity or stop contract is invalid")
+    unsigned = dict(summary)
+    artifact_id = unsigned.pop("artifact_id")
+    if artifact_id != sha256_json(unsigned):
+        raise ValueError("Stage A summary artifact ID is invalid")
+    return dict(summary)
+
+
+def finalize_stage_a(
+    *,
+    plan_payload: Mapping[str, object],
+    receipts: Sequence[Mapping[str, object]],
+    input_root: Path,
+    model_root: Path,
+    run_root: Path,
+    volume: VolumeClient,
+    behavior_gate: Callable[..., Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    """Validate the complete Stage A matrix and publish a mandatory stop summary."""
+    _validate_pilot_plan_payload(plan_payload)
+    snapshot, cache_manifest = _validated_model_cache(model_root)
+    jobs = plan_payload["jobs"]
+    assert isinstance(jobs, list)
+    received = tuple(receipts)
+    if len(received) != 12:
+        raise ValueError("Stage A finalization requires exactly twelve receipts")
+    training = tuple(
+        validate_job_receipt_payload(
+            receipt_payload=received[index],
+            plan_payload=plan_payload,
+            job_payload=job,
+            stage="train",
+        )
+        for index, job in enumerate(jobs)
+    )
+    selection = tuple(
+        validate_job_receipt_payload(
+            receipt_payload=received[index + 6],
+            plan_payload=plan_payload,
+            job_payload=job,
+            stage="selection",
+        )
+        for index, job in enumerate(jobs)
+    )
+    artifact_ids = [
+        receipt["artifact_id"] for receipt in (*training, *selection)
+    ]
+    if len(set(artifact_ids)) != 12:
+        raise ValueError("Stage A finalization receipt identities are not unique")
+    if any(
+        receipt["model_cache_artifact_id"] != cache_manifest.artifact_id
+        for receipt in (*training, *selection)
+    ):
+        raise ValueError("Stage A receipts do not bind the validated model cache")
+
+    gate_function = (
+        _run_behavior_prerequisite_gate if behavior_gate is None else behavior_gate
+    )
+    with _offline_model_cache(snapshot.parents[2]):
+        gate = gate_function(
+            plan_payload=plan_payload,
+            input_root=Path(input_root),
+            model_root=Path(model_root),
+            run_root=Path(run_root),
+        )
+    if not isinstance(gate, Mapping) or set(gate) != {
+        "passed", "checked_artifact_ids", "commands",
+    }:
+        raise ValueError("behavior prerequisite gate result is invalid")
+    checked = gate["checked_artifact_ids"]
+    commands = gate["commands"]
+    if (
+        gate["passed"] is not True
+        or not isinstance(checked, list)
+        or not all(_is_sha256(value) for value in checked)
+        or not isinstance(commands, list)
+        or len(commands) != 1
+        or not isinstance(commands[0], str)
+        or not commands[0]
+    ):
+        raise ValueError("behavior prerequisite gate did not pass exactly once")
+
+    summary: dict[str, object] = {
+        "schema_version": 1,
+        "stage": "stage-a",
+        "run_id": plan_payload["run_id"],
+        "training_receipt_ids": [receipt["artifact_id"] for receipt in training],
+        "selection_receipt_ids": [receipt["artifact_id"] for receipt in selection],
+        "behavior_gate_checked_artifact_ids": list(checked),
+        "next_command": commands[0],
+        "stopped_before_behavior": True,
+    }
+    summary["artifact_id"] = sha256_json(summary)
+    validated = validate_stage_a_summary(
+        summary,
+        plan_payload=plan_payload,
+        training_receipts=training,
+        selection_receipts=selection,
+    )
+    run = Path(run_root).resolve() / "runs" / str(plan_payload["run_id"])
+    run.mkdir(parents=True, exist_ok=True)
+    summary_path = run / "stage-a-summary.json"
+    if summary_path.exists():
+        try:
+            existing = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("existing Stage A summary is invalid") from error
+        if not isinstance(existing, Mapping):
+            raise ValueError("existing Stage A summary is invalid")
+        revalidated = validate_stage_a_summary(
+            existing,
+            plan_payload=plan_payload,
+            training_receipts=training,
+            selection_receipts=selection,
+        )
+        if revalidated != validated:
+            raise ValueError("existing Stage A summary conflicts with current validation")
+        return revalidated
+
+    _write_canonical_json_exclusive(summary_path, validated)
+    try:
+        volume.commit()
+    except Exception as error:
+        try:
+            quarantine = run / "attempts" / f"finalizer-{create_attempt_id()}"
+            quarantine.mkdir(parents=True, exist_ok=False)
+            summary_path.replace(quarantine / "stage-a-summary.json")
+            volume.commit()
+        except Exception as persistence_error:
+            error.add_note(
+                "Stage A summary rollback also failed: "
+                f"{type(persistence_error).__name__}: {persistence_error}"
+            )
+        raise
+    return validated
+
+
+def _write_canonical_json_exclusive(
+    path: Path, payload: Mapping[str, object]
+) -> Path:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=destination.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(canonical_json(payload) + "\n")
+        os.link(temporary, destination)
+    except FileExistsError as error:
+        raise FileExistsError("immutable JSON destination already exists") from error
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return destination
+
+
+def _run_behavior_prerequisite_gate(
+    *,
+    plan_payload: Mapping[str, object],
+    input_root: Path,
+    model_root: Path,
+    run_root: Path,
+) -> dict[str, object]:
+    """Run the existing pilot behavior gate against a temporary read-only path view."""
+    expected_cache_root = Path(model_root).resolve() / "canonical"
+    if (
+        os.environ.get("HF_HUB_CACHE") != str(expected_cache_root)
+        or os.environ.get("HF_HUB_OFFLINE") != "1"
+        or os.environ.get("TRANSFORMERS_OFFLINE") != "1"
+    ):
+        raise ValueError("behavior prerequisite gate requires the validated offline cache")
+    from phase_marker.config import ExperimentConfig
+    from phase_marker.modal_plan import StageAResources
+    from phase_marker.pipeline import _run_gate
+
+    bundle = Path(input_root) / "bundles" / str(plan_payload["bundle_id"])
+    canonical = (
+        Path(run_root) / "runs" / str(plan_payload["run_id"])
+        / "artifacts" / "phase-marker"
+    )
+    with tempfile.TemporaryDirectory(prefix="phase-marker-finalize-") as temporary:
+        view = Path(temporary)
+        config = view / "configs/phase-marker-qwen25-7b.toml"
+        config.parent.mkdir(parents=True)
+        config.symlink_to(bundle / "configs/phase-marker-qwen25-7b.toml")
+        artifacts = view / "artifacts/phase-marker"
+        artifacts.mkdir(parents=True)
+        for name, source in (
+            ("splits", bundle / "artifacts/phase-marker/splits"),
+            ("training-data", bundle / "artifacts/phase-marker/training-data"),
+            ("checkpoints", canonical / "checkpoints"),
+            ("checkpoint-selections", canonical / "checkpoint-selections"),
+        ):
+            if not source.is_dir():
+                raise ValueError(f"behavior prerequisite source is missing: {name}")
+            (artifacts / name).symlink_to(source, target_is_directory=True)
+        with chdir(view):
+            loaded = ExperimentConfig.load(Path("configs/phase-marker-qwen25-7b.toml"))
+            result = _run_gate(
+                "behavior",
+                loaded,
+                Path("artifacts/phase-marker"),
+                kind="pilot",
+                seeds=(42,),
+                config_path=Path("configs/phase-marker-qwen25-7b.toml"),
+                approval=StageAResources().approval(),
+            )
+    if not result.passed:
+        raise ValueError(f"behavior prerequisite gate failed: {result.reason}")
+    return {
+        "passed": True,
+        "checked_artifact_ids": list(result.checked_artifact_ids),
+        "commands": list(result.commands),
+    }
 
 
 def _receipt_payload(receipt: AttemptReceipt, *, include_artifact_id: bool) -> dict[str, object]:
@@ -462,6 +1435,13 @@ def _validate_receipt(receipt: AttemptReceipt) -> None:
         )
     ):
         raise ValueError("receipt hash fields are invalid")
+    output_records_valid = _valid_output_records(
+        receipt.expected_outputs, receipt.output_hashes
+    ) or (
+        receipt.validated is False
+        and receipt.expected_outputs == ()
+        and receipt.output_hashes == ()
+    )
     if (
         not isinstance(receipt.command, str)
         or not receipt.command
@@ -480,7 +1460,8 @@ def _validate_receipt(receipt: AttemptReceipt) -> None:
         or isinstance(receipt.exit_status, bool)
         or not isinstance(receipt.validated, bool)
         or not isinstance(receipt.promoted, bool)
-        or not _valid_output_records(receipt.expected_outputs, receipt.output_hashes)
+        or not output_records_valid
+        or (receipt.validated is False and receipt.promoted is True)
         or (receipt.failure_reason is not None and not isinstance(receipt.failure_reason, str))
     ):
         raise ValueError("receipt fields are invalid")

@@ -10,16 +10,19 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import shlex
 import shutil
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any, Callable
+import uuid
 
 import pytest
 
 from phase_marker.config import ExperimentConfig
 from phase_marker.io import canonical_json
 from phase_marker.modal_artifacts import (
+    AttemptReceipt,
     build_input_bundle,
     build_model_cache_manifest,
     hash_source_tree,
@@ -67,6 +70,10 @@ class FakeRemoteFunction:
     def remote(self, *args: object, **kwargs: object) -> object:
         self._modal.rpc_calls.append(("remote", self.name, args, kwargs))
         raise AssertionError("adapter attempted a remote call")
+
+    def map(self, payloads: object) -> object:
+        self._modal.rpc_calls.append(("map", self.name, payloads))
+        raise AssertionError("adapter attempted a remote map call")
 
     def local(self, *args: object, **kwargs: object) -> object:
         return self._function(*args, **kwargs)
@@ -424,7 +431,9 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
 
     gpu_options = next(
         call[1] for call in fake.declaration_calls
-        if call[0] == "function" and call[1].get("gpu") == "H100"
+        if call[0] == "function"
+        and call[1].get("gpu") == "H100"
+        and "/mnt/inputs" in call[1]["volumes"]
     )
     assert gpu_options["image"] is imported_adapter.gpu_image
     assert gpu_options["timeout"] == 14_400
@@ -470,7 +479,13 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
     assert smoke_options["volumes"]["/mnt/runs"] is imported_adapter.runs_volume
 
     assert set(imported_adapter.app.remote_functions) == {
-        "cache_model_remote", "smoke_remote", "gpu_resources", "status_resources",
+        "cache_model_remote",
+        "smoke_remote",
+        "run_training_job",
+        "run_selection_job",
+        "finalize_stage_a_remote",
+        "gpu_resources",
+        "status_resources",
     }
     assert isinstance(imported_adapter.cache_model_remote, imported_adapter.RemoteFunction)
     assert isinstance(imported_adapter.smoke_remote, imported_adapter.RemoteFunction)
@@ -478,9 +493,126 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
     assert isinstance(imported_adapter.status_resources, imported_adapter.RemoteFunction)
     assert [
         call[1] for call in fake.declaration_calls if call[0] == "local_entrypoint_decorated"
-    ] == ["status", "stage_inputs", "cache_model", "smoke"]
+    ] == ["status", "stage_inputs", "cache_model", "smoke", "run_stage_a"]
     assert "plan" not in [
         call[1] for call in fake.declaration_calls if call[0] == "local_entrypoint_decorated"
+    ]
+
+
+def test_stage_a_job_resources_and_mount_permissions_are_exact(
+    imported_adapter: ModuleType,
+) -> None:
+    """Would fail if either Stage A job could exceed or bypass the approved H100 envelope."""
+    declarations = {
+        name: options
+        for (kind, options), (_, name) in zip(
+            (
+                call for call in imported_adapter.fake_modal.declaration_calls
+                if call[0] == "function"
+            ),
+            (
+                call for call in imported_adapter.fake_modal.declaration_calls
+                if call[0] == "function_decorated"
+            ),
+            strict=True,
+        )
+    }
+
+    for name in ("run_training_job", "run_selection_job"):
+        options = declarations[name]
+        assert {
+            key: options[key]
+            for key in (
+                "gpu", "timeout", "startup_timeout", "max_containers",
+                "retries", "ephemeral_disk",
+            )
+        } == {
+            "gpu": "H100",
+            "timeout": 14_400,
+            "startup_timeout": 1_200,
+            "max_containers": 2,
+            "retries": 0,
+            "ephemeral_disk": 80 * 1024,
+        }
+        assert set(options["volumes"]) == {"/inputs", "/model-cache", "/runs"}
+        assert options["volumes"]["/inputs"].volume is imported_adapter.inputs_volume
+        assert options["volumes"]["/inputs"].read_only is True
+        assert options["volumes"]["/model-cache"].volume is imported_adapter.model_volume
+        assert options["volumes"]["/model-cache"].read_only is True
+        assert options["volumes"]["/runs"] is imported_adapter.runs_volume
+
+    finalizer = declarations["finalize_stage_a_remote"]
+    assert "gpu" not in finalizer
+    assert finalizer["cpu"] == 2.0
+    assert finalizer["memory"] == 8_192
+    assert finalizer["timeout"] == 900
+    assert finalizer["retries"] == 0
+    assert finalizer["volumes"]["/inputs"].read_only is True
+    assert finalizer["volumes"]["/model-cache"].read_only is True
+    assert finalizer["volumes"]["/runs"] is imported_adapter.runs_volume
+
+
+def test_gpu_job_wrappers_forward_one_approved_payload_to_the_exact_stage(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a remote wrapper changed the payload or crossed the wrong stage."""
+    plan = _build_plan(
+        pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name)
+    )
+    payload = {
+        "plan": modal_plan.pilot_plan_payload(plan),
+        "job": asdict(plan.jobs[0]),
+    }
+    calls: list[dict[str, object]] = []
+
+    def execute(**kwargs: object) -> dict[str, object]:
+        calls.append(dict(kwargs))
+        return {"stage": kwargs["stage"]}
+
+    monkeypatch.setattr(imported_adapter, "execute_pilot_job", execute)
+
+    assert imported_adapter.run_training_job.local(payload) == {"stage": "train"}
+    assert imported_adapter.run_selection_job.local(payload) == {"stage": "selection"}
+    assert [call["stage"] for call in calls] == ["train", "selection"]
+    for call in calls:
+        assert call["plan_payload"] is payload["plan"]
+        assert call["job_payload"] is payload["job"]
+        assert call["code_root"] == imported_adapter.CODE_ROOT
+        assert call["input_root"] == Path("/inputs")
+        assert call["model_root"] == Path("/model-cache")
+        assert call["run_root"] == Path("/runs")
+        assert call["volume"] is imported_adapter.runs_volume
+
+
+def test_cpu_finalizer_wrapper_forwards_receipts_without_loading_weights(
+    imported_adapter: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if finalization crossed a GPU/model or behavior execution boundary."""
+    plan_payload = {"run_id": "pilot"}
+    receipts = ({"artifact_id": "a" * 64},)
+    calls: list[dict[str, object]] = []
+
+    def finalize(**kwargs: object) -> dict[str, object]:
+        calls.append(dict(kwargs))
+        return {"stopped_before_behavior": True}
+
+    monkeypatch.setattr(imported_adapter, "finalize_stage_a", finalize, raising=False)
+
+    result = imported_adapter.finalize_stage_a_remote.local(plan_payload, receipts)
+
+    assert result == {"stopped_before_behavior": True}
+    assert calls == [
+        {
+            "plan_payload": plan_payload,
+            "receipts": receipts,
+            "input_root": Path("/inputs"),
+            "model_root": Path("/model-cache"),
+            "run_root": Path("/runs"),
+            "volume": imported_adapter.runs_volume,
+        }
     ]
 
 
@@ -1184,3 +1316,705 @@ def test_operator_entrypoints_reject_before_tags_or_remote_boundary(
         )
 
     assert imported_adapter.fake_modal.rpc_calls == []
+
+
+def test_run_stage_a_entrypoint_forwards_explicit_resume_and_prints_summary(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Would fail if the CLI silently enabled resume or bypassed the local orchestrator."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    calls: list[dict[str, object]] = []
+    summary = {"stopped_before_behavior": True, "artifact_id": "a" * 64}
+
+    def run(local_plan: object, **kwargs: object) -> dict[str, object]:
+        assert local_plan is plan
+        calls.append(dict(kwargs))
+        return summary
+
+    monkeypatch.setattr(
+        imported_adapter, "_build_operator_context", lambda root: (bundle, plan)
+    )
+    monkeypatch.setattr(imported_adapter, "run_stage_a_local", run)
+
+    imported_adapter.run_stage_a(
+        repo_root=str(pilot_repo),
+        approved_run_id=plan.run_id,
+        budget_acknowledged=True,
+        resume=True,
+    )
+
+    assert calls == [
+        {
+            "approved_run_id": plan.run_id,
+            "budget_acknowledged": True,
+            "resume": True,
+            "training_function": imported_adapter.run_training_job,
+            "selection_function": imported_adapter.run_selection_job,
+            "finalizer_function": imported_adapter.finalize_stage_a_remote,
+            "runs_client": imported_adapter.runs_volume,
+        }
+    ]
+    assert capsys.readouterr().out == canonical_json(summary) + "\n"
+
+
+def _stage_a_receipt(
+    plan: modal_plan.PilotPlan, job: modal_plan.PilotJob, stage: str,
+) -> dict[str, object]:
+    command = job.training_command if stage == "train" else job.selection_command
+    paths = (
+        ("adapter_config.json", "adapter_model.safetensors", "run-manifest.json")
+        if stage == "train"
+        else ("manifest.json", "evidence.jsonl")
+    )
+    receipt = AttemptReceipt(
+        schema_version=1,
+        run_id=plan.run_id,
+        bundle_id=plan.bundle_id,
+        stage=stage,
+        arm=job.arm,
+        seed=job.seed,
+        attempt_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{stage}:{job.arm}")),
+        command=command,
+        command_hash=hashlib.sha256(command.encode("utf-8")).hexdigest(),
+        source_hash=plan.source_hash,
+        dependency_lock_hash=plan.dependency_lock_hash,
+        model_cache_artifact_id="e" * 64,
+        requested_gpu="H100",
+        observed_gpu="NVIDIA H100 80GB HBM3",
+        started_at="2026-08-05T00:00:00+00:00",
+        finished_at="2026-08-05T00:01:00+00:00",
+        elapsed_seconds=60.0,
+        timeout_seconds=14_400,
+        exit_status=0,
+        validated=True,
+        promoted=True,
+        expected_outputs=paths,
+        output_hashes=tuple(hashlib.sha256(path.encode("utf-8")).hexdigest() for path in paths),
+        failure_reason=None,
+        artifact_id="",
+    )
+    receipt = replace(receipt, artifact_id=receipt.recomputed_artifact_id())
+    payload = asdict(receipt)
+    payload["expected_outputs"] = list(receipt.expected_outputs)
+    payload["output_hashes"] = list(receipt.output_hashes)
+    return payload
+
+
+class StageAMapFunction:
+    def __init__(
+        self,
+        stage: str,
+        results: dict[str, object],
+        events: list[tuple[object, ...]],
+        *,
+        before_first: Callable[[], None] | None = None,
+    ) -> None:
+        self.stage = stage
+        self.results = results
+        self.events = events
+        self.calls: list[dict[str, object]] = []
+        self.before_first = before_first
+
+    def map(self, payloads: object) -> object:
+        items = list(payloads)
+
+        def results() -> object:
+            for index, payload in enumerate(items):
+                if index == 0 and self.before_first is not None:
+                    self.before_first()
+                assert isinstance(payload, dict)
+                job = payload["job"]
+                assert isinstance(job, dict)
+                arm = str(job["arm"])
+                self.calls.append(payload)
+                self.events.append((self.stage, arm))
+                result = self.results[arm]
+                if isinstance(result, Exception):
+                    raise RuntimeError(f"{arm}: {result}") from result
+                yield result
+
+        return results()
+
+
+class StageAFinalizer:
+    def __init__(self, summary: dict[str, object], events: list[tuple[object, ...]]) -> None:
+        self.summary = summary
+        self.events = events
+        self.calls: list[tuple[object, object]] = []
+
+    def remote(self, plan_payload: object, receipts: object) -> dict[str, object]:
+        self.calls.append((plan_payload, receipts))
+        self.events.append(("finalizer",))
+        return self.summary
+
+
+class EmptyStageARunsClient:
+    def __init__(self, events: list[tuple[object, ...]]) -> None:
+        self.events = events
+        self.reload_count = 0
+
+    def read_file(self, path: str) -> list[bytes]:
+        self.events.append(("read_file", path))
+        raise FileNotFoundError(path)
+
+    def listdir(self, path: str, *, recursive: bool = False) -> list[object]:
+        assert recursive is True
+        self.events.append(("listdir", path))
+        raise FileNotFoundError(path)
+
+    def reload(self) -> None:
+        self.reload_count += 1
+        self.events.append(("reload", self.reload_count))
+
+
+class StageARunsClient(RecordingVolume):
+    def __init__(
+        self, files: dict[str, bytes], events: list[tuple[object, ...]],
+    ) -> None:
+        super().__init__(files)
+        self.events = events
+        self.reload_count = 0
+
+    def reload(self) -> None:
+        self.reload_count += 1
+        self.events.append(("reload", self.reload_count))
+
+
+def _canonical_stage_a_files(
+    plan: modal_plan.PilotPlan,
+    job: modal_plan.PilotJob,
+    stage: str,
+) -> tuple[dict[str, bytes], dict[str, object]]:
+    kind = "checkpoints" if stage == "train" else "checkpoint-selections"
+    producer = (
+        f"/runs/{plan.run_id}/artifacts/phase-marker/{kind}/pilot/seed-42/{job.arm}"
+    )
+    if stage == "train":
+        data_path = f"artifacts/phase-marker/training-data/{job.arm}.jsonl"
+        data = (Path(plan.local_repo_root) / data_path).read_bytes()
+        materialization_id = dict(
+            zip(
+                (candidate.arm for candidate in plan.jobs),
+                plan.materialization_artifact_ids,
+                strict=True,
+            )
+        )[job.arm]
+        producer_files = {
+            "adapter_config.json": (
+                canonical_json(
+                    {
+                        "base_model_name_or_path": "Qwen/Qwen2.5-7B-Instruct",
+                        "revision": plan.model_revision,
+                    }
+                )
+                + "\n"
+            ).encode("utf-8"),
+            "adapter_model.safetensors": f"adapter:{job.arm}".encode("utf-8"),
+            "tokenizer_config.json": b"{}\n",
+            "trainer_state.json": b"{}\n",
+        }
+        output_hash = modal_artifacts.sha256_json(
+            [
+                {
+                    "path": path,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+                for path, content in sorted(producer_files.items())
+            ]
+        )
+        manifest = {
+            "kind": "phase_marker_training_run",
+            "arm": job.arm,
+            "seed": 42,
+            "model_id": "Qwen/Qwen2.5-7B-Instruct",
+            "model_revision": plan.model_revision,
+            "tokenizer_revision": plan.model_revision,
+            "config_hash": plan.config_hash,
+            "dataset_path": data_path,
+            "dataset_hash": modal_artifacts.sha256_json(data.hex()),
+            "data_artifact_id": materialization_id,
+            "parent_hashes": [materialization_id],
+            "data_parent_hashes": [plan.split_artifact_id],
+            "arguments": shlex.split(job.training_command)[3:],
+            "environment": {},
+            "checkpoints": [],
+            "saved_artifacts": ["adapter", "tokenizer", "trainer_state"],
+            "output_hash": output_hash,
+        }
+        producer_files["run-manifest.json"] = (
+            canonical_json(manifest) + "\n"
+        ).encode("utf-8")
+    else:
+        manifest = canonical_json(
+            {
+                "schema_version": 1,
+                "kind": "phase_marker_checkpoint_selection",
+                "run_kind": "pilot",
+                "arm": job.arm,
+                "seed": 42,
+                "config_hash": plan.config_hash,
+                "model_revision": plan.model_revision,
+                "completed": True,
+            }
+        ).encode("utf-8") + b"\n"
+        producer_files = {
+            "manifest.json": manifest,
+            "evidence.jsonl": b"{}\n",
+        }
+    command = job.training_command if stage == "train" else job.selection_command
+    paths = tuple(sorted(producer_files))
+    receipt = AttemptReceipt(
+        schema_version=1,
+        run_id=plan.run_id,
+        bundle_id=plan.bundle_id,
+        stage=stage,
+        arm=job.arm,
+        seed=42,
+        attempt_id=str(uuid.uuid5(uuid.NAMESPACE_OID, f"canonical:{stage}:{job.arm}")),
+        command=command,
+        command_hash=hashlib.sha256(command.encode("utf-8")).hexdigest(),
+        source_hash=plan.source_hash,
+        dependency_lock_hash=plan.dependency_lock_hash,
+        model_cache_artifact_id="e" * 64,
+        requested_gpu="H100",
+        observed_gpu="NVIDIA H100 80GB HBM3",
+        started_at="2026-08-05T00:00:00+00:00",
+        finished_at="2026-08-05T00:01:00+00:00",
+        elapsed_seconds=60.0,
+        timeout_seconds=14_400,
+        exit_status=0,
+        validated=True,
+        promoted=True,
+        expected_outputs=paths,
+        output_hashes=tuple(
+            hashlib.sha256(producer_files[path]).hexdigest() for path in paths
+        ),
+        failure_reason=None,
+        artifact_id="",
+    )
+    receipt = replace(receipt, artifact_id=receipt.recomputed_artifact_id())
+    receipt_payload = asdict(receipt)
+    receipt_payload["expected_outputs"] = list(receipt.expected_outputs)
+    receipt_payload["output_hashes"] = list(receipt.output_hashes)
+    files = {
+        f"{producer}/{path}": content for path, content in producer_files.items()
+    }
+    files[
+        f"/runs/{plan.run_id}/receipts/canonical/{stage}/{job.arm}.json"
+    ] = (canonical_json(receipt_payload) + "\n").encode("utf-8")
+    return files, receipt_payload
+
+
+def _stage_a_summary(
+    plan: modal_plan.PilotPlan,
+    training: dict[str, dict[str, object]],
+    selection: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "stage": "stage-a",
+        "run_id": plan.run_id,
+        "training_receipt_ids": [training[job.arm]["artifact_id"] for job in plan.jobs],
+        "selection_receipt_ids": [selection[job.arm]["artifact_id"] for job in plan.jobs],
+        "behavior_gate_checked_artifact_ids": [],
+        "next_command": "./.venv/bin/python -m phase_marker.behavior run",
+        "stopped_before_behavior": True,
+    }
+    payload["artifact_id"] = modal_artifacts.sha256_json(payload)
+    return payload
+
+
+def test_stage_a_validates_all_training_before_selection_and_stops(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if selection overlapped training validation or behavior was invoked."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    training_results = {job.arm: _stage_a_receipt(plan, job, "train") for job in plan.jobs}
+    selection_results = {
+        job.arm: _stage_a_receipt(plan, job, "selection") for job in plan.jobs
+    }
+    events: list[tuple[object, ...]] = []
+    training = StageAMapFunction("train", training_results, events)
+    selection = StageAMapFunction(
+        "selection",
+        selection_results,
+        events,
+        before_first=lambda: (
+            events.count(("validated", "train")) == 6
+            or pytest.fail("selection began before six training receipts were validated")
+        ),
+    )
+    finalizer = StageAFinalizer(_stage_a_summary(plan, training_results, selection_results), events)
+    runs = EmptyStageARunsClient(events)
+    real_validate = modal_artifacts.validate_job_receipt_payload
+
+    def validate(*args: object, **kwargs: object) -> dict[str, object]:
+        result = real_validate(*args, **kwargs)
+        events.append(("validated", kwargs["stage"]))
+        return result
+
+    monkeypatch.setattr(imported_adapter, "validate_job_receipt_payload", validate)
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda approved: events.append(("tags", approved.run_id)),
+    )
+
+    summary = imported_adapter.run_stage_a_local(
+        plan,
+        approved_run_id=plan.run_id,
+        budget_acknowledged=True,
+        resume=False,
+        training_function=training,
+        selection_function=selection,
+        finalizer_function=finalizer,
+        runs_client=runs,
+    )
+
+    assert len(training.calls) == 6
+    assert len(selection.calls) == 6
+    assert len(finalizer.calls) == 1
+    assert runs.reload_count == 2
+    assert summary["stopped_before_behavior"] is True
+    assert summary == finalizer.summary
+    first_gpu = min(index for index, event in enumerate(events) if event[0] in {"train", "selection"})
+    assert events.index(("tags", plan.run_id)) < first_gpu
+    assert sum(event[0] in {"train", "selection"} for event in events) == 12
+    assert all(event[0] != "behavior" for event in events)
+
+
+def test_training_failure_prevents_every_selection(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if any selection could launch after an incomplete training matrix."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    training_results: dict[str, object] = {
+        job.arm: _stage_a_receipt(plan, job, "train") for job in plan.jobs
+    }
+    training_results["dot"] = RuntimeError("boom")
+    selection_results = {
+        job.arm: _stage_a_receipt(plan, job, "selection") for job in plan.jobs
+    }
+    events: list[tuple[object, ...]] = []
+    training = StageAMapFunction("train", training_results, events)
+    selection = StageAMapFunction("selection", selection_results, events)
+    finalizer = StageAFinalizer(
+        _stage_a_summary(
+            plan,
+            {job.arm: _stage_a_receipt(plan, job, "train") for job in plan.jobs},
+            selection_results,
+        ),
+        events,
+    )
+
+    monkeypatch.setattr(
+        imported_adapter, "apply_approved_app_tags", lambda approved: None
+    )
+    with pytest.raises(RuntimeError, match="dot"):
+        imported_adapter.run_stage_a_local(
+            plan,
+            approved_run_id=plan.run_id,
+            budget_acknowledged=True,
+            resume=False,
+            training_function=training,
+            selection_function=selection,
+            finalizer_function=finalizer,
+            runs_client=EmptyStageARunsClient(events),
+        )
+    assert selection.calls == []
+    assert finalizer.calls == []
+
+
+def test_selection_failure_prevents_cpu_finalization(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if an incomplete selection matrix could publish a stop summary."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    training_results = {job.arm: _stage_a_receipt(plan, job, "train") for job in plan.jobs}
+    selection_results: dict[str, object] = {
+        job.arm: _stage_a_receipt(plan, job, "selection") for job in plan.jobs
+    }
+    selection_results["dot"] = RuntimeError("selection boom")
+    events: list[tuple[object, ...]] = []
+    training = StageAMapFunction("train", training_results, events)
+    selection = StageAMapFunction("selection", selection_results, events)
+    finalizer = StageAFinalizer({}, events)
+    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="dot.*selection boom"):
+        imported_adapter.run_stage_a_local(
+            plan,
+            approved_run_id=plan.run_id,
+            budget_acknowledged=True,
+            resume=False,
+            training_function=training,
+            selection_function=selection,
+            finalizer_function=finalizer,
+            runs_client=EmptyStageARunsClient(events),
+        )
+    assert len(training.calls) == 6
+    assert finalizer.calls == []
+
+
+def test_stage_a_mismatched_run_id_aborts_before_preflight_tags_or_remote_calls(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a partial run identity could inspect or mutate remote state."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    events: list[tuple[object, ...]] = []
+    training = StageAMapFunction("train", {}, events)
+    selection = StageAMapFunction("selection", {}, events)
+    finalizer = StageAFinalizer({}, events)
+    tags: list[object] = []
+    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tags.append)
+
+    with pytest.raises(ValueError, match="full approved run ID"):
+        imported_adapter.run_stage_a_local(
+            plan,
+            approved_run_id=plan.run_id[:-1],
+            budget_acknowledged=True,
+            resume=False,
+            training_function=training,
+            selection_function=selection,
+            finalizer_function=finalizer,
+            runs_client=EmptyStageARunsClient(events),
+        )
+    assert events == []
+    assert tags == []
+    assert training.calls == [] and selection.calls == [] and finalizer.calls == []
+
+
+def test_explicit_resume_revalidates_existing_and_schedules_only_missing_arms(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Would fail if resume reused quarantine or overwrote already-canonical arms."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    files: dict[str, bytes] = {}
+    existing_training: dict[str, dict[str, object]] = {}
+    for job in plan.jobs[:2]:
+        arm_files, receipt = _canonical_stage_a_files(plan, job, "train")
+        files.update(arm_files)
+        existing_training[job.arm] = receipt
+    failed_attempt = f"/runs/{plan.run_id}/attempts/failed-dot/receipt.json"
+    files[failed_attempt] = b'{"validated":false,"promoted":false}\n'
+    original_files = dict(files)
+    events: list[tuple[object, ...]] = []
+    runs = StageARunsClient(files, events)
+    training_results = {job.arm: _stage_a_receipt(plan, job, "train") for job in plan.jobs}
+    selection_results = {
+        job.arm: _stage_a_receipt(plan, job, "selection") for job in plan.jobs
+    }
+    combined_training = {**training_results, **existing_training}
+    training = StageAMapFunction("train", training_results, events)
+    selection = StageAMapFunction("selection", selection_results, events)
+    finalizer = StageAFinalizer(
+        _stage_a_summary(plan, combined_training, selection_results), events
+    )
+    validated_existing: list[tuple[str, str]] = []
+    real_validate = modal_artifacts.validate_canonical_job_output
+
+    def validate_existing(*args: object, **kwargs: object) -> dict[str, object]:
+        result = real_validate(*args, **kwargs)
+        job = kwargs["job_payload"]
+        validated_existing.append((str(kwargs["stage"]), str(job["arm"])))
+        return result
+
+    monkeypatch.setattr(
+        imported_adapter, "validate_canonical_job_output", validate_existing
+    )
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda approved: events.append(("tags", approved.run_id)),
+    )
+
+    summary = imported_adapter.run_stage_a_local(
+        plan,
+        approved_run_id=plan.run_id,
+        budget_acknowledged=True,
+        resume=True,
+        training_function=training,
+        selection_function=selection,
+        finalizer_function=finalizer,
+        runs_client=runs,
+    )
+
+    assert [payload["job"]["arm"] for payload in training.calls] == [
+        "dot", "random", "direct", "filler"
+    ]
+    assert [payload["job"]["arm"] for payload in selection.calls] == [
+        "semantic", "glyph", "dot", "random", "direct", "filler"
+    ]
+    assert validated_existing == [("train", "semantic"), ("train", "glyph")]
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["resume"] is True
+    assert printed["missing_training_arms"] == ["dot", "random", "direct", "filler"]
+    assert summary["stopped_before_behavior"] is True
+    assert runs.files == original_files
+    assert runs.files[failed_attempt] == original_files[failed_attempt]
+
+
+@pytest.mark.parametrize("corruption", ("receipt", "manifest"))
+def test_resume_corrupt_canonical_output_aborts_before_tags_or_remote_calls(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    """Would fail if resume scheduled around stale canonical evidence."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    files, _ = _canonical_stage_a_files(plan, plan.jobs[0], "train")
+    target = next(
+        path for path in files
+        if path.endswith("semantic.json") if corruption == "receipt"
+    ) if corruption == "receipt" else next(
+        path for path in files if path.endswith("run-manifest.json")
+    )
+    files[target] = b'{"corrupt":true}\n'
+    events: list[tuple[object, ...]] = []
+    training = StageAMapFunction("train", {}, events)
+    selection = StageAMapFunction("selection", {}, events)
+    finalizer = StageAFinalizer({}, events)
+    tags: list[object] = []
+    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tags.append)
+
+    with pytest.raises(ValueError, match="receipt|manifest|canonical"):
+        imported_adapter.run_stage_a_local(
+            plan,
+            approved_run_id=plan.run_id,
+            budget_acknowledged=True,
+            resume=True,
+            training_function=training,
+            selection_function=selection,
+            finalizer_function=finalizer,
+            runs_client=StageARunsClient(files, events),
+        )
+    assert tags == []
+    assert training.calls == []
+    assert selection.calls == []
+    assert finalizer.calls == []
+
+
+def test_resume_semantically_invalid_self_consistent_training_aborts_before_remote_calls(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if matching receipt hashes replaced producer semantic validation."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    files, receipt = _canonical_stage_a_files(plan, plan.jobs[0], "train")
+    manifest_path = next(path for path in files if path.endswith("run-manifest.json"))
+    receipt_path = next(path for path in files if path.endswith("semantic.json"))
+    manifest = json.loads(files[manifest_path])
+    manifest["saved_artifacts"] = []
+    manifest_bytes = (canonical_json(manifest) + "\n").encode("utf-8")
+    files[manifest_path] = manifest_bytes
+    output_index = receipt["expected_outputs"].index("run-manifest.json")
+    receipt["output_hashes"][output_index] = hashlib.sha256(manifest_bytes).hexdigest()
+    unsigned = dict(receipt)
+    unsigned.pop("artifact_id")
+    receipt["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+    files[receipt_path] = (canonical_json(receipt) + "\n").encode("utf-8")
+    events: list[tuple[object, ...]] = []
+    training = StageAMapFunction("train", {}, events)
+    selection = StageAMapFunction("selection", {}, events)
+    finalizer = StageAFinalizer({}, events)
+    tags: list[object] = []
+    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tags.append)
+
+    with pytest.raises(ValueError, match="training|completion|semantic"):
+        imported_adapter.run_stage_a_local(
+            plan,
+            approved_run_id=plan.run_id,
+            budget_acknowledged=True,
+            resume=True,
+            training_function=training,
+            selection_function=selection,
+            finalizer_function=finalizer,
+            runs_client=StageARunsClient(files, events),
+        )
+    assert tags == []
+    assert training.calls == [] and selection.calls == [] and finalizer.calls == []
+
+
+def test_initial_stage_a_refuses_existing_output_before_tags_or_remote_calls(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if normal mode implicitly reused or overwrote a canonical arm."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    files, _ = _canonical_stage_a_files(plan, plan.jobs[0], "train")
+    events: list[tuple[object, ...]] = []
+    training = StageAMapFunction("train", {}, events)
+    selection = StageAMapFunction("selection", {}, events)
+    finalizer = StageAFinalizer({}, events)
+    tags: list[object] = []
+    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tags.append)
+
+    with pytest.raises(FileExistsError, match="use --resume"):
+        imported_adapter.run_stage_a_local(
+            plan,
+            approved_run_id=plan.run_id,
+            budget_acknowledged=True,
+            resume=False,
+            training_function=training,
+            selection_function=selection,
+            finalizer_function=finalizer,
+            runs_client=StageARunsClient(files, events),
+        )
+    assert tags == []
+    assert training.calls == [] and selection.calls == [] and finalizer.calls == []
+
+
+@pytest.mark.parametrize(
+    "existing_path",
+    (
+        "stage-a-summary.json",
+        "artifacts/phase-marker/checkpoints/pilot/seed-42/unapproved/run-manifest.json",
+    ),
+)
+def test_initial_stage_a_refuses_summary_or_unexpected_canonical_namespace(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_path: str,
+) -> None:
+    """Would fail if stale terminal or orphan state could launch a fresh GPU graph."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    files = {f"/runs/{plan.run_id}/{existing_path}": b"{}\n"}
+    events: list[tuple[object, ...]] = []
+    training = StageAMapFunction("train", {}, events)
+    selection = StageAMapFunction("selection", {}, events)
+    finalizer = StageAFinalizer({}, events)
+    tags: list[object] = []
+    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tags.append)
+
+    with pytest.raises((FileExistsError, ValueError), match="canonical|summary"):
+        imported_adapter.run_stage_a_local(
+            plan,
+            approved_run_id=plan.run_id,
+            budget_acknowledged=True,
+            resume=False,
+            training_function=training,
+            selection_function=selection,
+            finalizer_function=finalizer,
+            runs_client=StageARunsClient(files, events),
+        )
+    assert tags == []
+    assert training.calls == [] and selection.calls == [] and finalizer.calls == []

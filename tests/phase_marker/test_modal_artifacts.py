@@ -4,10 +4,13 @@ from dataclasses import asdict, replace
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
+import shlex
 import socket
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -1222,6 +1225,40 @@ def test_promotion_copies_attempt_bytes_once_and_refuses_existing_canonical(tmp_
         promote_validated_output(source, attempt_root, canonical, receipt)
 
 
+def test_promotion_lock_cleanup_failure_rolls_publication_back_to_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if post-rename lock cleanup could strand canonical output."""
+    receipt = _receipt_for_file("adapter.bin", b"frozen adapter bytes")
+    attempt = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = (
+        attempt / "workspace"
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    )
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"frozen adapter bytes")
+    canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    lock = canonical.parent / ".glyph.promotion.lock"
+    original_unlink = Path.unlink
+    failed = False
+
+    def fail_once(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal failed
+        if path == lock and not failed:
+            failed = True
+            raise OSError("injected promotion lock cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_once)
+
+    with pytest.raises(OSError, match="lock cleanup"):
+        promote_validated_output(source, attempt, canonical, receipt)
+
+    assert not canonical.exists()
+    assert (attempt / "failed-promotion/adapter.bin").read_bytes() == b"frozen adapter bytes"
+    assert (attempt / "failed-promotion.lock").is_file()
+
+
 def test_rescheduled_executions_get_distinct_uuid_attempt_ids() -> None:
     """Would fail if a reschedule could reuse an attempt's mutable namespace."""
     first = create_attempt_id()
@@ -1455,3 +1492,618 @@ def test_promotion_rejects_symlink_entry_before_staging(tmp_path: Path) -> None:
         promote_validated_output(source, attempt, canonical, receipt)
 
     assert not (attempt / "promotion-staging").exists()
+
+
+def _stage_job_inputs(repo_fixture: Path, input_root: Path) -> object:
+    bundle = build_input_bundle(repo_fixture)
+    bundle_root = input_root / "bundles" / bundle.bundle_id
+    for item in bundle.files:
+        destination = bundle_root / item.path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(repo_fixture / item.path, destination)
+    (bundle_root / "bundle-manifest.json").write_text(
+        canonical_json(asdict(bundle)) + "\n", encoding="utf-8"
+    )
+    return bundle
+
+
+def _stage_job_model(qwen_snapshot: Path, model_root: Path) -> tuple[Path, ModelCacheManifest]:
+    snapshot = (
+        model_root / "canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+    snapshot.parent.mkdir(parents=True)
+    shutil.copytree(qwen_snapshot, snapshot)
+    manifest = build_model_cache_manifest(snapshot)
+    (snapshot.parent / f"{QWEN25_7B_TOKENIZER_REVISION}.manifest.json").write_text(
+        canonical_json(asdict(manifest)) + "\n", encoding="utf-8"
+    )
+    return snapshot, manifest
+
+
+def _job_execution_plan(repo_fixture: Path, bundle: object) -> modal_plan.PilotPlan:
+    code_root = Path(__file__).resolve().parents[2]
+    return modal_plan.build_pilot_plan(
+        repo_fixture / CONFIG_PATH,
+        repo_fixture / "artifacts/phase-marker",
+        bundle=bundle,
+        source_hash=hash_source_tree(code_root),
+        dependency_lock_hash=hashlib.sha256(
+            (code_root / "requirements-modal-phase-marker.txt").read_bytes()
+        ).hexdigest(),
+    )
+
+
+def test_execute_jobs_use_exact_commands_offline_env_and_promote_only_producers(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if Stage A translated a command or mixed logs/receipts into output."""
+    code_root = Path(__file__).resolve().parents[2]
+    input_root = tmp_path / "inputs"
+    model_root = tmp_path / "model-cache"
+    run_root = tmp_path / "runs"
+    bundle = _stage_job_inputs(repo_fixture, input_root)
+    snapshot, cache_manifest = _stage_job_model(qwen_snapshot, model_root)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[1]
+    commands: list[tuple[list[str], dict[str, object]]] = []
+    validated: list[tuple[str, str]] = []
+
+    def fake_subprocess(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[0] == "nvidia-smi":
+            assert kwargs["timeout"] == 10
+            return SimpleNamespace(returncode=0, stdout="NVIDIA H100 80GB HBM3\n")
+        commands.append((list(argv), dict(kwargs)))
+        workspace = Path(str(kwargs["cwd"]))
+        output_flag = "--output-dir" if "phase_marker.training" in argv else "--output"
+        output = workspace / argv[argv.index(output_flag) + 1]
+        output.mkdir(parents=True)
+        if output_flag == "--output-dir":
+            (output / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+            (output / "adapter_model.safetensors").write_bytes(b"adapter")
+            (output / "run-manifest.json").write_text("{}\n", encoding="utf-8")
+        else:
+            (output / "manifest.json").write_text("{}\n", encoding="utf-8")
+            (output / "evidence.jsonl").write_text("{}\n", encoding="utf-8")
+        kwargs["stdout"].write(b"fake model log\n")
+        return SimpleNamespace(returncode=0)
+
+    def validate(stage: str, producer: Path, *_: object) -> None:
+        assert producer.is_dir()
+        validated.append((stage, producer.name))
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess)
+    volume = CommitVolume()
+    common = {
+        "plan_payload": modal_plan.pilot_plan_payload(plan),
+        "job_payload": asdict(job),
+        "code_root": code_root,
+        "input_root": input_root,
+        "model_root": model_root,
+        "run_root": run_root,
+        "volume": volume,
+        "environ": {"CUDA_VISIBLE_DEVICES": "0", "PATH": "/usr/bin"},
+        "producer_validator": validate,
+        "bf16_probe": lambda: True,
+    }
+
+    training = modal_artifacts.execute_pilot_job(stage="train", **common)
+    selection = modal_artifacts.execute_pilot_job(stage="selection", **common)
+
+    assert [argv for argv, _ in commands] == [
+        shlex.split(job.training_command), shlex.split(job.selection_command)
+    ]
+    for _, kwargs in commands:
+        assert kwargs["shell"] is False
+        env = kwargs["env"]
+        assert env["CUDA_VISIBLE_DEVICES"] == "0"
+        assert env["HF_HUB_OFFLINE"] == "1"
+        assert env["TRANSFORMERS_OFFLINE"] == "1"
+        assert env["HF_HUB_CACHE"] == str(snapshot.parents[2])
+    assert validated == [("train", "glyph"), ("selection", "glyph")]
+    assert training["command"] == job.training_command
+    assert selection["command"] == job.selection_command
+    assert training["model_cache_artifact_id"] == cache_manifest.artifact_id
+    assert selection["model_cache_artifact_id"] == cache_manifest.artifact_id
+    assert training["promoted"] is True and selection["promoted"] is True
+    assert volume.commit_count == 2
+
+    run = run_root / "runs" / plan.run_id
+    checkpoint = run / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    selected = run / "artifacts/phase-marker/checkpoint-selections/pilot/seed-42/glyph"
+    assert {path.name for path in checkpoint.iterdir()} == {
+        "adapter_config.json", "adapter_model.safetensors", "run-manifest.json"
+    }
+    assert {path.name for path in selected.iterdir()} == {"manifest.json", "evidence.jsonl"}
+    assert not any(path.name.endswith(".log") for path in checkpoint.rglob("*"))
+    assert not any("receipt" in path.name for path in selected.rglob("*"))
+    assert len(list((run / "attempts").glob("*/logs/*.log"))) == 2
+    assert len(list((run / "receipts/attempts").glob("*.json"))) == 2
+    assert (run / "receipts/canonical/train/glyph.json").is_file()
+    assert (run / "receipts/canonical/selection/glyph.json").is_file()
+
+
+def test_job_validation_failure_persists_unpromoted_receipt_and_reraises(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a rejected producer vanished or became canonical success."""
+    code_root = Path(__file__).resolve().parents[2]
+    input_root = tmp_path / "inputs"
+    model_root = tmp_path / "model-cache"
+    run_root = tmp_path / "runs"
+    bundle = _stage_job_inputs(repo_fixture, input_root)
+    _stage_job_model(qwen_snapshot, model_root)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[2]
+
+    def fake_subprocess(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[0] == "nvidia-smi":
+            return SimpleNamespace(returncode=0, stdout="NVIDIA H100 80GB HBM3\n")
+        workspace = Path(str(kwargs["cwd"]))
+        output = workspace / argv[argv.index("--output-dir") + 1]
+        output.mkdir(parents=True)
+        (output / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+        (output / "adapter_model.safetensors").write_bytes(b"adapter")
+        (output / "run-manifest.json").write_text("{}\n", encoding="utf-8")
+        kwargs["stdout"].write(b"producer reached validation\n")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess)
+    volume = CommitVolume()
+    with pytest.raises(RuntimeError, match="rejected dot"):
+        modal_artifacts.execute_pilot_job(
+            stage="train",
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            job_payload=asdict(job),
+            code_root=code_root,
+            input_root=input_root,
+            model_root=model_root,
+            run_root=run_root,
+            volume=volume,
+            environ={"CUDA_VISIBLE_DEVICES": "0"},
+            producer_validator=lambda *_: (_ for _ in ()).throw(
+                RuntimeError("producer rejected dot")
+            ),
+            bf16_probe=lambda: True,
+        )
+
+    run = run_root / "runs" / plan.run_id
+    failed = list((run / "receipts/attempts").glob("*.json"))
+    assert len(failed) == 1
+    receipt = json.loads(failed[0].read_text(encoding="utf-8"))
+    assert receipt["arm"] == "dot"
+    assert receipt["validated"] is False
+    assert receipt["promoted"] is False
+    assert "RuntimeError: producer rejected dot" in receipt["failure_reason"]
+    assert len(list((run / "attempts").glob("*/logs/train.log"))) == 1
+    assert not (run / "artifacts/phase-marker/checkpoints/pilot/seed-42/dot").exists()
+    assert not (run / "receipts/canonical/train/dot.json").exists()
+    assert volume.commit_count == 1
+
+
+def test_job_subprocess_failure_without_outputs_still_persists_failed_receipt(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if an early model-command crash masked itself while writing evidence."""
+    code_root = Path(__file__).resolve().parents[2]
+    input_root = tmp_path / "inputs"
+    model_root = tmp_path / "model-cache"
+    run_root = tmp_path / "runs"
+    bundle = _stage_job_inputs(repo_fixture, input_root)
+    _stage_job_model(qwen_snapshot, model_root)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[3]
+
+    def fake_subprocess(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[0] == "nvidia-smi":
+            return SimpleNamespace(returncode=0, stdout="NVIDIA H100 80GB HBM3\n")
+        kwargs["stdout"].write(b"model process crashed\n")
+        return SimpleNamespace(returncode=7)
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess)
+    volume = CommitVolume()
+    with pytest.raises(RuntimeError, match="random.*status 7"):
+        modal_artifacts.execute_pilot_job(
+            stage="train",
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            job_payload=asdict(job),
+            code_root=code_root,
+            input_root=input_root,
+            model_root=model_root,
+            run_root=run_root,
+            volume=volume,
+            environ={"CUDA_VISIBLE_DEVICES": "0"},
+            bf16_probe=lambda: True,
+        )
+
+    failed = list(
+        (run_root / "runs" / plan.run_id / "receipts/attempts").glob("*.json")
+    )
+    assert len(failed) == 1
+    receipt = json.loads(failed[0].read_text(encoding="utf-8"))
+    assert receipt["exit_status"] == 7
+    assert receipt["expected_outputs"] == []
+    assert receipt["output_hashes"] == []
+    assert receipt["validated"] is False and receipt["promoted"] is False
+    assert volume.commit_count == 1
+
+
+def test_job_bf16_preflight_failure_still_persists_failed_receipt(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if hardware rejection happened outside the forensic attempt boundary."""
+    code_root = Path(__file__).resolve().parents[2]
+    input_root = tmp_path / "inputs"
+    model_root = tmp_path / "model-cache"
+    run_root = tmp_path / "runs"
+    bundle = _stage_job_inputs(repo_fixture, input_root)
+    _stage_job_model(qwen_snapshot, model_root)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[4]
+    commands: list[list[str]] = []
+
+    def fake_subprocess(argv: list[str], **_: object) -> SimpleNamespace:
+        commands.append(argv)
+        return SimpleNamespace(returncode=0, stdout="NVIDIA H100 80GB HBM3\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess)
+    volume = CommitVolume()
+    with pytest.raises(RuntimeError, match="BF16"):
+        modal_artifacts.execute_pilot_job(
+            stage="train",
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            job_payload=asdict(job),
+            code_root=code_root,
+            input_root=input_root,
+            model_root=model_root,
+            run_root=run_root,
+            volume=volume,
+            environ={"CUDA_VISIBLE_DEVICES": "0"},
+            bf16_probe=lambda: False,
+        )
+
+    run = run_root / "runs" / plan.run_id
+    failed = list((run / "receipts/attempts").glob("*.json"))
+    assert len(failed) == 1
+    receipt = json.loads(failed[0].read_text(encoding="utf-8"))
+    assert receipt["arm"] == "direct"
+    assert receipt["observed_gpu"] == "NVIDIA H100 80GB HBM3"
+    assert receipt["validated"] is False and receipt["promoted"] is False
+    assert "RuntimeError: pilot job requires BF16 support" in receipt["failure_reason"]
+    assert commands == [["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]]
+    assert len(list((run / "attempts").glob("*/logs/train.log"))) == 1
+    assert volume.commit_count == 1
+
+
+def test_selection_workspace_failure_still_persists_failed_receipt(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if workspace construction escaped the forensic attempt boundary."""
+    code_root = Path(__file__).resolve().parents[2]
+    input_root = tmp_path / "inputs"
+    model_root = tmp_path / "model-cache"
+    run_root = tmp_path / "runs"
+    bundle = _stage_job_inputs(repo_fixture, input_root)
+    _stage_job_model(qwen_snapshot, model_root)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[0]
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("hardware or model command ran"),
+    )
+    volume = CommitVolume()
+
+    with pytest.raises(ValueError, match="canonical training root is missing"):
+        modal_artifacts.execute_pilot_job(
+            stage="selection",
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            job_payload=asdict(job),
+            code_root=code_root,
+            input_root=input_root,
+            model_root=model_root,
+            run_root=run_root,
+            volume=volume,
+            environ={"CUDA_VISIBLE_DEVICES": "0"},
+            bf16_probe=lambda: True,
+        )
+
+    run = run_root / "runs" / plan.run_id
+    receipts = list((run / "receipts/attempts").glob("*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipt["stage"] == "selection"
+    assert receipt["validated"] is False and receipt["promoted"] is False
+    assert "canonical training root is missing" in receipt["failure_reason"]
+    assert len(list((run / "attempts").glob("*/logs/selection.log"))) == 1
+    assert volume.commit_count == 1
+
+
+def test_job_publication_commit_failure_rolls_back_canonical_and_records_failure(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a failed commit stranded canonical success or masked its cause."""
+    code_root = Path(__file__).resolve().parents[2]
+    input_root = tmp_path / "inputs"
+    model_root = tmp_path / "model-cache"
+    run_root = tmp_path / "runs"
+    bundle = _stage_job_inputs(repo_fixture, input_root)
+    _stage_job_model(qwen_snapshot, model_root)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[5]
+
+    def fake_subprocess(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[0] == "nvidia-smi":
+            return SimpleNamespace(returncode=0, stdout="NVIDIA H100 80GB HBM3\n")
+        workspace = Path(str(kwargs["cwd"]))
+        output = workspace / argv[argv.index("--output-dir") + 1]
+        output.mkdir(parents=True)
+        (output / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+        (output / "adapter_model.safetensors").write_bytes(b"adapter")
+        (output / "run-manifest.json").write_text("{}\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess)
+    volume = FailFirstCommitVolume()
+    with pytest.raises(RuntimeError, match="injected first commit failure"):
+        modal_artifacts.execute_pilot_job(
+            stage="train",
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            job_payload=asdict(job),
+            code_root=code_root,
+            input_root=input_root,
+            model_root=model_root,
+            run_root=run_root,
+            volume=volume,
+            environ={"CUDA_VISIBLE_DEVICES": "0"},
+            producer_validator=lambda *_: None,
+            bf16_probe=lambda: True,
+        )
+
+    run = run_root / "runs" / plan.run_id
+    canonical = run / "artifacts/phase-marker/checkpoints/pilot/seed-42/filler"
+    canonical_receipt = run / "receipts/canonical/train/filler.json"
+    failed = list((run / "receipts/attempts").glob("*.json"))
+    assert not canonical.exists()
+    assert not canonical_receipt.exists()
+    assert len(failed) == 1
+    receipt = json.loads(failed[0].read_text(encoding="utf-8"))
+    assert receipt["validated"] is False and receipt["promoted"] is False
+    assert "RuntimeError: injected first commit failure" in receipt["failure_reason"]
+    attempt = next((run / "attempts").iterdir())
+    assert (attempt / "failed-publication/producer").is_dir()
+    assert (attempt / "failed-publication/success-receipt.json").is_file()
+    assert volume.commit_count == 2
+
+
+def _finalizer_receipt_payload(
+    plan: modal_plan.PilotPlan,
+    job: modal_plan.PilotJob,
+    stage: str,
+    *,
+    cache_artifact_id: str = "e" * 64,
+) -> dict[str, object]:
+    command = job.training_command if stage == "train" else job.selection_command
+    paths = (
+        ("adapter_config.json", "adapter_model.safetensors", "run-manifest.json")
+        if stage == "train"
+        else ("manifest.json", "evidence.jsonl")
+    )
+    receipt = AttemptReceipt(
+        schema_version=1,
+        run_id=plan.run_id,
+        bundle_id=plan.bundle_id,
+        stage=stage,
+        arm=job.arm,
+        seed=42,
+        attempt_id=f"finalizer-{stage}-{job.arm}",
+        command=command,
+        command_hash=hashlib.sha256(command.encode("utf-8")).hexdigest(),
+        source_hash=plan.source_hash,
+        dependency_lock_hash=plan.dependency_lock_hash,
+        model_cache_artifact_id=cache_artifact_id,
+        requested_gpu="H100",
+        observed_gpu="NVIDIA H100 80GB HBM3",
+        started_at="2026-08-05T00:00:00+00:00",
+        finished_at="2026-08-05T00:01:00+00:00",
+        elapsed_seconds=60.0,
+        timeout_seconds=14_400,
+        exit_status=0,
+        validated=True,
+        promoted=True,
+        expected_outputs=paths,
+        output_hashes=tuple(hashlib.sha256(path.encode()).hexdigest() for path in paths),
+        failure_reason=None,
+        artifact_id="",
+    )
+    receipt = replace(receipt, artifact_id=receipt.recomputed_artifact_id())
+    payload = asdict(receipt)
+    payload["expected_outputs"] = list(receipt.expected_outputs)
+    payload["output_hashes"] = list(receipt.output_hashes)
+    return payload
+
+
+def test_cpu_finalizer_runs_read_only_gate_and_publishes_inert_stop_summary(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if finalization executed behavior or published an authorization field."""
+    bundle = build_input_bundle(repo_fixture)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    plan_payload = modal_plan.pilot_plan_payload(plan)
+    snapshot, cache_manifest = _stage_job_model(
+        qwen_snapshot, tmp_path / "model-cache"
+    )
+    training = tuple(
+        _finalizer_receipt_payload(
+            plan, job, "train", cache_artifact_id=cache_manifest.artifact_id
+        )
+        for job in plan.jobs
+    )
+    selection = tuple(
+        _finalizer_receipt_payload(
+            plan, job, "selection", cache_artifact_id=cache_manifest.artifact_id
+        )
+        for job in plan.jobs
+    )
+    gate_calls: list[dict[str, object]] = []
+    monkeypatch.setenv("HF_HUB_CACHE", "before-cache")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "before-hub")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "before-transformers")
+
+    def gate(**kwargs: object) -> dict[str, object]:
+        assert os.environ["HF_HUB_CACHE"] == str(snapshot.parents[2])
+        assert os.environ["HF_HUB_OFFLINE"] == "1"
+        assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+        gate_calls.append(dict(kwargs))
+        return {
+            "passed": True,
+            "checked_artifact_ids": ["f" * 64],
+            "commands": ["./.venv/bin/python -m phase_marker.behavior run"],
+        }
+
+    volume = CommitVolume()
+    result = modal_artifacts.finalize_stage_a(
+        plan_payload=plan_payload,
+        receipts=(*training, *selection),
+        input_root=tmp_path / "inputs",
+        model_root=tmp_path / "model-cache",
+        run_root=tmp_path / "runs",
+        volume=volume,
+        behavior_gate=gate,
+    )
+
+    assert len(gate_calls) == 1
+    assert gate_calls[0]["plan_payload"] is plan_payload
+    assert gate_calls[0]["input_root"] == tmp_path / "inputs"
+    assert gate_calls[0]["model_root"] == tmp_path / "model-cache"
+    assert gate_calls[0]["run_root"] == tmp_path / "runs"
+    assert result["stopped_before_behavior"] is True
+    assert result["next_command"] == "./.venv/bin/python -m phase_marker.behavior run"
+    assert "confirmation_seeds" not in result
+    assert "mechanism_approval" not in result
+    assert "callback" not in result
+    summary_path = tmp_path / "runs" / "runs" / plan.run_id / "stage-a-summary.json"
+    assert json.loads(summary_path.read_text(encoding="utf-8")) == result
+    assert volume.commit_count == 1
+    assert os.environ["HF_HUB_CACHE"] == "before-cache"
+    assert os.environ["HF_HUB_OFFLINE"] == "before-hub"
+    assert os.environ["TRANSFORMERS_OFFLINE"] == "before-transformers"
+
+    resumed = modal_artifacts.finalize_stage_a(
+        plan_payload=plan_payload,
+        receipts=(*training, *selection),
+        input_root=tmp_path / "inputs",
+        model_root=tmp_path / "model-cache",
+        run_root=tmp_path / "runs",
+        volume=volume,
+        behavior_gate=gate,
+    )
+    assert resumed == result
+    assert len(gate_calls) == 2
+    assert volume.commit_count == 1
+
+    for change in (
+        {"next_command": lambda: None},
+        {"confirmation_seeds": [101, 202, 303]},
+        {"mechanism_approval": True},
+    ):
+        invalid = {**result, **change}
+        with pytest.raises(ValueError, match="summary"):
+            modal_artifacts.validate_stage_a_summary(
+                invalid,
+                plan_payload=plan_payload,
+                training_receipts=training,
+                selection_receipts=selection,
+            )
+
+
+def test_default_training_producer_validation_rejects_semantically_empty_manifest(
+    repo_fixture: Path,
+) -> None:
+    """Would fail if producer validation only checked that expected filenames exist."""
+    bundle = build_input_bundle(repo_fixture)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[0]
+    producer = (
+        repo_fixture
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/semantic"
+    )
+    producer.mkdir(parents=True)
+    (producer / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+    (producer / "adapter_model.safetensors").write_bytes(b"adapter")
+    (producer / "run-manifest.json").write_text("{}\n", encoding="utf-8")
+    job_payload = asdict(job)
+    job_payload["expected_outputs"] = list(job.expected_outputs)
+
+    with pytest.raises(ValueError, match="manifest|completion|producer"):
+        modal_artifacts._validate_job_producer(
+            "train", producer, modal_plan.pilot_plan_payload(plan), job_payload
+        )
+
+
+def test_finalizer_commit_failure_quarantines_summary_and_preserves_original_error(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+) -> None:
+    """Would fail if an uncommitted summary made explicit resume permanently stuck."""
+    bundle = build_input_bundle(repo_fixture)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    plan_payload = modal_plan.pilot_plan_payload(plan)
+    _snapshot, cache_manifest = _stage_job_model(
+        qwen_snapshot, tmp_path / "model-cache"
+    )
+    training = tuple(
+        _finalizer_receipt_payload(
+            plan, job, "train", cache_artifact_id=cache_manifest.artifact_id
+        )
+        for job in plan.jobs
+    )
+    selection = tuple(
+        _finalizer_receipt_payload(
+            plan, job, "selection", cache_artifact_id=cache_manifest.artifact_id
+        )
+        for job in plan.jobs
+    )
+    volume = FailFirstCommitVolume()
+
+    with pytest.raises(RuntimeError, match="injected first commit failure"):
+        modal_artifacts.finalize_stage_a(
+            plan_payload=plan_payload,
+            receipts=(*training, *selection),
+            input_root=tmp_path / "inputs",
+            model_root=tmp_path / "model-cache",
+            run_root=tmp_path / "runs",
+            volume=volume,
+            behavior_gate=lambda **_: {
+                "passed": True,
+                "checked_artifact_ids": ["f" * 64],
+                "commands": ["./.venv/bin/python -m phase_marker.behavior run"],
+            },
+        )
+
+    run = tmp_path / "runs" / "runs" / plan.run_id
+    assert not (run / "stage-a-summary.json").exists()
+    assert len(list((run / "attempts").glob("*/stage-a-summary.json"))) == 1
+    assert volume.commit_count == 2

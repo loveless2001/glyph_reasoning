@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import io
+import json
 from pathlib import Path, PurePosixPath
 import shlex
 import subprocess
+from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
 import modal
@@ -17,9 +19,15 @@ from phase_marker.modal_artifacts import (
     VolumeClient,
     build_input_bundle,
     cache_model_to_volume,
+    execute_pilot_job,
+    finalize_stage_a,
     hash_source_tree,
     require_clean_tracked_status,
     run_cpu_smoke,
+    validate_canonical_job_output,
+    validate_canonical_job_semantics,
+    validate_job_receipt_payload,
+    validate_stage_a_summary,
     validate_bundle_at_root,
 )
 from phase_marker.modal_plan import (
@@ -37,6 +45,8 @@ BASE_IMAGE = (
 GPU = "H100"
 GPU_TIMEOUT_SECONDS = 14_400
 MAX_GPU_CONTAINERS = 2
+GPU_STARTUP_TIMEOUT_SECONDS = 1_200
+GPU_EPHEMERAL_DISK_MIB = 80 * 1024
 MODEL_CACHE_CPU = 4.0
 MODEL_CACHE_MEMORY_MIB = 32_768
 MODEL_CACHE_TIMEOUT_SECONDS = 7_200
@@ -80,6 +90,9 @@ class RemoteFunction(Protocol):
     def remote(self, *args: object, **kwargs: object) -> object:
         """Invoke the declared function remotely."""
 
+    def map(self, payloads: object) -> object:
+        """Invoke the declared function once per ordered payload."""
+
 
 @dataclass(frozen=True)
 class InputStagingPlan:
@@ -91,6 +104,13 @@ class InputStagingPlan:
     upload_required: bool
 
 
+@dataclass(frozen=True)
+class StageAPreflight:
+    training: dict[str, dict[str, object]]
+    selection: dict[str, dict[str, object]]
+    summary: dict[str, object] | None
+
+
 app = modal.App(
     APP_NAME,
     tags=_BASE_TAGS,
@@ -99,6 +119,17 @@ app = modal.App(
 inputs_volume = modal.Volume.from_name(VOLUME_NAMES[0], create_if_missing=True)
 model_volume = modal.Volume.from_name(VOLUME_NAMES[1], create_if_missing=True)
 runs_volume = modal.Volume.from_name(VOLUME_NAMES[2], create_if_missing=True)
+
+GPU_VOLUMES = {
+    "/inputs": inputs_volume.read_only(),
+    "/model-cache": model_volume.read_only(),
+    "/runs": runs_volume,
+}
+FINALIZER_VOLUMES = {
+    "/inputs": inputs_volume.read_only(),
+    "/model-cache": model_volume.read_only(),
+    "/runs": runs_volume,
+}
 
 gpu_image = (
     modal.Image.from_registry(BASE_IMAGE, add_python="3.12")
@@ -160,6 +191,458 @@ def smoke_remote(plan_payload: dict[str, object]) -> dict[str, object]:
         volume=runs_volume,
         runtime_imports=LOCKED_RUNTIME_IMPORTS,
     )
+
+
+@app.function(
+    image=gpu_image,
+    gpu="H100",
+    timeout=14_400,
+    startup_timeout=1_200,
+    max_containers=2,
+    retries=0,
+    ephemeral_disk=80 * 1024,
+    volumes=GPU_VOLUMES,
+)
+def run_training_job(job_payload: dict[str, object]) -> dict[str, object]:
+    """Execute one immutable training arm inside the approved GPU boundary."""
+    return _execute_job("train", job_payload)
+
+
+@app.function(
+    image=gpu_image,
+    gpu="H100",
+    timeout=14_400,
+    startup_timeout=1_200,
+    max_containers=2,
+    retries=0,
+    ephemeral_disk=80 * 1024,
+    volumes=GPU_VOLUMES,
+)
+def run_selection_job(job_payload: dict[str, object]) -> dict[str, object]:
+    """Execute one immutable selection arm inside the approved GPU boundary."""
+    return _execute_job("selection", job_payload)
+
+
+@app.function(
+    image=cpu_image,
+    cpu=2.0,
+    memory=8_192,
+    timeout=900,
+    retries=0,
+    volumes=FINALIZER_VOLUMES,
+)
+def finalize_stage_a_remote(
+    plan_payload: Mapping[str, object],
+    receipts: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Validate Stage A prerequisites and publish an inert stop summary."""
+    return finalize_stage_a(
+        plan_payload=plan_payload,
+        receipts=receipts,
+        input_root=Path("/inputs"),
+        model_root=Path("/model-cache"),
+        run_root=Path("/runs"),
+        volume=runs_volume,
+    )
+
+
+def _execute_job(stage: str, job_payload: dict[str, object]) -> dict[str, object]:
+    if not isinstance(job_payload, dict) or set(job_payload) != {"plan", "job"}:
+        raise ValueError("remote job payload fields are invalid")
+    plan = job_payload["plan"]
+    job = job_payload["job"]
+    if not isinstance(plan, Mapping) or not isinstance(job, Mapping):
+        raise ValueError("remote job payload values are invalid")
+    return execute_pilot_job(
+        stage=stage,
+        plan_payload=plan,
+        job_payload=job,
+        code_root=CODE_ROOT,
+        input_root=Path("/inputs"),
+        model_root=Path("/model-cache"),
+        run_root=Path("/runs"),
+        volume=runs_volume,
+    )
+
+
+def run_stage_a_local(
+    plan: PilotPlan,
+    *,
+    approved_run_id: str,
+    budget_acknowledged: bool,
+    resume: bool,
+    training_function: RemoteFunction,
+    selection_function: RemoteFunction,
+    finalizer_function: RemoteFunction,
+    runs_client: VolumeClient,
+) -> dict[str, object]:
+    """Run the approved Stage A graph in frozen order, stopping before behavior."""
+    _validate_operator_approval(
+        approved_run_id=approved_run_id,
+        plan=plan,
+        budget_acknowledged=budget_acknowledged,
+    )
+    if not isinstance(resume, bool):
+        raise TypeError("resume must be an explicit boolean")
+    existing = _preflight_stage_a_outputs(plan, resume=resume, runs_client=runs_client)
+    plan_payload = pilot_plan_payload(plan)
+    missing_training = tuple(job for job in plan.jobs if job.arm not in existing.training)
+    print(
+        canonical_json(
+            {
+                "operation": "run-stage-a",
+                "run_id": plan.run_id,
+                "resume": resume,
+                "missing_training_arms": [job.arm for job in missing_training],
+            }
+        )
+    )
+    apply_approved_app_tags(plan)
+
+    training_receipts = dict(existing.training)
+    training_payloads = tuple(
+        _remote_job_payload(plan_payload, job) for job in missing_training
+    )
+    if training_payloads:
+        results = list(training_function.map(training_payloads))
+        if len(results) != len(missing_training):
+            raise RuntimeError("training map returned an incomplete result set")
+        for job, payload, result in zip(
+            missing_training, training_payloads, results, strict=True
+        ):
+            if not isinstance(result, Mapping):
+                raise TypeError(f"training remote returned a non-object for {job.arm}")
+            training_receipts[job.arm] = validate_job_receipt_payload(
+                receipt_payload=result,
+                plan_payload=plan_payload,
+                job_payload=payload["job"],
+                stage="train",
+            )
+    _require_complete_receipt_matrix(training_receipts, plan, "training")
+
+    runs_client.reload()
+    existing_selection = _revalidate_resume_selections(
+        plan, resume=resume, runs_client=runs_client, existing=existing.selection
+    )
+    missing_selection = tuple(
+        job for job in plan.jobs if job.arm not in existing_selection
+    )
+    selection_receipts = dict(existing_selection)
+    selection_payloads = tuple(
+        _remote_job_payload(plan_payload, job) for job in missing_selection
+    )
+    if selection_payloads:
+        results = list(selection_function.map(selection_payloads))
+        if len(results) != len(missing_selection):
+            raise RuntimeError("selection map returned an incomplete result set")
+        for job, payload, result in zip(
+            missing_selection, selection_payloads, results, strict=True
+        ):
+            if not isinstance(result, Mapping):
+                raise TypeError(f"selection remote returned a non-object for {job.arm}")
+            selection_receipts[job.arm] = validate_job_receipt_payload(
+                receipt_payload=result,
+                plan_payload=plan_payload,
+                job_payload=payload["job"],
+                stage="selection",
+            )
+    _require_complete_receipt_matrix(selection_receipts, plan, "selection")
+
+    ordered_training = tuple(training_receipts[job.arm] for job in plan.jobs)
+    ordered_selection = tuple(selection_receipts[job.arm] for job in plan.jobs)
+    runs_client.reload()
+    summary = finalizer_function.remote(
+        plan_payload, (*ordered_training, *ordered_selection)
+    )
+    if not isinstance(summary, Mapping):
+        raise TypeError("Stage A finalizer returned a non-object")
+    return validate_stage_a_summary(
+        summary,
+        plan_payload=plan_payload,
+        training_receipts=ordered_training,
+        selection_receipts=ordered_selection,
+    )
+
+
+def _remote_job_payload(
+    plan_payload: dict[str, object], job: object,
+) -> dict[str, object]:
+    payload = asdict(job)
+    payload["expected_outputs"] = list(payload["expected_outputs"])
+    return {"plan": plan_payload, "job": payload}
+
+
+def _preflight_stage_a_outputs(
+    plan: PilotPlan, *, resume: bool, runs_client: VolumeClient,
+) -> StageAPreflight:
+    summary_bytes = _preflight_stage_a_namespace(
+        plan, resume=resume, runs_client=runs_client
+    )
+    existing: dict[str, dict[str, dict[str, object]]] = {
+        "train": {},
+        "selection": {},
+    }
+    plan_payload = pilot_plan_payload(plan)
+    for stage in ("train", "selection"):
+        for job in plan.jobs:
+            receipt_path = _volume_canonical_receipt_path(plan.run_id, stage, job.arm)
+            producer_path = _volume_producer_path(plan.run_id, stage, job.arm)
+            receipt = _read_volume_file_optional(runs_client, receipt_path)
+            entries = _list_volume_files_optional(runs_client, producer_path)
+            if receipt is None and not entries:
+                continue
+            if not resume:
+                raise FileExistsError(
+                    f"canonical Stage A output already exists for {stage}/{job.arm}; use --resume"
+                )
+            if receipt is None or not entries:
+                raise ValueError(
+                    f"canonical output is incomplete for {stage}/{job.arm}"
+                )
+            existing[stage][job.arm] = _validate_volume_canonical_output(
+                plan_payload=plan_payload,
+                job=job,
+                stage=stage,
+                receipt_bytes=receipt,
+                entries=entries,
+                producer_path=producer_path,
+                runs_client=runs_client,
+                local_input_root=Path(plan.local_repo_root),
+            )
+    if not set(existing["selection"]).issubset(existing["train"]):
+        raise ValueError("canonical selection is missing its canonical training parent")
+    summary: dict[str, object] | None = None
+    if summary_bytes is not None:
+        if len(existing["train"]) != 6 or len(existing["selection"]) != 6:
+            raise ValueError("canonical Stage A summary has an incomplete receipt matrix")
+        try:
+            payload = json.loads(summary_bytes.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("canonical Stage A summary is invalid") from error
+        if not isinstance(payload, Mapping):
+            raise ValueError("canonical Stage A summary is invalid")
+        summary = validate_stage_a_summary(
+            payload,
+            plan_payload=plan_payload,
+            training_receipts=tuple(
+                existing["train"][job.arm] for job in plan.jobs
+            ),
+            selection_receipts=tuple(
+                existing["selection"][job.arm] for job in plan.jobs
+            ),
+        )
+    return StageAPreflight(
+        training=existing["train"],
+        selection=existing["selection"],
+        summary=summary,
+    )
+
+
+def _preflight_stage_a_namespace(
+    plan: PilotPlan, *, resume: bool, runs_client: VolumeClient,
+) -> bytes | None:
+    run_root = f"/runs/{plan.run_id}"
+    entries = _list_volume_files_optional(runs_client, run_root)
+    producer_roots = {
+        _volume_producer_path(plan.run_id, stage, job.arm)
+        for stage in ("train", "selection")
+        for job in plan.jobs
+    }
+    receipt_paths = {
+        _volume_canonical_receipt_path(plan.run_id, stage, job.arm)
+        for stage in ("train", "selection")
+        for job in plan.jobs
+    }
+    summary_path = f"{run_root}/stage-a-summary.json"
+    expected = {*producer_roots, *receipt_paths, summary_path}
+    ignored_prefixes = (
+        f"{run_root}/attempts/",
+        f"{run_root}/receipts/attempts/",
+        f"{run_root}/receipts/smoke/",
+    )
+    summary_seen = False
+    for entry in entries:
+        raw_path = entry if isinstance(entry, str) else getattr(entry, "path", None)
+        if not isinstance(raw_path, str):
+            raise ValueError("Stage A namespace contains an invalid path")
+        path = "/" + raw_path.lstrip("/")
+        if path == run_root or any(path.startswith(prefix) for prefix in ignored_prefixes):
+            continue
+        if path == summary_path:
+            summary_seen = True
+            continue
+        if any(
+            path == target
+            or path.startswith(target.rstrip("/") + "/")
+            or target.startswith(path.rstrip("/") + "/")
+            for target in expected
+        ):
+            continue
+        raise ValueError(f"unexpected canonical Stage A path: {path}")
+    if not summary_seen:
+        return None
+    if not resume:
+        raise FileExistsError("canonical Stage A summary already exists; use --resume")
+    summary = _read_volume_file_optional(runs_client, summary_path)
+    if summary is None:
+        raise ValueError("canonical Stage A summary disappeared during preflight")
+    return summary
+
+
+def _revalidate_resume_selections(
+    plan: PilotPlan,
+    *,
+    resume: bool,
+    runs_client: VolumeClient,
+    existing: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    if not resume:
+        return dict(existing)
+    plan_payload = pilot_plan_payload(plan)
+    revalidated: dict[str, dict[str, object]] = {}
+    for job in plan.jobs:
+        if job.arm not in existing:
+            continue
+        receipt_path = _volume_canonical_receipt_path(
+            plan.run_id, "selection", job.arm
+        )
+        producer_path = _volume_producer_path(plan.run_id, "selection", job.arm)
+        receipt = _read_volume_file_optional(runs_client, receipt_path)
+        entries = _list_volume_files_optional(runs_client, producer_path)
+        if receipt is None or not entries:
+            raise ValueError(
+                f"canonical output changed during resume for selection/{job.arm}"
+            )
+        current = _validate_volume_canonical_output(
+            plan_payload=plan_payload,
+            job=job,
+            stage="selection",
+            receipt_bytes=receipt,
+            entries=entries,
+            producer_path=producer_path,
+            runs_client=runs_client,
+            local_input_root=Path(plan.local_repo_root),
+        )
+        if current["artifact_id"] != existing[job.arm]["artifact_id"]:
+            raise ValueError(
+                f"canonical output changed during resume for selection/{job.arm}"
+            )
+        revalidated[job.arm] = current
+    return revalidated
+
+
+def _validate_volume_canonical_output(
+    *,
+    plan_payload: dict[str, object],
+    job: object,
+    stage: str,
+    receipt_bytes: bytes,
+    entries: tuple[object, ...],
+    producer_path: str,
+    runs_client: VolumeClient,
+    local_input_root: Path,
+) -> dict[str, object]:
+    try:
+        receipt_payload = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("canonical receipt is invalid") from error
+    if not isinstance(receipt_payload, Mapping):
+        raise ValueError("canonical receipt is invalid")
+    files = _read_volume_producer_files(
+        entries=entries,
+        producer_path=producer_path,
+        runs_client=runs_client,
+    )
+    payload = asdict(job)
+    payload["expected_outputs"] = list(payload["expected_outputs"])
+    validated = validate_canonical_job_output(
+        receipt_payload=receipt_payload,
+        producer_files=files,
+        plan_payload=plan_payload,
+        job_payload=payload,
+        stage=stage,
+    )
+    training_files: dict[str, bytes] | None = None
+    if stage == "selection":
+        training_path = _volume_producer_path(
+            str(plan_payload["run_id"]), "train", str(payload["arm"])
+        )
+        training_entries = _list_volume_files_optional(runs_client, training_path)
+        if not training_entries:
+            raise ValueError("canonical selection is missing its semantic training parent")
+        training_files = _read_volume_producer_files(
+            entries=training_entries,
+            producer_path=training_path,
+            runs_client=runs_client,
+        )
+    validate_canonical_job_semantics(
+        stage=stage,
+        producer_files=files,
+        canonical_training_files=training_files,
+        plan_payload=plan_payload,
+        job_payload=payload,
+        local_input_root=local_input_root,
+    )
+    return validated
+
+
+def _read_volume_producer_files(
+    *,
+    entries: tuple[object, ...],
+    producer_path: str,
+    runs_client: VolumeClient,
+) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
+    prefix = producer_path.rstrip("/") + "/"
+    for entry in entries:
+        raw_path = entry if isinstance(entry, str) else getattr(entry, "path", None)
+        if not isinstance(raw_path, str):
+            raise ValueError("canonical producer listing contains an invalid path")
+        path = "/" + raw_path.lstrip("/")
+        kind = _remote_entry_kind(entry)
+        if kind == "directory":
+            continue
+        if kind not in {"file", "unspecified"} or not path.startswith(prefix):
+            raise ValueError("canonical producer listing contains an invalid path")
+        relative = path[len(prefix):]
+        if not relative or relative in files:
+            raise ValueError("canonical producer listing contains an invalid path")
+        content = _read_volume_file_optional(runs_client, path)
+        if content is None:
+            raise ValueError("canonical producer file disappeared during validation")
+        files[relative] = content
+    return files
+
+
+def _require_complete_receipt_matrix(
+    receipts: Mapping[str, Mapping[str, object]], plan: PilotPlan, label: str,
+) -> None:
+    expected = tuple(job.arm for job in plan.jobs)
+    if tuple(arm for arm in expected if arm in receipts) != expected or len(receipts) != 6:
+        raise RuntimeError(f"{label} receipt matrix is incomplete")
+
+
+def _volume_canonical_receipt_path(run_id: str, stage: str, arm: str) -> str:
+    return f"/runs/{run_id}/receipts/canonical/{stage}/{arm}.json"
+
+
+def _volume_producer_path(run_id: str, stage: str, arm: str) -> str:
+    kind = "checkpoints" if stage == "train" else "checkpoint-selections"
+    return f"/runs/{run_id}/artifacts/phase-marker/{kind}/pilot/seed-42/{arm}"
+
+
+def _read_volume_file_optional(client: VolumeClient, path: str) -> bytes | None:
+    try:
+        return b"".join(client.read_file(path))
+    except FileNotFoundError:
+        return None
+
+
+def _list_volume_files_optional(client: VolumeClient, path: str) -> tuple[object, ...]:
+    try:
+        return tuple(client.listdir(path, recursive=True))
+    except FileNotFoundError:
+        return ()
 
 
 @app.function(
@@ -388,6 +871,28 @@ def smoke(
     _print_remote_result(result)
 
 
+@app.local_entrypoint(name="run-stage-a")
+def run_stage_a(
+    repo_root: str,
+    approved_run_id: str,
+    budget_acknowledged: bool = False,
+    resume: bool = False,
+) -> None:
+    """Explicitly run training, selection, and CPU finalization only."""
+    _bundle, plan = _build_operator_context(Path(repo_root))
+    result = run_stage_a_local(
+        plan,
+        approved_run_id=approved_run_id,
+        budget_acknowledged=budget_acknowledged,
+        resume=resume,
+        training_function=run_training_job,
+        selection_function=run_selection_job,
+        finalizer_function=finalize_stage_a_remote,
+        runs_client=runs_volume,
+    )
+    print(canonical_json(result))
+
+
 def _build_operator_context(repo_root: Path) -> tuple[InputBundle, PilotPlan]:
     root = Path(repo_root).resolve()
     status_result = subprocess.run(
@@ -482,17 +987,16 @@ def _validate_operator_approval(
 
 
 def _plan_repo_root(plan: PilotPlan) -> Path:
+    root = Path(plan.local_repo_root).resolve()
+    expected = root / "configs/phase-marker-qwen25-7b.toml"
+    if not expected.is_file():
+        raise ValueError("pilot plan repository configuration is not approved")
     try:
         argv = shlex.split(plan.jobs[0].training_command)
-        config_index = argv.index("--config") + 1
-        config_path = Path(argv[config_index])
+        config_path = Path(argv[argv.index("--config") + 1])
     except (IndexError, ValueError) as error:
         raise ValueError("pilot plan lacks its approved repository configuration") from error
-    if not config_path.is_absolute():
-        raise ValueError("pilot plan repository configuration must be absolute")
-    root = config_path.resolve().parent.parent
-    expected = (root / "configs/phase-marker-qwen25-7b.toml").resolve()
-    if config_path.resolve() != expected:
+    if config_path != Path("configs/phase-marker-qwen25-7b.toml"):
         raise ValueError("pilot plan repository configuration is not approved")
     return root
 

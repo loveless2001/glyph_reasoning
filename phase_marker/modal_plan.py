@@ -22,6 +22,8 @@ from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
 
 _PILOT_KIND = "pilot"
 _EXPECTED_ARMS = ("semantic", "glyph", "dot", "random", "direct", "filler")
+_PORTABLE_CONFIG_PATH = Path("configs/phase-marker-qwen25-7b.toml")
+_PORTABLE_ARTIFACT_ROOT = Path("artifacts/phase-marker")
 _SHA256_LENGTH = 64
 _MANIFEST_FIELDS = frozenset(
     {
@@ -99,6 +101,7 @@ class PilotPlan:
     resources: StageAResources
     jobs: tuple[PilotJob, ...]
     run_id: str
+    local_repo_root: Path
 
 
 def build_stage_a_resources() -> StageAResources:
@@ -129,14 +132,19 @@ def build_pilot_plan(
     approval = resources.approval()
     manifest_jobs = build_command_manifest(
         config,
-        artifact_root,
+        _PORTABLE_ARTIFACT_ROOT,
         kind=_PILOT_KIND,
         seeds=(config.pilot_seed,),
-        config_path=config_path,
+        config_path=_PORTABLE_CONFIG_PATH,
         approval=approval,
     )
     jobs = _validate_manifest_jobs(
-        manifest_jobs, config, approval, resources, config_path, artifact_root
+        manifest_jobs,
+        config,
+        approval,
+        resources,
+        _PORTABLE_CONFIG_PATH,
+        _PORTABLE_ARTIFACT_ROOT,
     )
     config_hash = hashlib.sha256(
         canonical_json(asdict(config)).encode("utf-8")
@@ -160,6 +168,7 @@ def build_pilot_plan(
         resources=resources,
         jobs=jobs,
         run_id=run_id,
+        local_repo_root=root,
     )
 
 

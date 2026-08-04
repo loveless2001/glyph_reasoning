@@ -662,6 +662,7 @@ def _validate_training_runs(
     kind: str,
     seeds: tuple[int, ...],
     expected_materializations: Mapping[str, str] | None = None,
+    expected_identities: frozenset[tuple[int, str]] | None = None,
 ) -> tuple[str, ...]:
     fallback = artifact_root / "adapter.json"
     if fallback.is_file():
@@ -674,7 +675,10 @@ def _validate_training_runs(
     if not candidates:
         raise GateFailure("missing training run manifests")
 
-    expected = {(seed, arm) for seed in seeds for arm in config.arms}
+    full_expected = {(seed, arm) for seed in seeds for arm in config.arms}
+    expected = full_expected if expected_identities is None else set(expected_identities)
+    if not expected or not expected.issubset(full_expected):
+        raise GateFailure("training run expected identities are outside the frozen matrix")
     observed: set[tuple[int, str]] = set()
     checked: list[str] = []
     for path in candidates:
