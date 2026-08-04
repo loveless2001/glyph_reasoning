@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import os
@@ -327,7 +327,7 @@ def _validation_rows(
     selected = tuple(sorted(unused, key=lambda row: (row.question_hash, row.example_id))[:VALIDATION_PER_SOURCE])
     if len(selected) != VALIDATION_PER_SOURCE:
         raise ValueError(f"need {VALIDATION_PER_SOURCE} unused {source} train rows, got {len(selected)}")
-    return selected
+    return tuple(replace(row, split="validation") for row in selected)
 
 
 def _examples_from_rows(

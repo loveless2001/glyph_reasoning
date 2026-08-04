@@ -21,6 +21,7 @@ from phase_marker.splits import (
     parse_trace_pool,
     question_hash,
     write_split_bundle,
+    _validation_rows,
 )
 
 
@@ -154,6 +155,60 @@ def test_build_selects_exactly_300_unused_rows_per_validation_source(
     assert [row.question_hash for row in bundle.validation if row.source == "gsm8k"] == sorted(
         row.question_hash for row in bundle.validation if row.source == "gsm8k"
     )
+
+
+def test_validation_selection_relabels_copies_without_mutating_train_candidates():
+    candidates = tuple(
+        example("gsm8k", f"candidate {index}", str(index))
+        for index in range(300)
+    )
+    original_records = tuple(
+        (
+            row.source,
+            row.split,
+            row.example_id,
+            row.question,
+            row.answer,
+            row.question_hash,
+        )
+        for row in candidates
+    )
+    originals_by_id = {row.example_id: row for row in candidates}
+
+    selected = _validation_rows(candidates, set(), "gsm8k")
+
+    assert {row.split for row in selected} == {"validation"}
+    assert {
+        row.example_id: (
+            row.source,
+            row.example_id,
+            row.question,
+            row.answer,
+            row.question_hash,
+        )
+        for row in selected
+    } == {
+        row.example_id: (
+            row.source,
+            row.example_id,
+            row.question,
+            row.answer,
+            row.question_hash,
+        )
+        for row in candidates
+    }
+    assert all(row is not originals_by_id[row.example_id] for row in selected)
+    assert tuple(
+        (
+            row.source,
+            row.split,
+            row.example_id,
+            row.question,
+            row.answer,
+            row.question_hash,
+        )
+        for row in candidates
+    ) == original_records
 
 
 def test_build_records_unmatched_and_ambiguous_source_recovery(fake_loader):
