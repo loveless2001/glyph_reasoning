@@ -44,6 +44,35 @@ SOURCE_HASH = "1" * 64
 LOCK_HASH = "2" * 64
 
 
+def _pinned_qwen_model_config() -> dict[str, object]:
+    return {
+        "architectures": ["Qwen2ForCausalLM"],
+        "hidden_size": 3584,
+        "intermediate_size": 18944,
+        "model_type": "qwen2",
+        "num_attention_heads": 28,
+        "num_hidden_layers": 28,
+        "num_key_value_heads": 4,
+        "vocab_size": 152064,
+    }
+
+
+def _pinned_qwen_tokenizer_json() -> dict[str, object]:
+    return {
+        "version": "1.0",
+        "added_tokens": [{"id": 0, "content": "<|endoftext|>"}],
+        "normalizer": {"type": "NFC"},
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": []},
+        "post_processor": {"type": "ByteLevel"},
+        "decoder": {"type": "ByteLevel"},
+        "model": {
+            "type": "BPE",
+            "vocab": {"<|endoftext|>": 0, "t": 1, "o": 2, "to": 3},
+            "merges": ["t o"],
+        },
+    }
+
+
 @pytest.fixture
 def qwen_snapshot(tmp_path: Path) -> Path:
     snapshot = (
@@ -54,10 +83,20 @@ def qwen_snapshot(tmp_path: Path) -> Path:
     )
     snapshot.mkdir(parents=True)
     for name, payload in (
-        ("config.json", {"model_type": "qwen2"}),
-        ("generation_config.json", {"eos_token_id": 151643}),
-        ("tokenizer.json", {"version": "1.0"}),
-        ("tokenizer_config.json", {"tokenizer_class": "Qwen2Tokenizer"}),
+        ("config.json", _pinned_qwen_model_config()),
+        (
+            "generation_config.json",
+            {"bos_token_id": 151643, "eos_token_id": 151645, "pad_token_id": 151643},
+        ),
+        ("tokenizer.json", _pinned_qwen_tokenizer_json()),
+        (
+            "tokenizer_config.json",
+            {
+                "tokenizer_class": "Qwen2Tokenizer",
+                "chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+                "model_max_length": 131072,
+            },
+        ),
         (
             "model.safetensors.index.json",
             {
@@ -142,8 +181,65 @@ def test_model_cache_requires_generation_metadata(qwen_snapshot: Path) -> None:
     """Would fail if a model cache could omit generation configuration bytes."""
     (qwen_snapshot / "generation_config.json").unlink()
 
-    with pytest.raises(ValueError, match="required model cache file"):
+    with pytest.raises(ValueError, match="pinned Qwen generation metadata"):
         build_model_cache_manifest(qwen_snapshot)
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    (
+        ("config.json", "not-json"),
+        ("config.json", []),
+        ("config.json", {**_pinned_qwen_model_config(), "model_type": "qwen3"}),
+        ("config.json", {**_pinned_qwen_model_config(), "architectures": ["LlamaForCausalLM"]}),
+        ("generation_config.json", "not-json"),
+        ("generation_config.json", []),
+        ("generation_config.json", {"bos_token_id": 0, "eos_token_id": 1, "pad_token_id": 0}),
+    ),
+)
+def test_model_cache_rejects_invalid_pinned_model_metadata(
+    qwen_snapshot: Path, filename: str, payload: object,
+) -> None:
+    """Would fail if arbitrary metadata could be certified as the pinned Qwen model."""
+    content = payload if isinstance(payload, str) else json.dumps(payload)
+    (qwen_snapshot / filename).write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="pinned Qwen (model|generation) metadata"):
+        build_model_cache_manifest(qwen_snapshot)
+
+
+def test_model_cache_rejects_malformed_tokenizer_layout_on_build_and_validation(
+    qwen_snapshot: Path,
+) -> None:
+    """Would fail if cache certification skipped the public tokenizer preflight."""
+    manifest = build_model_cache_manifest(qwen_snapshot)
+    (qwen_snapshot / "tokenizer.json").write_text("[]", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="pinned tokenizer snapshot"):
+        validate_model_cache_manifest(qwen_snapshot, manifest)
+    with pytest.raises(FileNotFoundError, match="pinned tokenizer snapshot"):
+        build_model_cache_manifest(qwen_snapshot)
+
+
+def test_model_cache_validation_rejects_changed_valid_generation_metadata(
+    qwen_snapshot: Path,
+) -> None:
+    """Would fail if manifest validation accepted changed metadata with valid identity fields."""
+    manifest = build_model_cache_manifest(qwen_snapshot)
+    (qwen_snapshot / "generation_config.json").write_text(
+        json.dumps(
+            {
+                "bos_token_id": 151643,
+                "eos_token_id": 151645,
+                "pad_token_id": 151643,
+                "additional_stable_note": "changed bytes",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="model cache file hash mismatch"):
+        validate_model_cache_manifest(qwen_snapshot, manifest)
 
 
 def test_model_cache_validation_rejects_changed_bytes_and_manifest_metadata(

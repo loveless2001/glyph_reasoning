@@ -17,7 +17,10 @@ import uuid
 
 from phase_marker.config import REQUIRED_MODEL_ID
 from phase_marker.io import canonical_json, sha256_json
-from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
+from phase_marker.token_audit import (
+    QWEN25_7B_TOKENIZER_REVISION,
+    validate_pinned_qwen_tokenizer_snapshot,
+)
 
 
 SOURCE_INCLUDE_PATHS = ("phase_marker/**/*.py", "modal_phase_marker.py")
@@ -52,6 +55,21 @@ _MODEL_CACHE_REQUIRED_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
 )
+_PINNED_QWEN_MODEL_METADATA = {
+    "architectures": ["Qwen2ForCausalLM"],
+    "hidden_size": 3584,
+    "intermediate_size": 18944,
+    "model_type": "qwen2",
+    "num_attention_heads": 28,
+    "num_hidden_layers": 28,
+    "num_key_value_heads": 4,
+    "vocab_size": 152064,
+}
+_PINNED_QWEN_GENERATION_METADATA = {
+    "bos_token_id": 151643,
+    "eos_token_id": 151645,
+    "pad_token_id": 151643,
+}
 
 
 class VolumeClient(Protocol):
@@ -583,6 +601,8 @@ def hash_source_tree(repo_root: Path) -> str:
 def build_model_cache_manifest(snapshot: Path) -> ModelCacheManifest:
     """Build an exact, content-addressed manifest for one pinned local Qwen snapshot."""
     root = _pinned_qwen_snapshot_root(snapshot)
+    validate_pinned_qwen_tokenizer_snapshot(root)
+    _validate_pinned_qwen_model_metadata(root)
     paths = _model_cache_paths(root)
     files = tuple(_model_cache_file(root, path) for path in paths)
     manifest = ModelCacheManifest(
@@ -605,6 +625,8 @@ def build_model_cache_manifest(snapshot: Path) -> ModelCacheManifest:
 def validate_model_cache_manifest(snapshot: Path, manifest: ModelCacheManifest) -> None:
     """Fail closed unless manifest metadata and every pinned cache byte still match."""
     root = _pinned_qwen_snapshot_root(snapshot)
+    validate_pinned_qwen_tokenizer_snapshot(root)
+    _validate_pinned_qwen_model_metadata(root)
     _validate_model_cache_manifest_shape(manifest)
     expected_paths = _model_cache_paths(root)
     actual_paths = tuple(item.path for item in manifest.files)
@@ -643,6 +665,28 @@ def _model_cache_paths(snapshot: Path) -> tuple[str, ...]:
     if found_shards != shards:
         raise ValueError("model cache contains unindexed or missing model shards")
     return tuple(sorted((*_MODEL_CACHE_REQUIRED_FILES, *shards)))
+
+
+def _validate_pinned_qwen_model_metadata(snapshot: Path) -> None:
+    config = _read_model_metadata_object(snapshot / "config.json", "model")
+    generation = _read_model_metadata_object(snapshot / "generation_config.json", "generation")
+    if any(config.get(key) != value for key, value in _PINNED_QWEN_MODEL_METADATA.items()):
+        raise ValueError("pinned Qwen model metadata is invalid")
+    if any(
+        generation.get(key) != value
+        for key, value in _PINNED_QWEN_GENERATION_METADATA.items()
+    ):
+        raise ValueError("pinned Qwen generation metadata is invalid")
+
+
+def _read_model_metadata_object(path: Path, kind: str) -> Mapping[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"pinned Qwen {kind} metadata is invalid") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"pinned Qwen {kind} metadata is invalid")
+    return payload
 
 
 def _model_index_shards(snapshot: Path) -> tuple[str, ...]:
