@@ -134,6 +134,10 @@ class VolumeClient(Protocol):
         """Make prior volume writes durable."""
 
 
+class _CachePublicationRollbackError(RuntimeError):
+    """A visible cache publication could not be restored to quarantine."""
+
+
 @dataclass(frozen=True)
 class BundleFile:
     path: str
@@ -768,9 +772,13 @@ def cache_model_to_volume(
             raise ValueError("downloaded snapshot escaped the model cache hub")
         source_manifest = build_model_cache_manifest(resolved_download)
 
-        staged = (
+        staged_model_root = (
             attempt_root
+            / "publication"
             / "models--Qwen--Qwen2.5-7B-Instruct"
+        )
+        staged = (
+            staged_model_root
             / "snapshots"
             / QWEN25_7B_TOKENIZER_REVISION
         )
@@ -783,25 +791,58 @@ def cache_model_to_volume(
         if staged_manifest != source_manifest:
             raise ValueError("staged model cache does not match downloaded bytes")
         validate_model_cache_manifest(staged, staged_manifest)
+        staged_manifest_path = staged.parent / (
+            f"{QWEN25_7B_TOKENIZER_REVISION}.manifest.json"
+        )
+        _write_quarantined_model_cache_manifest(
+            staged_manifest_path, staged_manifest
+        )
+        quarantined_manifest = load_model_cache_manifest(staged_manifest_path)
+        validate_model_cache_manifest(staged, quarantined_manifest)
 
-        canonical.parent.mkdir(parents=True, exist_ok=True)
-        lock = canonical.parent / ".cache-promotion.lock"
+        canonical_model_root = canonical.parents[1]
+        canonical_model_root.parent.mkdir(parents=True, exist_ok=True)
+        lock = canonical_model_root.parent / ".cache-promotion.lock"
+        lock_acquired = False
+        published = False
         try:
             lock.touch(exist_ok=False)
         except FileExistsError as error:
-            raise FileExistsError("canonical model cache promotion is already in progress") from error
+            raise FileExistsError(
+                "canonical model cache promotion is already in progress"
+            ) from error
+        lock_acquired = True
         try:
-            if canonical.exists() or manifest_path.exists():
+            if canonical_model_root.exists() or canonical.exists() or manifest_path.exists():
                 raise FileExistsError("canonical model cache already exists")
-            staged.replace(canonical)
-            with manifest_path.open("x", encoding="utf-8") as handle:
-                handle.write(canonical_json(asdict(staged_manifest)) + "\n")
-        finally:
-            lock.unlink(missing_ok=True)
+            staged_model_root.replace(canonical_model_root)
+            published = True
+            _cache_publication_hook(
+                "after-publication",
+                canonical_model_root=canonical_model_root,
+                attempt_root=attempt_root,
+            )
+            _cache_publication_hook(
+                "during-final-validation",
+                canonical_snapshot=canonical,
+                canonical_manifest=manifest_path,
+            )
+            published_manifest = load_model_cache_manifest(manifest_path)
+            validate_model_cache_manifest(canonical, published_manifest)
+            _release_cache_promotion_lock(lock)
+            lock_acquired = False
+            volume.commit()
+        except Exception as error:
+            _restore_failed_cache_publication(
+                error=error,
+                published=published,
+                canonical_model_root=canonical_model_root,
+                attempt_root=attempt_root,
+                lock=lock,
+                lock_acquired=lock_acquired,
+            )
+            raise
 
-        published_manifest = load_model_cache_manifest(manifest_path)
-        validate_model_cache_manifest(canonical, published_manifest)
-        volume.commit()
         return _model_cache_result(
             canonical, manifest_path, published_manifest, cached=True
         )
@@ -813,13 +854,114 @@ def cache_model_to_volume(
                 attempt_id=attempt_id,
                 error=error,
             )
-            volume.commit()
+            if not isinstance(error, _CachePublicationRollbackError):
+                volume.commit()
         except Exception as persistence_error:
             error.add_note(
                 "cache-model receipt persistence also failed: "
                 f"{type(persistence_error).__name__}: {persistence_error}"
             )
         raise
+
+
+def _write_quarantined_model_cache_manifest(
+    manifest_path: Path, manifest: ModelCacheManifest,
+) -> None:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    if manifest_path.exists():
+        raise FileExistsError("quarantined model cache manifest already exists")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=manifest_path.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(canonical_json(asdict(manifest)) + "\n")
+        _cache_publication_hook(
+            "during-manifest-publication",
+            temporary_manifest=temporary,
+            manifest_path=manifest_path,
+        )
+        os.link(temporary, manifest_path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _rollback_cache_publication(
+    canonical_model_root: Path, rollback_model_root: Path,
+) -> None:
+    rollback_model_root.parent.mkdir(parents=True, exist_ok=True)
+    if rollback_model_root.exists():
+        raise FileExistsError("cache rollback quarantine already exists")
+    canonical_model_root.replace(rollback_model_root)
+    if canonical_model_root.exists():
+        raise OSError("canonical model cache remains visible after rollback")
+
+
+def _release_cache_promotion_lock(lock: Path) -> None:
+    lock.unlink(missing_ok=True)
+
+
+def _quarantine_cache_promotion_lock(lock: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise FileExistsError("failed promotion lock quarantine already exists")
+    lock.replace(destination)
+    if lock.exists():
+        raise OSError("promotion lock remains visible after quarantine")
+
+
+def _restore_failed_cache_publication(
+    *,
+    error: Exception,
+    published: bool,
+    canonical_model_root: Path,
+    attempt_root: Path,
+    lock: Path,
+    lock_acquired: bool,
+) -> None:
+    restoration_errors: list[tuple[str, Exception]] = []
+    if published and canonical_model_root.exists():
+        rollback_model_root = (
+            attempt_root
+            / "rolled-back-publication"
+            / "models--Qwen--Qwen2.5-7B-Instruct"
+        )
+        try:
+            _rollback_cache_publication(
+                canonical_model_root, rollback_model_root
+            )
+        except Exception as rollback_error:
+            restoration_errors.append(("rollback", rollback_error))
+    if lock_acquired and lock.exists():
+        try:
+            _release_cache_promotion_lock(lock)
+        except Exception as release_error:
+            try:
+                _quarantine_cache_promotion_lock(
+                    lock, attempt_root / "failed-promotion.lock"
+                )
+            except Exception as quarantine_error:
+                restoration_errors.append(("lock quarantine", quarantine_error))
+            else:
+                error.add_note(
+                    "promotion lock release failed and was quarantined: "
+                    f"{type(release_error).__name__}: {release_error}"
+                )
+    if restoration_errors:
+        compound = _CachePublicationRollbackError(
+            "cache publication rollback failed; refusing to commit poisoned canonical state"
+        )
+        for kind, restoration_error in restoration_errors:
+            compound.add_note(
+                f"{kind} error: {type(restoration_error).__name__}: {restoration_error}"
+            )
+        raise compound from error
+
+
+def _cache_publication_hook(stage: str, **context: object) -> None:
+    """Injectable local failure boundary; production execution is a no-op."""
 
 
 def _existing_model_cache_result(

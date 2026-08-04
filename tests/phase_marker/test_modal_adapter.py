@@ -129,9 +129,11 @@ class RecordingVolume:
     def __init__(self, files: dict[str, bytes] | None = None) -> None:
         self.files = dict(files or {})
         self.put_calls: list[SimpleNamespace] = []
+        self.events: list[tuple[object, ...]] = []
 
     def listdir(self, path: str, *, recursive: bool = False) -> list[SimpleNamespace]:
         assert recursive is True
+        self.events.append(("listdir", path))
         prefix = path.rstrip("/") + "/"
         return [
             SimpleNamespace(path=remote_path, type="file")
@@ -140,12 +142,14 @@ class RecordingVolume:
         ]
 
     def read_file(self, path: str) -> list[bytes]:
+        self.events.append(("read_file", path))
         if path not in self.files:
             raise FileNotFoundError(path)
         return [self.files[path]]
 
     @contextmanager
     def batch_upload(self) -> object:
+        self.events.append(("batch_upload",))
         pending: list[tuple[str, bytes]] = []
 
         class Batch:
@@ -724,6 +728,132 @@ def test_stage_inputs_requires_budget_and_matching_full_identities(
         assert volume.put_calls == []
 
 
+@pytest.mark.parametrize(
+    ("conflict", "message"),
+    (
+        ("byte", "conflicting remote bundle byte"),
+        ("path", "outside the bundle ID"),
+        ("type", "conflicting remote bundle path"),
+        ("incomplete", "conflicting remote bundle is incomplete"),
+    ),
+)
+def test_stage_entrypoint_conflicts_fail_before_tags_or_writes(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    conflict: str,
+    message: str,
+) -> None:
+    """Would fail if a known remote conflict were discovered only after app tagging."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    expected = _bundle_volume_files(bundle, pilot_repo)
+    if conflict == "byte":
+        files = dict(expected)
+        files[next(iter(files))] = b"wrong bytes"
+        volume = RecordingVolume(files)
+    elif conflict == "incomplete":
+        first_path = next(iter(expected))
+        volume = RecordingVolume({first_path: expected[first_path]})
+    else:
+        volume = RecordingVolume()
+        listed_path = (
+            "/bundles/not-this-bundle/secret"
+            if conflict == "path"
+            else f"/bundles/{bundle.bundle_id}/configs"
+        )
+        volume.listdir = lambda path, recursive=False: [
+            SimpleNamespace(path=listed_path, type="file")
+        ]
+    monkeypatch.setattr(imported_adapter, "inputs_volume", volume)
+    monkeypatch.setattr(
+        imported_adapter, "_build_operator_context", lambda root: (bundle, plan)
+    )
+
+    with pytest.raises((FileExistsError, ValueError), match=message):
+        imported_adapter.stage_inputs(
+            repo_root=str(pilot_repo),
+            approved_run_id=plan.run_id,
+            budget_acknowledged=True,
+        )
+
+    assert imported_adapter.fake_modal.rpc_calls == []
+    assert volume.put_calls == []
+    assert capsys.readouterr().out == ""
+
+
+def test_stage_entrypoint_identical_noop_needs_no_tag_or_upload(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Would fail if proving an identical remote bundle still mutated app or volume state."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume = RecordingVolume(_bundle_volume_files(bundle, pilot_repo))
+    monkeypatch.setattr(imported_adapter, "inputs_volume", volume)
+    monkeypatch.setattr(
+        imported_adapter, "_build_operator_context", lambda root: (bundle, plan)
+    )
+
+    imported_adapter.stage_inputs(
+        repo_root=str(pilot_repo),
+        approved_run_id=plan.run_id,
+        budget_acknowledged=True,
+    )
+
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output[0]["action"] == "no-op"
+    assert output[1] == {"bundle_id": bundle.bundle_id, "uploaded": False}
+    assert imported_adapter.fake_modal.rpc_calls == []
+    assert volume.put_calls == []
+    assert all(event[0] != "batch_upload" for event in volume.events)
+
+
+def test_stage_entrypoint_tags_only_after_read_only_preflight_then_narrow_apply(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Would fail if tagging or upload preceded the complete read-only staging preflight."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    upload_items = tuple(_bundle_volume_files(bundle, pilot_repo).items())
+    volume = RecordingVolume()
+
+    def tag(approved_plan: object) -> None:
+        assert approved_plan is plan
+        volume.events.append(("tags",))
+
+    monkeypatch.setattr(
+        imported_adapter, "_build_operator_context", lambda root: (bundle, plan)
+    )
+    monkeypatch.setattr(imported_adapter, "inputs_volume", volume)
+    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tag)
+
+    imported_adapter.stage_inputs(
+        repo_root=str(pilot_repo),
+        approved_run_id=plan.run_id,
+        budget_acknowledged=True,
+    )
+
+    assert [event[0] for event in volume.events] == ["listdir", "tags", "batch_upload"]
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output[0]["action"] == "upload"
+    assert output[0]["remote_files"] == [
+        {
+            "path": path,
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        for path, content in upload_items
+    ]
+    assert output[1] == {"bundle_id": bundle.bundle_id, "uploaded": True}
+
+
 def _write_smoke_model_cache(model_root: Path) -> tuple[Path, Path]:
     snapshot = (
         model_root / "canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots"
@@ -908,10 +1038,19 @@ def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
     plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
     monkeypatch.setattr(imported_adapter, "_build_operator_context", lambda root: (bundle, plan))
     boundaries: list[tuple[str, object]] = []
+    upload_items = tuple(_bundle_volume_files(bundle, pilot_repo).items())
+    staging_plan = imported_adapter.InputStagingPlan(
+        bundle_id=bundle.bundle_id,
+        bundle_root=f"/bundles/{bundle.bundle_id}",
+        upload_items=upload_items,
+        upload_required=True,
+    )
 
-    def stage_boundary(*args: object, **kwargs: object) -> dict[str, object]:
+    def stage_boundary(preflight_plan: object, volume: object) -> dict[str, object]:
         assert imported_adapter.fake_modal.rpc_calls[-1][0] == "set_tags"
-        boundaries.append(("stage-inputs", kwargs))
+        assert preflight_plan is staging_plan
+        assert volume is imported_adapter.inputs_volume
+        boundaries.append(("stage-inputs", preflight_plan))
         return {"bundle_id": bundle.bundle_id, "uploaded": True}
 
     class RemoteBoundary:
@@ -924,7 +1063,12 @@ def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
             boundaries.append((self.name, payload))
             return self.result
 
-    monkeypatch.setattr(imported_adapter, "stage_inputs_local", stage_boundary)
+    monkeypatch.setattr(
+        imported_adapter,
+        "preflight_inputs_local",
+        lambda *args, **kwargs: staging_plan,
+    )
+    monkeypatch.setattr(imported_adapter, "_apply_input_staging_plan", stage_boundary)
     monkeypatch.setattr(
         imported_adapter,
         "cache_model_remote",
@@ -947,10 +1091,19 @@ def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
     stage_output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert stage_output[0] == {
         "operation": "stage-inputs",
+        "action": "upload",
         "run_id": plan.run_id,
         "bundle_id": bundle.bundle_id,
         "file_count": len(bundle.files) + 1,
         "destination": f"{imported_adapter.VOLUME_NAMES[0]}:/bundles/{bundle.bundle_id}",
+        "remote_files": [
+            {
+                "path": path,
+                "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+            for path, content in upload_items
+        ],
         "budget_acknowledged_usd": 1_000.0,
     }
 

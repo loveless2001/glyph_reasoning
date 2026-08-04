@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import io
 from pathlib import Path, PurePosixPath
 import shlex
@@ -79,6 +79,16 @@ class RemoteFunction(Protocol):
 
     def remote(self, *args: object, **kwargs: object) -> object:
         """Invoke the declared function remotely."""
+
+
+@dataclass(frozen=True)
+class InputStagingPlan:
+    """Immutable result of local-byte and current remote-state staging preflight."""
+
+    bundle_id: str
+    bundle_root: str
+    upload_items: tuple[tuple[str, bytes], ...]
+    upload_required: bool
 
 
 app = modal.App(
@@ -194,7 +204,26 @@ def stage_inputs_local(
     plan: PilotPlan,
     budget_acknowledged: bool,
 ) -> dict[str, object]:
-    """Upload exactly one approved bundle, or prove its remote bytes are identical."""
+    """Compose the read-only staging preflight and narrow upload apply boundary."""
+    staging_plan = preflight_inputs_local(
+        bundle,
+        volume,
+        approved_run_id=approved_run_id,
+        plan=plan,
+        budget_acknowledged=budget_acknowledged,
+    )
+    return _apply_input_staging_plan(staging_plan, volume)
+
+
+def preflight_inputs_local(
+    bundle: InputBundle,
+    volume: VolumeClient,
+    *,
+    approved_run_id: str,
+    plan: PilotPlan,
+    budget_acknowledged: bool,
+) -> InputStagingPlan:
+    """Validate local identity and all current remote state without writing."""
     _validate_operator_approval(
         approved_run_id=approved_run_id,
         plan=plan,
@@ -227,12 +256,32 @@ def stage_inputs_local(
             actual = b"".join(volume.read_file(remote_path))
             if actual != expected:
                 raise FileExistsError(f"conflicting remote bundle byte: {remote_path}")
-        return {"bundle_id": bundle.bundle_id, "uploaded": False}
+        return InputStagingPlan(
+            bundle_id=bundle.bundle_id,
+            bundle_root=bundle_root,
+            upload_items=tuple(upload_bytes.items()),
+            upload_required=False,
+        )
 
+    return InputStagingPlan(
+        bundle_id=bundle.bundle_id,
+        bundle_root=bundle_root,
+        upload_items=tuple(upload_bytes.items()),
+        upload_required=True,
+    )
+
+
+def _apply_input_staging_plan(
+    staging_plan: InputStagingPlan, volume: VolumeClient,
+) -> dict[str, object]:
+    if not isinstance(staging_plan, InputStagingPlan):
+        raise TypeError("input staging apply requires an immutable preflight plan")
+    if not staging_plan.upload_required:
+        return {"bundle_id": staging_plan.bundle_id, "uploaded": False}
     with volume.batch_upload() as batch:
-        for remote_path, content in upload_bytes.items():
+        for remote_path, content in staging_plan.upload_items:
             batch.put_file(io.BytesIO(content), remote_path)
-    return {"bundle_id": bundle.bundle_id, "uploaded": True}
+    return {"bundle_id": staging_plan.bundle_id, "uploaded": True}
 
 
 @app.local_entrypoint()
@@ -259,22 +308,19 @@ def stage_inputs(
         plan=plan,
         budget_acknowledged=budget_acknowledged,
     )
-    print(canonical_json({
-        "operation": "stage-inputs",
-        "run_id": plan.run_id,
-        "bundle_id": bundle.bundle_id,
-        "file_count": len(bundle.files) + 1,
-        "destination": f"{VOLUME_NAMES[0]}:/bundles/{bundle.bundle_id}",
-        "budget_acknowledged_usd": 1_000.0,
-    }))
-    apply_approved_app_tags(plan)
-    result = stage_inputs_local(
+    staging_plan = preflight_inputs_local(
         bundle,
         inputs_volume,
         approved_run_id=approved_run_id,
         plan=plan,
         budget_acknowledged=budget_acknowledged,
     )
+    print(canonical_json(_staging_plan_payload(staging_plan, plan)))
+    if not staging_plan.upload_required:
+        print(canonical_json({"bundle_id": bundle.bundle_id, "uploaded": False}))
+        return
+    apply_approved_app_tags(plan)
+    result = _apply_input_staging_plan(staging_plan, inputs_volume)
     print(canonical_json(result))
 
 
@@ -370,6 +416,28 @@ def _print_remote_result(result: object) -> None:
     if not isinstance(result, dict):
         raise TypeError("remote boundary returned a non-object result")
     print(canonical_json(result))
+
+
+def _staging_plan_payload(
+    staging_plan: InputStagingPlan, plan: PilotPlan,
+) -> dict[str, object]:
+    return {
+        "operation": "stage-inputs",
+        "action": "upload" if staging_plan.upload_required else "no-op",
+        "run_id": plan.run_id,
+        "bundle_id": staging_plan.bundle_id,
+        "file_count": len(staging_plan.upload_items),
+        "destination": f"{VOLUME_NAMES[0]}:{staging_plan.bundle_root}",
+        "remote_files": [
+            {
+                "path": remote_path,
+                "size": len(content),
+                "sha256": _sha256_bytes(content),
+            }
+            for remote_path, content in staging_plan.upload_items
+        ],
+        "budget_acknowledged_usd": 1_000.0,
+    }
 
 
 def _validate_tag_plan(plan: PilotPlan) -> None:

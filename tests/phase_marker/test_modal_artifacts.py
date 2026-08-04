@@ -62,6 +62,20 @@ class FailingCommitVolume(CommitVolume):
         raise RuntimeError("simulated receipt commit failure")
 
 
+class FailFirstCommitVolume(CommitVolume):
+    def commit(self) -> None:
+        self.commit_count += 1
+        if self.commit_count == 1:
+            raise RuntimeError("injected first commit failure")
+
+
+class FailFirstCommitWithFileExistsVolume(CommitVolume):
+    def commit(self) -> None:
+        self.commit_count += 1
+        if self.commit_count == 1:
+            raise FileExistsError("injected first commit file-exists failure")
+
+
 def _pinned_qwen_model_config() -> dict[str, object]:
     return {
         "architectures": ["Qwen2ForCausalLM"],
@@ -416,6 +430,191 @@ def test_cache_model_downloads_pinned_revision_validates_then_promotes_once(
     assert result["artifact_id"] == modal_artifacts.load_model_cache_manifest(
         manifest_path
     ).artifact_id
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("during-manifest-publication", "after-publication", "during-final-validation"),
+)
+def test_cache_publication_failure_rolls_back_before_durable_receipt(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    """Would fail if any publication failure could durably poison canonical cache state."""
+    cache_root = tmp_path / "model-cache"
+    _install_fake_snapshot_download(monkeypatch, qwen_snapshot, [])
+
+    def inject(stage: str, **context: object) -> None:
+        if stage == failure_stage:
+            raise RuntimeError(f"injected {failure_stage} failure")
+
+    monkeypatch.setattr(
+        modal_artifacts, "_cache_publication_hook", inject, raising=False
+    )
+    volume = CommitVolume()
+
+    with pytest.raises(RuntimeError, match=f"injected {failure_stage} failure"):
+        modal_artifacts.cache_model_to_volume(
+            plan_payload=_cache_plan_payload(repo_fixture),
+            cache_root=cache_root,
+            volume=volume,
+        )
+
+    canonical_model = cache_root / "canonical/models--Qwen--Qwen2.5-7B-Instruct"
+    canonical_snapshot = canonical_model / "snapshots" / QWEN25_7B_TOKENIZER_REVISION
+    canonical_manifest = canonical_snapshot.parent / (
+        f"{QWEN25_7B_TOKENIZER_REVISION}.manifest.json"
+    )
+    assert not canonical_model.exists()
+    assert not canonical_snapshot.exists()
+    assert not canonical_manifest.exists()
+    attempt_roots = list(cache_root.glob("attempts/cache-model/*"))
+    assert len(attempt_roots) == 1
+    assert list(attempt_roots[0].rglob("config.json"))
+    receipts = list(attempt_roots[0].glob("receipt.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipt["validated"] is False
+    assert f"injected {failure_stage} failure" in receipt["failure_reason"]
+    assert volume.commit_count == 1
+
+
+def test_cache_rollback_failure_never_commits_poisoned_canonical_state(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a failed rollback committed visible canonical bytes or hid the cause."""
+    cache_root = tmp_path / "model-cache"
+    _install_fake_snapshot_download(monkeypatch, qwen_snapshot, [])
+
+    def inject(stage: str, **context: object) -> None:
+        if stage == "after-publication":
+            raise RuntimeError("injected post-publication failure")
+
+    def fail_rollback(*args: object, **kwargs: object) -> None:
+        raise OSError("injected rollback failure")
+
+    monkeypatch.setattr(
+        modal_artifacts, "_cache_publication_hook", inject, raising=False
+    )
+    monkeypatch.setattr(
+        modal_artifacts, "_rollback_cache_publication", fail_rollback, raising=False
+    )
+    volume = CommitVolume()
+
+    with pytest.raises(RuntimeError, match="rollback failed") as raised:
+        modal_artifacts.cache_model_to_volume(
+            plan_payload=_cache_plan_payload(repo_fixture),
+            cache_root=cache_root,
+            volume=volume,
+        )
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert "post-publication" in str(raised.value.__cause__)
+    assert any("injected rollback failure" in note for note in raised.value.__notes__)
+    assert (
+        cache_root / "canonical/models--Qwen--Qwen2.5-7B-Instruct"
+    ).exists()
+    assert volume.commit_count == 0
+
+
+def test_cache_lock_cleanup_failure_rolls_back_and_quarantines_lock(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if lock cleanup escaped rollback or left a durable stale lock."""
+    cache_root = tmp_path / "model-cache"
+    _install_fake_snapshot_download(monkeypatch, qwen_snapshot, [])
+    monkeypatch.setattr(
+        modal_artifacts,
+        "_release_cache_promotion_lock",
+        lambda path: (_ for _ in ()).throw(OSError("injected lock cleanup failure")),
+        raising=False,
+    )
+    volume = CommitVolume()
+
+    with pytest.raises(OSError, match="injected lock cleanup failure"):
+        modal_artifacts.cache_model_to_volume(
+            plan_payload=_cache_plan_payload(repo_fixture),
+            cache_root=cache_root,
+            volume=volume,
+        )
+
+    assert not (
+        cache_root / "canonical/models--Qwen--Qwen2.5-7B-Instruct"
+    ).exists()
+    assert not (cache_root / "canonical/.cache-promotion.lock").exists()
+    attempt_roots = list(cache_root.glob("attempts/cache-model/*"))
+    assert len(attempt_roots) == 1
+    assert list(attempt_roots[0].rglob("config.json"))
+    assert (attempt_roots[0] / "failed-promotion.lock").is_file()
+    assert (attempt_roots[0] / "receipt.json").is_file()
+    assert volume.commit_count == 1
+
+
+def test_cache_first_commit_failure_rolls_back_before_receipt_commit(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if retrying a failed commit durably published canonical cache bytes."""
+    cache_root = tmp_path / "model-cache"
+    _install_fake_snapshot_download(monkeypatch, qwen_snapshot, [])
+    volume = FailFirstCommitVolume()
+
+    with pytest.raises(RuntimeError, match="injected first commit failure"):
+        modal_artifacts.cache_model_to_volume(
+            plan_payload=_cache_plan_payload(repo_fixture),
+            cache_root=cache_root,
+            volume=volume,
+        )
+
+    assert not (
+        cache_root / "canonical/models--Qwen--Qwen2.5-7B-Instruct"
+    ).exists()
+    attempt_roots = list(cache_root.glob("attempts/cache-model/*"))
+    assert len(attempt_roots) == 1
+    assert list(attempt_roots[0].rglob("config.json"))
+    assert (attempt_roots[0] / "receipt.json").is_file()
+    assert volume.commit_count == 2
+
+
+def test_cache_first_commit_file_exists_rolls_back_before_receipt_commit(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if commit FileExistsError were mistaken for lock contention."""
+    cache_root = tmp_path / "model-cache"
+    _install_fake_snapshot_download(monkeypatch, qwen_snapshot, [])
+    volume = FailFirstCommitWithFileExistsVolume()
+
+    with pytest.raises(
+        FileExistsError, match="injected first commit file-exists failure"
+    ):
+        modal_artifacts.cache_model_to_volume(
+            plan_payload=_cache_plan_payload(repo_fixture),
+            cache_root=cache_root,
+            volume=volume,
+        )
+
+    assert not (
+        cache_root / "canonical/models--Qwen--Qwen2.5-7B-Instruct"
+    ).exists()
+    attempt_roots = list(cache_root.glob("attempts/cache-model/*"))
+    assert len(attempt_roots) == 1
+    assert list(attempt_roots[0].rglob("config.json"))
+    assert (attempt_roots[0] / "receipt.json").is_file()
+    assert volume.commit_count == 2
 
 
 def test_cache_model_identical_repeat_is_noop_and_conflict_never_overwrites(
