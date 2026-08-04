@@ -97,14 +97,20 @@ class OfflineDatasetLoader:
                 if dataset_id == MATH_DATASET[0] and config == MATH_DATASET[1]
                 else (config,)
             )
+            splits = (
+                ("train", "test")
+                if dataset_id == SVAMP_DATASET[0] and split == "all"
+                else (split,)
+            )
             download_config = datasets.DownloadConfig(local_files_only=True)
             rows = tuple(
                 dict(row)
                 for resolved_config in configs
+                for resolved_split in splits
                 for row in datasets.load_dataset(
                     dataset_id,
                     resolved_config,
-                    split=split,
+                    split=resolved_split,
                     revision=revision,
                     download_config=download_config,
                 )
@@ -260,7 +266,7 @@ def _load_official_rows(
     gsm_test = _examples_from_rows(
         "gsm8k", "test", _load_spec(loader, gsm_test_spec)
     )
-    svamp_spec = specs[("svamp", "train")]
+    svamp_spec = specs[("svamp", "all")]
     svamp_test = _examples_from_rows(
         "svamp", "test", _load_spec(loader, svamp_spec)
     )
@@ -458,7 +464,7 @@ def _dataset_specs(
     return (
         _dataset_spec("gsm8k", GSM8K_DATASET[0], GSM8K_DATASET[1], "train", gsm8k_revision),
         _dataset_spec("gsm8k", GSM8K_DATASET[0], GSM8K_DATASET[1], "test", gsm8k_revision),
-        _dataset_spec("svamp", SVAMP_DATASET[0], SVAMP_DATASET[1], "train", svamp_revision),
+        _dataset_spec("svamp", SVAMP_DATASET[0], SVAMP_DATASET[1], "all", svamp_revision),
         _dataset_spec("math", MATH_DATASET[0], MATH_DATASET[1], "train", math_revision),
         _dataset_spec("math", MATH_DATASET[0], MATH_DATASET[1], "test", math_revision),
     )
@@ -494,7 +500,7 @@ def _validate_frozen_dataset_specs(
     expected = {
         ("gsm8k", "gsm8k", "main", "train"),
         ("gsm8k", "gsm8k", "main", "test"),
-        ("svamp", "ChilleD/SVAMP", None, "train"),
+        ("svamp", "ChilleD/SVAMP", None, "all"),
         ("math", "EleutherAI/hendrycks_math", "all", "train"),
         ("math", "EleutherAI/hendrycks_math", "all", "test"),
     }

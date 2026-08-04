@@ -118,7 +118,7 @@ def fake_loader() -> InMemoryLoader:
         {
             ("gsm8k", "main", "train"): gsm_train,
             ("gsm8k", "main", "test"): [{"question": "gsm official test", "answer": "#### 4"}],
-            ("ChilleD/SVAMP", None, "train"): svamp,
+            ("ChilleD/SVAMP", None, "all"): svamp,
             ("EleutherAI/hendrycks_math", "all", "train"): math_train,
             ("EleutherAI/hendrycks_math", "all", "test"): [
                 {"problem": "math official test", "solution": "\\boxed{5}"}
@@ -237,6 +237,70 @@ def test_offline_loader_keeps_non_math_all_requests_to_one_call(monkeypatch):
     assert calls[0][0:2] == ("gsm8k", "main")
 
 
+def test_offline_loader_concatenates_all_pinned_svamp_rows_in_split_order(monkeypatch):
+    revision = "d" * 40
+    calls = []
+
+    def load_dataset(dataset_id, config, **kwargs):
+        calls.append(
+            (
+                dataset_id,
+                config,
+                kwargs["split"],
+                kwargs["revision"],
+                kwargs["download_config"],
+            )
+        )
+        count = 700 if kwargs["split"] == "train" else 300
+        return tuple(
+            {"ID": f"{kwargs['split']}-{index}"}
+            for index in range(count)
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "datasets",
+        SimpleNamespace(DownloadConfig=FakeDownloadConfig, load_dataset=load_dataset),
+    )
+
+    rows = OfflineDatasetLoader().load("ChilleD/SVAMP", None, "all", revision)
+
+    assert [(dataset_id, config, split, pinned_revision) for dataset_id, config, split, pinned_revision, _ in calls] == [
+        ("ChilleD/SVAMP", None, "train", revision),
+        ("ChilleD/SVAMP", None, "test", revision),
+    ]
+    assert calls[0][4] is calls[1][4]
+    assert calls[0][4].local_files_only is True
+    assert len(rows) == 1000
+    assert [row["ID"] for row in rows[:2]] == ["train-0", "train-1"]
+    assert [row["ID"] for row in rows[698:702]] == [
+        "train-698",
+        "train-699",
+        "test-0",
+        "test-1",
+    ]
+    assert rows[-1]["ID"] == "test-299"
+
+
+def test_offline_loader_normalizes_svamp_constituent_failure(monkeypatch):
+    revision = "e" * 40
+
+    def load_dataset(dataset_id, config, **kwargs):
+        del dataset_id, config
+        if kwargs["split"] == "test":
+            raise FileNotFoundError("test split not cached")
+        return ({"ID": "train-0"},)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "datasets",
+        SimpleNamespace(DownloadConfig=FakeDownloadConfig, load_dataset=load_dataset),
+    )
+
+    with pytest.raises(DatasetCacheMiss, match=rf"ChilleD/SVAMP@{revision}"):
+        OfflineDatasetLoader().load("ChilleD/SVAMP", None, "all", revision)
+
+
 def test_offline_loader_normalizes_math_config_failure(monkeypatch):
     def load_dataset(dataset_id, config, **kwargs):
         del dataset_id, kwargs
@@ -309,7 +373,7 @@ def test_frozen_publication_requires_immutable_dataset_specs_and_complete_input_
     mutable_specs = (
         {"source": "gsm8k", "dataset_id": "gsm8k", "config": "main", "requested_split": "train", "revision": "main"},
         {"source": "gsm8k", "dataset_id": "gsm8k", "config": "main", "requested_split": "test", "revision": "main"},
-        {"source": "svamp", "dataset_id": "ChilleD/SVAMP", "config": None, "requested_split": "train", "revision": "main"},
+        {"source": "svamp", "dataset_id": "ChilleD/SVAMP", "config": None, "requested_split": "all", "revision": "main"},
         {"source": "math", "dataset_id": "EleutherAI/hendrycks_math", "config": "all", "requested_split": "train", "revision": "main"},
         {"source": "math", "dataset_id": "EleutherAI/hendrycks_math", "config": "all", "requested_split": "test", "revision": "main"},
     )
@@ -395,7 +459,7 @@ def test_frozen_publication_rejects_parse_exclusion_provenance_mismatch(tmp_path
     frozen_specs = (
         {"source": "gsm8k", "dataset_id": "gsm8k", "config": "main", "requested_split": "train", "revision": "a" * 40},
         {"source": "gsm8k", "dataset_id": "gsm8k", "config": "main", "requested_split": "test", "revision": "a" * 40},
-        {"source": "svamp", "dataset_id": "ChilleD/SVAMP", "config": None, "requested_split": "train", "revision": "a" * 40},
+        {"source": "svamp", "dataset_id": "ChilleD/SVAMP", "config": None, "requested_split": "all", "revision": "a" * 40},
         {"source": "math", "dataset_id": "EleutherAI/hendrycks_math", "config": "all", "requested_split": "train", "revision": "a" * 40},
         {"source": "math", "dataset_id": "EleutherAI/hendrycks_math", "config": "all", "requested_split": "test", "revision": "a" * 40},
     )
