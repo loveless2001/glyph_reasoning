@@ -339,21 +339,40 @@ def _pinned_tokenizer_snapshot_path(model_id: str) -> Path:
     )
 
 
+def _is_json_object(path: Path, *, require_nonempty: bool) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, Mapping) and (not require_nonempty or bool(payload))
+
+
+def _is_nonempty_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def _load_cached_tokenizer(model_id: str) -> object:
     snapshot = _pinned_tokenizer_snapshot_path(model_id)
     if not snapshot.is_dir():
         raise FileNotFoundError(f"missing pinned tokenizer snapshot directory: {snapshot}")
     tokenizer_config = snapshot / "tokenizer_config.json"
-    standalone_assets = tuple(
-        snapshot / name for name in ("tokenizer.json", "tokenizer.model", "spiece.model")
+    standalone_assets_valid = _is_json_object(
+        snapshot / "tokenizer.json", require_nonempty=True
+    ) or any(
+        _is_nonempty_file(snapshot / name)
+        for name in ("tokenizer.model", "spiece.model")
     )
-    split_assets = (snapshot / "vocab.json", snapshot / "merges.txt")
+    split_assets_valid = _is_json_object(
+        snapshot / "vocab.json", require_nonempty=True
+    ) and _is_nonempty_file(snapshot / "merges.txt")
     if (
-        not tokenizer_config.is_file()
-        or not (
-            any(path.is_file() for path in standalone_assets)
-            or all(path.is_file() for path in split_assets)
-        )
+        not _is_json_object(tokenizer_config, require_nonempty=False)
+        or not (standalone_assets_valid or split_assets_valid)
     ):
         raise FileNotFoundError(f"pinned tokenizer snapshot lacks config/assets: {snapshot}")
     from transformers import AutoTokenizer
