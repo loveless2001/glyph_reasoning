@@ -152,9 +152,95 @@ def test_manifest_binds_the_resolved_cached_qwen_revision(
     assert manifests["dot"].metadata["tokenizer_revision"] == QWEN25_7B_TOKENIZER_REVISION
 
 
-@pytest.mark.parametrize("asset_family", ("standalone-json", "split-vocab"))
+def _qwen_tokenizer_snapshot_payloads(
+    tokenizer_class: str = "Qwen2Tokenizer",
+) -> tuple[dict[str, object], dict[str, object]]:
+    return (
+        {
+            "tokenizer_class": tokenizer_class,
+            "chat_template": (
+                "{% for message in messages %}"
+                "{{ message['role'] + ': ' + message['content'] }}"
+                "{% endfor %}"
+            ),
+            "model_max_length": 131072,
+        },
+        {
+            "version": "1.0",
+            "added_tokens": [
+                {
+                    "id": 0,
+                    "content": "<|endoftext|>",
+                    "single_word": False,
+                    "lstrip": False,
+                    "rstrip": False,
+                    "normalized": False,
+                    "special": True,
+                }
+            ],
+            "normalizer": {"type": "NFC"},
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": []},
+            "post_processor": {
+                "type": "ByteLevel",
+                "add_prefix_space": False,
+                "trim_offsets": False,
+                "use_regex": False,
+            },
+            "decoder": {
+                "type": "ByteLevel",
+                "add_prefix_space": False,
+                "trim_offsets": False,
+                "use_regex": False,
+            },
+            "model": {
+                "type": "BPE",
+                "dropout": None,
+                "unk_token": None,
+                "continuing_subword_prefix": "",
+                "end_of_word_suffix": "",
+                "fuse_unk": False,
+                "byte_fallback": False,
+                "vocab": {"<|endoftext|>": 0, "t": 1, "o": 2, "to": 3},
+                "merges": ["t o"],
+            },
+        },
+    )
+
+
+def _write_qwen_tokenizer_snapshot(
+    snapshot: Path,
+    *,
+    tokenizer_class: str = "Qwen2Tokenizer",
+    null_components: bool = False,
+) -> None:
+    config_payload, tokenizer_payload = _qwen_tokenizer_snapshot_payloads(
+        tokenizer_class
+    )
+    if null_components:
+        for key in ("normalizer", "pre_tokenizer", "post_processor", "decoder"):
+            tokenizer_payload[key] = None
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer_config.json").write_text(
+        json.dumps(config_payload), encoding="utf-8"
+    )
+    (snapshot / "tokenizer.json").write_text(
+        json.dumps(tokenizer_payload), encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokenizer_class", "null_components"),
+    (
+        ("Qwen2Tokenizer", False),
+        ("Qwen2TokenizerFast", False),
+        ("Qwen2Tokenizer", True),
+    ),
+)
 def test_cached_tokenizer_loader_uses_exact_filesystem_snapshot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, asset_family: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tokenizer_class: str,
+    null_components: bool,
 ):
     snapshot = (
         tmp_path
@@ -162,19 +248,11 @@ def test_cached_tokenizer_loader_uses_exact_filesystem_snapshot(
         / "snapshots"
         / QWEN25_7B_TOKENIZER_REVISION
     )
-    snapshot.mkdir(parents=True)
-    (snapshot / "tokenizer_config.json").write_text("{}\n", encoding="utf-8")
-    if asset_family == "standalone-json":
-        (snapshot / "tokenizer.json").write_text(
-            '{"model": {}}\n', encoding="utf-8"
-        )
-    else:
-        (snapshot / "vocab.json").write_text(
-            '{"token": 0}\n', encoding="utf-8"
-        )
-        (snapshot / "merges.txt").write_text(
-            "#version: 0.2\nt o\n", encoding="utf-8"
-        )
+    _write_qwen_tokenizer_snapshot(
+        snapshot,
+        tokenizer_class=tokenizer_class,
+        null_components=null_components,
+    )
     calls: list[tuple[object, dict[str, object]]] = []
     sentinel = object()
     transformers = ModuleType("transformers")
@@ -205,10 +283,114 @@ def test_cached_tokenizer_loader_rejects_incomplete_snapshot_before_transformers
     )
     if snapshot_state != "missing":
         snapshot.mkdir(parents=True)
+    config_payload, tokenizer_payload = _qwen_tokenizer_snapshot_payloads()
     if snapshot_state == "missing-config":
-        (snapshot / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+        (snapshot / "tokenizer.json").write_text(
+            json.dumps(tokenizer_payload), encoding="utf-8"
+        )
     elif snapshot_state == "missing-assets":
-        (snapshot / "tokenizer_config.json").write_text("{}\n", encoding="utf-8")
+        (snapshot / "tokenizer_config.json").write_text(
+            json.dumps(config_payload), encoding="utf-8"
+        )
+    transformers = ModuleType("transformers")
+    transformers.AutoTokenizer = SimpleNamespace(  # type: ignore[attr-defined]
+        from_pretrained=lambda *_args, **_kwargs: pytest.fail(
+            "transformers loader was called"
+        )
+    )
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+
+    with pytest.raises(FileNotFoundError, match="pinned tokenizer snapshot"):
+        _load_cached_tokenizer("Qwen/Qwen2.5-7B-Instruct")
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    ("document", "field_path", "bad_value"),
+    (
+        ("config", (), {}),
+        ("config", ("tokenizer_class",), _MISSING),
+        ("config", ("tokenizer_class",), ""),
+        ("config", ("tokenizer_class",), "GPT2TokenizerFast"),
+        ("config", ("tokenizer_class",), 7),
+        ("config", ("chat_template",), _MISSING),
+        ("config", ("chat_template",), ""),
+        ("config", ("chat_template",), []),
+        ("config", ("model_max_length",), _MISSING),
+        ("config", ("model_max_length",), 0),
+        ("config", ("model_max_length",), 32768),
+        ("config", ("model_max_length",), "131072"),
+        ("config", ("model_max_length",), True),
+        ("tokenizer", (), {}),
+        ("tokenizer", (), {"model": {}}),
+        ("tokenizer", ("version",), _MISSING),
+        ("tokenizer", ("version",), ""),
+        ("tokenizer", ("version",), "2.0"),
+        ("tokenizer", ("version",), 1.0),
+        ("tokenizer", ("added_tokens",), _MISSING),
+        ("tokenizer", ("added_tokens",), {}),
+        ("tokenizer", ("model",), _MISSING),
+        ("tokenizer", ("model",), []),
+        ("tokenizer", ("model", "type"), _MISSING),
+        ("tokenizer", ("model", "type"), "WordPiece"),
+        ("tokenizer", ("model", "vocab"), _MISSING),
+        ("tokenizer", ("model", "vocab"), {}),
+        ("tokenizer", ("model", "vocab"), []),
+        ("tokenizer", ("model", "merges"), _MISSING),
+        ("tokenizer", ("model", "merges"), []),
+        ("tokenizer", ("model", "merges"), {}),
+        ("tokenizer", ("normalizer",), _MISSING),
+        ("tokenizer", ("normalizer",), []),
+        ("tokenizer", ("pre_tokenizer",), _MISSING),
+        ("tokenizer", ("pre_tokenizer",), []),
+        ("tokenizer", ("post_processor",), _MISSING),
+        ("tokenizer", ("post_processor",), []),
+        ("tokenizer", ("decoder",), _MISSING),
+        ("tokenizer", ("decoder",), []),
+    ),
+    ids=lambda value: "missing" if value is _MISSING else str(value),
+)
+def test_cached_tokenizer_loader_rejects_invalid_qwen_schema_before_transformers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    document: str,
+    field_path: tuple[str, ...],
+    bad_value: object,
+):
+    snapshot = (
+        tmp_path
+        / "models--Qwen--Qwen2.5-7B-Instruct"
+        / "snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+    config_payload, tokenizer_payload = _qwen_tokenizer_snapshot_payloads()
+    selected_payload = config_payload if document == "config" else tokenizer_payload
+    if not field_path:
+        selected_payload = bad_value  # type: ignore[assignment]
+        if document == "config":
+            config_payload = selected_payload  # type: ignore[assignment]
+        else:
+            tokenizer_payload = selected_payload  # type: ignore[assignment]
+    else:
+        parent = selected_payload
+        for field in field_path[:-1]:
+            nested = parent[field]
+            assert isinstance(nested, dict)
+            parent = nested
+        if bad_value is _MISSING:
+            del parent[field_path[-1]]
+        else:
+            parent[field_path[-1]] = bad_value
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer_config.json").write_text(
+        json.dumps(config_payload), encoding="utf-8"
+    )
+    (snapshot / "tokenizer.json").write_text(
+        json.dumps(tokenizer_payload), encoding="utf-8"
+    )
     transformers = ModuleType("transformers")
     transformers.AutoTokenizer = SimpleNamespace(  # type: ignore[attr-defined]
         from_pretrained=lambda *_args, **_kwargs: pytest.fail(
@@ -223,55 +405,21 @@ def test_cached_tokenizer_loader_rejects_incomplete_snapshot_before_transformers
 
 
 @pytest.mark.parametrize(
-    ("config_content", "asset_contents"),
+    ("document", "bad_content"),
     (
-        ("", {"tokenizer.json": '{"model": {}}'}),
-        ("not-json", {"tokenizer.json": '{"model": {}}'}),
-        ("[]", {"tokenizer.json": '{"model": {}}'}),
-        ("{}", {"tokenizer.json": ""}),
-        ("{}", {"tokenizer.json": "not-json"}),
-        ("{}", {"tokenizer.json": "[]"}),
-        ("{}", {"tokenizer.json": "{}"}),
-        ("{}", {"tokenizer.model": b""}),
-        ("{}", {"spiece.model": b""}),
-        (
-            "{}",
-            {"vocab.json": "not-json", "merges.txt": "#version: 0.2"},
-        ),
-        (
-            "{}",
-            {"vocab.json": "[]", "merges.txt": "#version: 0.2"},
-        ),
-        (
-            "{}",
-            {"vocab.json": "{}", "merges.txt": "#version: 0.2"},
-        ),
-        (
-            "{}",
-            {"vocab.json": '{"token": 0}', "merges.txt": ""},
-        ),
-    ),
-    ids=(
-        "empty-config",
-        "invalid-config",
-        "non-object-config",
-        "empty-tokenizer-json",
-        "invalid-tokenizer-json",
-        "non-object-tokenizer-json",
-        "empty-object-tokenizer-json",
-        "empty-tokenizer-model",
-        "empty-spiece-model",
-        "invalid-vocab-json",
-        "non-object-vocab-json",
-        "empty-object-vocab-json",
-        "empty-merges",
+        ("config", ""),
+        ("config", "not-json"),
+        ("config", "[]"),
+        ("tokenizer", ""),
+        ("tokenizer", "not-json"),
+        ("tokenizer", "[]"),
     ),
 )
-def test_cached_tokenizer_loader_rejects_malformed_assets_before_transformers(
+def test_cached_tokenizer_loader_rejects_non_object_json_before_transformers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    config_content: str,
-    asset_contents: dict[str, str | bytes],
+    document: str,
+    bad_content: str,
 ):
     snapshot = (
         tmp_path
@@ -279,16 +427,9 @@ def test_cached_tokenizer_loader_rejects_malformed_assets_before_transformers(
         / "snapshots"
         / QWEN25_7B_TOKENIZER_REVISION
     )
-    snapshot.mkdir(parents=True)
-    (snapshot / "tokenizer_config.json").write_text(
-        config_content, encoding="utf-8"
-    )
-    for name, content in asset_contents.items():
-        path = snapshot / name
-        if isinstance(content, bytes):
-            path.write_bytes(content)
-        else:
-            path.write_text(content, encoding="utf-8")
+    _write_qwen_tokenizer_snapshot(snapshot)
+    filename = "tokenizer_config.json" if document == "config" else "tokenizer.json"
+    (snapshot / filename).write_text(bad_content, encoding="utf-8")
     transformers = ModuleType("transformers")
     transformers.AutoTokenizer = SimpleNamespace(  # type: ignore[attr-defined]
         from_pretrained=lambda *_args, **_kwargs: pytest.fail(

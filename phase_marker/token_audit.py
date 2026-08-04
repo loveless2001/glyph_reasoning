@@ -23,6 +23,7 @@ EMOJI_CONTROLS = ("🟦", "🟥", "🔶", "🔷")
 RANDOM_SYMBOL_CANDIDATES = ("♠", "♣", "♥", "♦")
 LOCAL_FREQUENCY_LABEL = "local_corpus_frequency_proxy"
 QWEN25_7B_TOKENIZER_REVISION = "a09a35458c702b33eeacc393d103063234e8bc28"
+QWEN25_7B_MODEL_MAX_LENGTH = 131072
 CANONICAL_TRAINING_ARMS = ("semantic", "glyph", "dot", "random", "direct", "filler")
 
 
@@ -339,42 +340,81 @@ def _pinned_tokenizer_snapshot_path(model_id: str) -> Path:
     )
 
 
-def _is_json_object(path: Path, *, require_nonempty: bool) -> bool:
+def _read_json_object(path: Path) -> Mapping[str, object] | None:
     if not path.is_file():
-        return False
+        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return False
-    return isinstance(payload, Mapping) and (not require_nonempty or bool(payload))
+        return None
+    return payload if isinstance(payload, Mapping) else None
 
 
-def _is_nonempty_file(path: Path) -> bool:
-    try:
-        return path.is_file() and path.stat().st_size > 0
-    except OSError:
+def _is_valid_qwen_tokenizer_config(payload: Mapping[str, object] | None) -> bool:
+    if payload is None:
         return False
+    tokenizer_class = payload.get("tokenizer_class")
+    chat_template = payload.get("chat_template")
+    model_max_length = payload.get("model_max_length")
+    return (
+        tokenizer_class in {"Qwen2Tokenizer", "Qwen2TokenizerFast"}
+        and isinstance(chat_template, str)
+        and bool(chat_template.strip())
+        and isinstance(model_max_length, int)
+        and not isinstance(model_max_length, bool)
+        and model_max_length == QWEN25_7B_MODEL_MAX_LENGTH
+    )
+
+
+def _is_object_or_null(payload: Mapping[str, object], key: str) -> bool:
+    return key in payload and (
+        payload[key] is None or isinstance(payload[key], Mapping)
+    )
+
+
+def _is_valid_qwen_tokenizer_json(payload: Mapping[str, object] | None) -> bool:
+    if payload is None:
+        return False
+    model = payload.get("model")
+    if not isinstance(model, Mapping):
+        return False
+    vocab = model.get("vocab")
+    merges = model.get("merges")
+    return (
+        payload.get("version") == "1.0"
+        and isinstance(payload.get("added_tokens"), list)
+        and model.get("type") == "BPE"
+        and isinstance(vocab, Mapping)
+        and bool(vocab)
+        and isinstance(merges, list)
+        and bool(merges)
+        and all(
+            _is_object_or_null(payload, key)
+            for key in (
+                "normalizer",
+                "pre_tokenizer",
+                "post_processor",
+                "decoder",
+            )
+        )
+    )
 
 
 def _load_cached_tokenizer(model_id: str) -> object:
     snapshot = _pinned_tokenizer_snapshot_path(model_id)
     if not snapshot.is_dir():
         raise FileNotFoundError(f"missing pinned tokenizer snapshot directory: {snapshot}")
-    tokenizer_config = snapshot / "tokenizer_config.json"
-    standalone_assets_valid = _is_json_object(
-        snapshot / "tokenizer.json", require_nonempty=True
-    ) or any(
-        _is_nonempty_file(snapshot / name)
-        for name in ("tokenizer.model", "spiece.model")
-    )
-    split_assets_valid = _is_json_object(
-        snapshot / "vocab.json", require_nonempty=True
-    ) and _is_nonempty_file(snapshot / "merges.txt")
     if (
-        not _is_json_object(tokenizer_config, require_nonempty=False)
-        or not (standalone_assets_valid or split_assets_valid)
+        not _is_valid_qwen_tokenizer_config(
+            _read_json_object(snapshot / "tokenizer_config.json")
+        )
+        or not _is_valid_qwen_tokenizer_json(
+            _read_json_object(snapshot / "tokenizer.json")
+        )
     ):
-        raise FileNotFoundError(f"pinned tokenizer snapshot lacks config/assets: {snapshot}")
+        raise FileNotFoundError(
+            f"pinned tokenizer snapshot lacks valid Qwen JSON-BPE assets: {snapshot}"
+        )
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
