@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 import json
 from pathlib import Path
+import shutil
 from typing import Callable
 
 import pytest
 
 import phase_marker.modal_plan as modal_plan
+from phase_marker.modal_artifacts import build_input_bundle
 from phase_marker.config import ExperimentConfig
 from phase_marker.io import canonical_json
 from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
@@ -21,16 +23,22 @@ LOCK_HASH = "2" * 64
 
 @pytest.fixture
 def prepared_artifacts(tmp_path: Path) -> Path:
-    config = ExperimentConfig.load(CONFIG_PATH)
-    _write_split(tmp_path, config)
-    _write_materializations(tmp_path, config)
-    return tmp_path
+    config_path = tmp_path / CONFIG_PATH
+    config_path.parent.mkdir(parents=True)
+    shutil.copyfile(CONFIG_PATH, config_path)
+    config = ExperimentConfig.load(config_path)
+    artifact_root = tmp_path / "artifacts/phase-marker"
+    _write_split(artifact_root, config)
+    _write_materializations(artifact_root, config)
+    return artifact_root
 
 
 def _plan(prepared_artifacts: Path) -> modal_plan.PilotPlan:
+    repo_root = prepared_artifacts.parent.parent
     return modal_plan.build_pilot_plan(
-        CONFIG_PATH,
+        repo_root / CONFIG_PATH,
         prepared_artifacts,
+        bundle=build_input_bundle(repo_root),
         source_hash=SOURCE_HASH,
         dependency_lock_hash=LOCK_HASH,
     )
@@ -182,8 +190,9 @@ def test_pilot_plan_rejects_non_sha_identity_inputs(
 ) -> None:
     with pytest.raises(ValueError):
         modal_plan.build_pilot_plan(
-            CONFIG_PATH,
+            prepared_artifacts.parent.parent / CONFIG_PATH,
             prepared_artifacts,
+            bundle=build_input_bundle(prepared_artifacts.parent.parent),
             source_hash=source_hash,
             dependency_lock_hash=dependency_lock_hash,
         )

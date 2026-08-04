@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import argparse
 import hashlib
+import json
 from pathlib import Path
 import shlex
+from typing import Sequence
 
+from phase_marker.modal_artifacts import InputBundle, build_input_bundle, hash_source_tree, validate_bundle_at_root
 from phase_marker.config import ExperimentConfig
 from phase_marker.io import canonical_json
 from phase_marker.pipeline import (
     ApprovalMetadata,
-    _validate_materializations,
-    _validate_split_manifest,
     build_command_manifest,
 )
 from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
@@ -93,6 +95,7 @@ class PilotPlan:
     model_revision: str
     source_hash: str
     dependency_lock_hash: str
+    bundle_id: str
     resources: StageAResources
     jobs: tuple[PilotJob, ...]
     run_id: str
@@ -106,6 +109,8 @@ def build_stage_a_resources() -> StageAResources:
 def build_pilot_plan(
     config_path: Path,
     artifact_root: Path,
+    *,
+    bundle: InputBundle,
     source_hash: str,
     dependency_lock_hash: str,
 ) -> PilotPlan:
@@ -113,7 +118,13 @@ def build_pilot_plan(
     if not _is_sha256(source_hash) or not _is_sha256(dependency_lock_hash):
         raise ValueError("source and dependency lock hashes must be lowercase sha256 values")
 
+    root = _repo_root_for_artifact_root(artifact_root)
+    _reject_duplicate_artifact_ids(bundle.artifact_ids)
+    validate_bundle_at_root(bundle, root)
+    bundle_split_id, *bundle_materialization_ids = _bundle_artifact_ids(bundle, artifact_root)
     config = ExperimentConfig.load(config_path)
+    if config.pilot_seed != 42:
+        raise ValueError("pilot plan requires the frozen seed 42")
     resources = build_stage_a_resources()
     approval = resources.approval()
     manifest_jobs = build_command_manifest(
@@ -127,27 +138,25 @@ def build_pilot_plan(
     jobs = _validate_manifest_jobs(
         manifest_jobs, config, approval, resources, config_path, artifact_root
     )
-    split = _validate_split_manifest(artifact_root, config)
-    materialization_ids = _validate_materializations(
-        artifact_root, config, split.artifact_id
-    )
     config_hash = hashlib.sha256(
         canonical_json(asdict(config)).encode("utf-8")
     ).hexdigest()
     run_id = (
         f"pilot-s{config.pilot_seed}-cfg-{config_hash[:8]}"
-        f"-split-{split.artifact_id[:8]}-src-{source_hash[:12]}"
+        f"-split-{bundle_split_id[:8]}-src-{source_hash[:12]}"
     )
+    _validate_run_id(run_id, config_hash, bundle_split_id, source_hash)
     return PilotPlan(
         schema_version=1,
         kind=_PILOT_KIND,
         seed=config.pilot_seed,
         config_hash=config_hash,
-        split_artifact_id=split.artifact_id,
-        materialization_artifact_ids=materialization_ids,
+        split_artifact_id=bundle_split_id,
+        materialization_artifact_ids=tuple(bundle_materialization_ids),
         model_revision=QWEN25_7B_TOKENIZER_REVISION,
         source_hash=source_hash,
         dependency_lock_hash=dependency_lock_hash,
+        bundle_id=bundle.bundle_id,
         resources=resources,
         jobs=jobs,
         run_id=run_id,
@@ -166,6 +175,7 @@ def pilot_plan_payload(plan: PilotPlan) -> dict[str, object]:
         "model_revision": plan.model_revision,
         "source_hash": plan.source_hash,
         "dependency_lock_hash": plan.dependency_lock_hash,
+        "bundle_id": plan.bundle_id,
         "resources": {
             "hardware": plan.resources.hardware,
             "timeout_seconds": plan.resources.timeout_seconds,
@@ -308,3 +318,97 @@ def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and len(value) == _SHA256_LENGTH and all(
         character in "0123456789abcdef" for character in value
     )
+
+
+def _repo_root_for_artifact_root(artifact_root: Path) -> Path:
+    resolved = Path(artifact_root).resolve()
+    if resolved.name != "phase-marker" or resolved.parent.name != "artifacts":
+        raise ValueError("artifact root must be repo-root/artifacts/phase-marker")
+    return resolved.parent.parent
+
+
+def _bundle_artifact_ids(bundle: InputBundle, artifact_root: Path) -> tuple[str, ...]:
+    relative_manifests = (
+        "splits/manifest.json",
+        *(f"training-data/{arm}.manifest.json" for arm in _EXPECTED_ARMS),
+    )
+    values: list[str] = []
+    for relative_path in relative_manifests:
+        path = Path(artifact_root) / relative_path
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"bundle manifest is invalid: {path}") from error
+        artifact_id = payload.get("artifact_id") if isinstance(payload, dict) else None
+        if not _is_sha256(artifact_id):
+            raise ValueError(f"bundle manifest artifact_id is missing or malformed: {path}")
+        values.append(str(artifact_id))
+    actual = tuple(values)
+    if actual != bundle.artifact_ids:
+        raise ValueError("bundle artifact IDs do not match exact manifest files")
+    return actual
+
+
+def _reject_duplicate_artifact_ids(artifact_ids: tuple[str, ...]) -> None:
+    if len(set(artifact_ids)) != len(artifact_ids):
+        raise ValueError("duplicate artifact ID in bundle")
+
+
+def _validate_run_id(
+    run_id: str, config_hash: str, split_id: str, source_hash: str
+) -> None:
+    expected = (
+        f"pilot-s42-cfg-{config_hash[:8]}-split-{split_id[:8]}-src-{source_hash[:12]}"
+    )
+    if run_id != expected:
+        raise ValueError("pilot run ID is noncanonical")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_beneath_repo(repo_root: Path, value: str) -> Path:
+    candidate = Path(value)
+    resolved = (candidate if candidate.is_absolute() else repo_root / candidate).resolve()
+    try:
+        resolved.relative_to(repo_root)
+    except ValueError as error:
+        raise ValueError(f"path escapes --repo-root: {value}") from error
+    return resolved
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Print an immutable pilot plan or its canonical run ID, entirely offline."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    for command in ("plan", "run-id"):
+        subparser = subcommands.add_parser(command)
+        subparser.add_argument("--repo-root", required=True)
+        subparser.add_argument("--config", required=True)
+        subparser.add_argument("--artifact-root", required=True)
+        subparser.add_argument("--dependency-lock", required=True)
+    arguments = parser.parse_args(argv)
+    repo_root = Path(arguments.repo_root).resolve()
+    config_path = _resolve_beneath_repo(repo_root, arguments.config)
+    artifact_root = _resolve_beneath_repo(repo_root, arguments.artifact_root)
+    dependency_lock = _resolve_beneath_repo(repo_root, arguments.dependency_lock)
+    plan = build_pilot_plan(
+        config_path,
+        artifact_root,
+        bundle=build_input_bundle(repo_root),
+        source_hash=hash_source_tree(repo_root),
+        dependency_lock_hash=_file_sha256(dependency_lock),
+    )
+    if arguments.command == "run-id":
+        print(plan.run_id)
+    else:
+        print(canonical_json(pilot_plan_payload(plan)))
+
+
+if __name__ == "__main__":
+    main()
