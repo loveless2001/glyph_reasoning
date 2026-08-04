@@ -83,6 +83,7 @@ def test_materialization_writes_six_real_jsonl_datasets_and_lineage_manifest(
         assert saved["artifact_id"] == manifest.artifact_id
         assert saved["parent_hashes"] == ["f" * 64]
         assert saved["metadata"]["row_hashes"]
+        assert saved["metadata"]["neutral_delimiter"] == ". . ."
         assert saved["metadata"]["tokenizer_revision"] == "fake-qwen-tokenizer-revision"
         assert saved["metadata"]["local_frequency_label"] == "local_corpus_frequency_proxy"
 
@@ -94,3 +95,21 @@ def test_materialization_refuses_to_invent_missing_frozen_split_lineage(
         materialize_training_arms(
             config, traces, FaithfulFakeTokenizer(), tmp_path / "training-data"
         )
+
+
+def test_manifest_binds_the_resolved_cached_qwen_revision(
+    tmp_path: Path, config: ExperimentConfig, traces: list[CanonicalTrace]
+):
+    split_root = tmp_path / "splits"
+    split_root.mkdir()
+    (split_root / "manifest.json").write_text(
+        json.dumps({"artifact_id": "e" * 64}) + "\n", encoding="utf-8"
+    )
+    tokenizer = FaithfulFakeTokenizer()
+    tokenizer.revision = None
+    tokenizer.name_or_path = "Qwen/Qwen2.5-7B-Instruct"
+    tokenizer.init_kwargs = {"revision": "main"}
+
+    manifests = materialize_training_arms(config, traces, tokenizer, tmp_path / "training-data")
+
+    assert manifests["dot"].metadata["tokenizer_revision"] == "a09a35458c702b33eeacc393d103063234e8bc28"

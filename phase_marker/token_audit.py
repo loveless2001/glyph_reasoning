@@ -17,10 +17,11 @@ from phase_marker.splits import parse_trace_pool
 from phase_marker.traces import render_training_example, semantic_projection
 
 
-DOT_CANDIDATES = (".", "|", "§", "·", "•")
+DOT_CANDIDATES = (".", "|", "§", "·", "•", ". . .")
 EMOJI_CONTROLS = ("🟦", "🟥", "🔶", "🔷")
 RANDOM_SYMBOL_CANDIDATES = ("♠", "♣", "♥", "♦")
 LOCAL_FREQUENCY_LABEL = "local_corpus_frequency_proxy"
+QWEN25_7B_TOKENIZER_REVISION = "a09a35458c702b33eeacc393d103063234e8bc28"
 
 
 class TokenWidthMismatch(ValueError):
@@ -141,7 +142,7 @@ def materialize_training_arms(
                 "row_hashes": row_hashes,
                 "exclusions": [],
                 "filler_length_counts": filler_lengths,
-                "tokenizer_revision": _tokenizer_revision(tokenizer),
+                "tokenizer_revision": _tokenizer_revision(tokenizer, config.model_id),
                 "parent_split_hash": split_hash,
                 "neutral_delimiter": neutral_delimiter,
                 "target_marker_token_width": target_width,
@@ -276,13 +277,19 @@ def _filler_length_counts(rows: Sequence[Mapping[str, object]]) -> dict[str, int
     return dict(sorted(counts.items(), key=lambda item: int(item[0])))
 
 
-def _tokenizer_revision(tokenizer: object) -> str:
+def _tokenizer_revision(tokenizer: object, model_id: str) -> str:
     explicit = getattr(tokenizer, "revision", None)
     if isinstance(explicit, str) and explicit:
         return explicit
     init_kwargs = getattr(tokenizer, "init_kwargs", None)
     if isinstance(init_kwargs, Mapping):
-        revision = init_kwargs.get("_commit_hash") or init_kwargs.get("revision")
+        commit_hash = init_kwargs.get("_commit_hash")
+        if isinstance(commit_hash, str) and commit_hash:
+            return commit_hash
+    if model_id == "Qwen/Qwen2.5-7B-Instruct":
+        return QWEN25_7B_TOKENIZER_REVISION
+    if isinstance(init_kwargs, Mapping):
+        revision = init_kwargs.get("revision")
         if isinstance(revision, str) and revision:
             return revision
     name_or_path = getattr(tokenizer, "name_or_path", None)

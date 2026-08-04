@@ -18,9 +18,10 @@ class FaithfulFakeTokenizer:
             "🜃": [47, 48],
             ".": [3],
             "|": [4],
-            "§": [5, 6],
+            "§": [5],
             "·": [11],
             "•": [12],
+            ". . .": [30, 31],
             "🟦": [7, 8],
             "🟥": [13, 14],
             "🔶": [15, 16],
@@ -57,27 +58,27 @@ class FaithfulFakeTokenizer:
         return dict(self._vocabulary)
 
 
-def test_neutral_delimiter_matches_glyph_token_width():
+def test_spaced_dot_delimiter_matches_glyph_width_when_single_symbols_do_not():
     tokenizer = FaithfulFakeTokenizer()
     glyph_width = len(tokenizer.encode("🜞", add_special_tokens=False))
 
-    audit = audit_marker_set(tokenizer, [".", "|", "§"])
+    audit = audit_marker_set(tokenizer, [".", "|", "§", ". . ."])
     selected = select_neutral_delimiter(audit, target_width=glyph_width)
 
-    assert selected == "§"
+    assert selected == ". . ."
     assert len(tokenizer.encode(selected, add_special_tokens=False)) == glyph_width
 
 
 def test_audit_records_token_and_unicode_measurements_without_pretraining_claims():
     tokenizer = FaithfulFakeTokenizer()
 
-    row = audit_marker_set(tokenizer, ["§"])[0]
+    row = audit_marker_set(tokenizer, [". . ."])[0]
 
-    assert row.symbol == "§"
-    assert row.codepoints == ("U+00A7",)
-    assert row.utf8_hex == "c2a7"
-    assert row.token_ids == (5, 6)
-    assert row.token_strings == ("tok-5", "tok-6")
+    assert row.symbol == ". . ."
+    assert row.codepoints == ("U+002E", "U+0020", "U+002E", "U+0020", "U+002E")
+    assert row.utf8_hex == "2e202e202e"
+    assert row.token_ids == (30, 31)
+    assert row.token_strings == ("tok-30", "tok-31")
     assert row.token_count == 2
-    assert row.vocabulary_member is True
+    assert row.vocabulary_member is False
     assert row.local_corpus_count == 0
