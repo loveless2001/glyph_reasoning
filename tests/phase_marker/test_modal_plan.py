@@ -249,3 +249,71 @@ def test_pilot_plan_payload_round_trips_as_canonical_json(
 
     assert_json_compatible(payload)
     assert json.loads(canonical_json(payload)) == payload
+
+
+def test_approval_action_manifest_contains_only_inert_approved_boundaries(
+    prepared_artifacts: Path,
+) -> None:
+    """Would fail if the handoff omitted a gate or embedded later experiment work."""
+    plan = _plan(prepared_artifacts)
+
+    manifest = modal_plan.approval_action_manifest(plan)
+
+    assert manifest["run_id"] == plan.run_id
+    assert manifest["bundle_id"] == plan.bundle_id
+    assert manifest["model_revision"] == plan.model_revision
+    assert manifest["training_job_count"] == 6
+    assert manifest["selection_job_count"] == 6
+    assert manifest["resources"] == {
+        "hardware": "H100",
+        "timeout_seconds": 14_400,
+        "max_containers": 2,
+        "stage_a_estimated_spend_usd": 250.0,
+        "estimated_spend_usd": 600.0,
+        "spend_cap_usd": 1_000.0,
+    }
+    assert manifest["external_actions"] == {
+        "stage_inputs": (
+            "modal run modal_phase_marker.py::stage-inputs --approved-run-id "
+            '"$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000'
+        ),
+        "cache_model": (
+            "modal run modal_phase_marker.py::cache-model --approved-run-id "
+            '"$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000'
+        ),
+        "smoke": (
+            "modal run modal_phase_marker.py::smoke --approved-run-id "
+            '"$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000'
+        ),
+        "run_stage_a": (
+            "modal run modal_phase_marker.py::run-stage-a --approved-run-id "
+            '"$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000'
+        ),
+    }
+    serialized = canonical_json(manifest)
+    assert "phase_marker.behavior run" not in serialized
+    assert "phase_marker.activations" not in serialized
+    assert "phase_marker.interventions" not in serialized
+
+
+def test_plan_cli_prints_approval_action_manifest(
+    prepared_artifacts: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo_root = prepared_artifacts.parent.parent
+    lock = repo_root / "requirements-modal-phase-marker.txt"
+    lock.write_text("example==1\n", encoding="utf-8")
+
+    modal_plan.main([
+        "plan",
+        "--repo-root", str(repo_root),
+        "--config", str(CONFIG_PATH),
+        "--artifact-root", "artifacts/phase-marker",
+        "--dependency-lock", lock.name,
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["action_manifest"]["run_id"] == payload["run_id"]
+    assert set(payload["action_manifest"]["external_actions"]) == {
+        "stage_inputs", "cache_model", "smoke", "run_stage_a",
+    }

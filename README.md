@@ -45,6 +45,74 @@ python train/train_sft.py
 
 ## Phase-marker mechanism pipeline
 
+### Modal seed-42 Stage A pilot (approval-gated)
+
+The dedicated `modal_phase_marker.py` app prepares one content-addressed,
+seed-42 pilot across the frozen arm order `semantic`, `glyph`, `dot`, `random`,
+`direct`, and `filler`. It runs training and validation-only checkpoint
+selection, then must stop before behavior evaluation. The workflow assumes one
+operator/coordinator: do not run staging, resume, or Stage A concurrently from
+multiple shells or people.
+
+The following two commands are local planning operations only. They do not
+import Modal, call a remote service, write a volume, load a model, or allocate a
+GPU. Freeze and inspect their full content-bound identity before considering any
+external action:
+
+```bash
+# Local only: derive the full content-bound identity without Modal or network.
+PHASE_MARKER_RUN_ID="$(./.venv/bin/python -m phase_marker.modal_plan run-id \
+  --repo-root . \
+  --config configs/phase-marker-qwen25-7b.toml \
+  --artifact-root artifacts/phase-marker \
+  --dependency-lock requirements-modal-phase-marker.txt)"
+
+# Local only: print the canonical plan and inert action manifest.
+./.venv/bin/python -m phase_marker.modal_plan plan \
+  --repo-root . \
+  --config configs/phase-marker-qwen25-7b.toml \
+  --artifact-root artifacts/phase-marker \
+  --dependency-lock requirements-modal-phase-marker.txt
+```
+
+The commands below are examples for an approval handoff. Every `modal run`
+crosses an external boundary and is not an offline dry run. Do not execute them
+without fresh authorization for the exact frozen run ID and stated budget:
+
+```bash
+# External writes/compute shown for handoff only; fresh approval is required.
+modal run modal_phase_marker.py::stage-inputs --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
+modal run modal_phase_marker.py::cache-model --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
+modal run modal_phase_marker.py::smoke --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
+modal run modal_phase_marker.py::run-stage-a --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
+
+# Crash recovery only: inspect status, review the printed missing-arm plan, and
+# obtain fresh approval before this explicit resume.
+modal run modal_phase_marker.py::run-stage-a --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000 --resume
+
+# Read-only remote inspection after an authorized run.
+modal run modal_phase_marker.py::status --run-id "$PHASE_MARKER_RUN_ID"
+
+# Explicit local write of compact allowlisted evidence after successful status.
+modal run modal_phase_marker.py::download-evidence --run-id "$PHASE_MARKER_RUN_ID" --destination phase-marker-stage-a-evidence
+```
+
+Stage A requests one H100 per job, permits Modal's automatic H200-compatible
+upgrade, allows at most two concurrent GPU containers, uses four-hour job
+timeouts, and has zero application retries. Its worst-case allocation is 48
+H100-hours; the approval estimate is USD 250 (approximately USD 189.56 at USD
+3.9492/hour). The full pilot estimate is USD 600 with a USD 1,000
+operator-acknowledged ceiling. That acknowledgement records the environment
+budget; it is not an application-enforced account spending limit.
+
+After the Stage A summary reports `stopped_before_behavior=true`, stop. Behavior
+evaluation requires a separate approval after the downloaded receipts,
+producer manifests, selection evidence, and summary have been inspected.
+Activation capture or intervention is mechanism work and requires its own later,
+stage-specific approval; neither is authorized by the Stage A commands above.
+No live Modal, model-cache, H100, billing, or scheduler integration is claimed
+by the offline implementation and tests in this repository.
+
 The maintained local verification suite is designed to run without network
 access, model weights, a GPU, or a scheduler:
 

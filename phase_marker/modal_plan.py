@@ -212,6 +212,41 @@ def pilot_plan_payload(plan: PilotPlan) -> dict[str, object]:
     }
 
 
+def approval_action_manifest(plan: PilotPlan) -> dict[str, object]:
+    """Return exact external commands as inert, approval-gated handoff data."""
+    if not isinstance(plan, PilotPlan):
+        raise TypeError("approval action manifest requires a PilotPlan")
+    prefix = (
+        "modal run modal_phase_marker.py::{entrypoint} --approved-run-id "
+        '"$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000'
+    )
+    return {
+        "schema_version": 1,
+        "run_id": plan.run_id,
+        "bundle_id": plan.bundle_id,
+        "model_revision": plan.model_revision,
+        "training_job_count": len(plan.jobs),
+        "selection_job_count": len(plan.jobs),
+        "resources": {
+            "hardware": plan.resources.hardware,
+            "timeout_seconds": plan.resources.timeout_seconds,
+            "max_containers": plan.resources.max_containers,
+            "stage_a_estimated_spend_usd": plan.resources.stage_a_estimated_spend_usd,
+            "estimated_spend_usd": plan.resources.estimated_spend_usd,
+            "spend_cap_usd": plan.resources.spend_cap_usd,
+        },
+        "external_actions": {
+            "stage_inputs": prefix.format(entrypoint="stage-inputs"),
+            "cache_model": prefix.format(entrypoint="cache-model"),
+            "smoke": prefix.format(entrypoint="smoke"),
+            "run_stage_a": prefix.format(entrypoint="run-stage-a"),
+        },
+        "approval_required": True,
+        "stopped_before_behavior": True,
+        "mechanism_approval_included": False,
+    }
+
+
 def _validate_manifest_jobs(
     manifest_jobs: tuple[dict[str, object], ...],
     config: ExperimentConfig,
@@ -438,7 +473,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     if arguments.command == "run-id":
         print(plan.run_id)
     else:
-        print(canonical_json(pilot_plan_payload(plan)))
+        payload = pilot_plan_payload(plan)
+        payload["action_manifest"] = approval_action_manifest(plan)
+        print(canonical_json(payload))
 
 
 if __name__ == "__main__":

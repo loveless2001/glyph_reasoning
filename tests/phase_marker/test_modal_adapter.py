@@ -493,7 +493,10 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
     assert isinstance(imported_adapter.status_resources, imported_adapter.RemoteFunction)
     assert [
         call[1] for call in fake.declaration_calls if call[0] == "local_entrypoint_decorated"
-    ] == ["status", "stage_inputs", "cache_model", "smoke", "run_stage_a"]
+    ] == [
+        "status", "download_evidence", "stage_inputs", "cache_model", "smoke",
+        "run_stage_a",
+    ]
     assert "plan" not in [
         call[1] for call in fake.declaration_calls if call[0] == "local_entrypoint_decorated"
     ]
@@ -637,18 +640,6 @@ def test_apply_approved_app_tags_validates_before_the_client_rpc(
     }
     assert fake.rpc_calls == [("set_tags", expected_tags)]
     assert imported_adapter.app.tags == expected_tags
-
-
-def test_status_is_local_read_only_and_never_mutates_app_tags(imported_adapter: ModuleType) -> None:
-    fake = imported_adapter.fake_modal
-
-    assert imported_adapter.status() == {
-        "app": "phase-marker-pilot-stage-a",
-        "gpu": "H100",
-        "max_gpu_containers": 2,
-        "volumes": list(imported_adapter.VOLUME_NAMES),
-    }
-    assert fake.rpc_calls == []
 
 
 def test_pure_python_plan_cli_does_not_import_or_call_modal(
@@ -907,7 +898,7 @@ def test_stage_entrypoint_conflicts_fail_before_tags_or_writes(
         imported_adapter.stage_inputs(
             repo_root=str(pilot_repo),
             approved_run_id=plan.run_id,
-            budget_acknowledged=True,
+            acknowledge_budget_usd=1_000,
         )
 
     assert imported_adapter.fake_modal.rpc_calls == []
@@ -933,7 +924,7 @@ def test_stage_entrypoint_identical_noop_needs_no_tag_or_upload(
     imported_adapter.stage_inputs(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
-        budget_acknowledged=True,
+        acknowledge_budget_usd=1_000,
     )
 
     output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
@@ -969,7 +960,7 @@ def test_stage_entrypoint_tags_only_after_read_only_preflight_then_narrow_apply(
     imported_adapter.stage_inputs(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
-        budget_acknowledged=True,
+        acknowledge_budget_usd=1_000,
     )
 
     assert [event[0] for event in volume.events] == ["listdir", "tags", "batch_upload"]
@@ -1218,7 +1209,7 @@ def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
     imported_adapter.stage_inputs(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
-        budget_acknowledged=True,
+        acknowledge_budget_usd=1_000,
     )
     stage_output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert stage_output[0] == {
@@ -1242,7 +1233,7 @@ def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
     imported_adapter.cache_model(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
-        budget_acknowledged=True,
+        acknowledge_budget_usd=1_000,
     )
     cache_output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert cache_output[0] == {
@@ -1261,7 +1252,7 @@ def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
     imported_adapter.smoke(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
-        budget_acknowledged=True,
+        acknowledge_budget_usd=1_000,
     )
     smoke_output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert smoke_output[0] == {
@@ -1280,8 +1271,8 @@ def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
 
 @pytest.mark.parametrize("entrypoint", ("stage_inputs", "cache_model", "smoke"))
 @pytest.mark.parametrize(
-    ("approved_run_id", "budget_acknowledged", "message"),
-    (("truncated", True, "full approved run ID"), ("valid", False, "USD 1000")),
+    ("approved_run_id", "acknowledge_budget_usd", "message"),
+    (("truncated", 1_000, "full approved run ID"), ("valid", 999, "USD 1000")),
 )
 def test_operator_entrypoints_reject_before_tags_or_remote_boundary(
     imported_adapter: ModuleType,
@@ -1289,7 +1280,7 @@ def test_operator_entrypoints_reject_before_tags_or_remote_boundary(
     monkeypatch: pytest.MonkeyPatch,
     entrypoint: str,
     approved_run_id: str,
-    budget_acknowledged: bool,
+    acknowledge_budget_usd: float,
     message: str,
 ) -> None:
     """Would fail if an incomplete operator acknowledgement caused any remote action."""
@@ -1312,7 +1303,7 @@ def test_operator_entrypoints_reject_before_tags_or_remote_boundary(
         getattr(imported_adapter, entrypoint)(
             repo_root=str(pilot_repo),
             approved_run_id=actual_run_id,
-            budget_acknowledged=budget_acknowledged,
+            acknowledge_budget_usd=acknowledge_budget_usd,
         )
 
     assert imported_adapter.fake_modal.rpc_calls == []
@@ -1343,7 +1334,7 @@ def test_run_stage_a_entrypoint_forwards_explicit_resume_and_prints_summary(
     imported_adapter.run_stage_a(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
-        budget_acknowledged=True,
+        acknowledge_budget_usd=1_000,
         resume=True,
     )
 
@@ -2191,3 +2182,237 @@ def test_initial_stage_a_refuses_summary_or_unexpected_canonical_namespace(
         )
     assert tags == []
     assert training.calls == [] and selection.calls == [] and finalizer.calls == []
+
+
+def _complete_status_volume(
+    plan: modal_plan.PilotPlan,
+) -> tuple[StageARunsClient, dict[str, dict[str, object]], dict[str, dict[str, object]]]:
+    events: list[tuple[object, ...]] = []
+    files: dict[str, bytes] = {}
+    training: dict[str, dict[str, object]] = {}
+    selection: dict[str, dict[str, object]] = {}
+    for stage, receipts in (("train", training), ("selection", selection)):
+        publications, stage_receipts = _canonical_stage_a_publications(plan, stage)
+        for job in plan.jobs:
+            files.update(publications[job.arm])
+            receipts[job.arm] = stage_receipts[job.arm]
+    summary = _stage_a_summary(plan, training, selection)
+    files[f"/runs/{plan.run_id}/stage-a-summary.json"] = (
+        canonical_json(summary) + "\n"
+    ).encode("utf-8")
+    return StageARunsClient(files, events), training, selection
+
+
+def test_status_reads_validated_receipts_and_producer_manifests_without_mutation(
+    imported_adapter: ModuleType, pilot_repo: Path,
+) -> None:
+    """Would fail if status inferred completion from names or wrote remote state."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    before = dict(volume.files)
+
+    result = imported_adapter.status_local(volume, run_id=plan.run_id)
+
+    assert result["training"] == {job.arm: "complete" for job in plan.jobs}
+    assert result["selection"] == {job.arm: "complete" for job in plan.jobs}
+    assert result["summary"] == "complete"
+    assert result["stopped_before_behavior"] is True
+    assert result["valid"] is True
+    assert volume.files == before
+    assert not any(event[0] in {"batch_upload", "commit", "reload"} for event in volume.events)
+
+
+def test_status_reports_partial_failed_and_invalid_evidence_without_completion(
+    imported_adapter: ModuleType, pilot_repo: Path,
+) -> None:
+    """Would fail if partial, failed, or hash-mismatched bytes looked complete."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    first = plan.jobs[0]
+    train_files, _receipt = _canonical_stage_a_files(plan, first, "train")
+    volume = StageARunsClient(train_files, [])
+    partial = imported_adapter.status_local(volume, run_id=plan.run_id)
+    assert partial["training"][first.arm] == "complete"
+    assert set(partial["training"].values()) == {"complete", "pending"}
+    assert set(partial["selection"].values()) == {"pending"}
+    assert partial["stopped_before_behavior"] is False
+
+    failed = _stage_a_receipt(plan, plan.jobs[1], "train")
+    failed.update(
+        exit_status=1,
+        validated=False,
+        promoted=False,
+        failure_reason="RuntimeError: producer crashed",
+    )
+    unsigned = dict(failed)
+    unsigned.pop("artifact_id")
+    failed["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+    volume.files[
+        f"/runs/{plan.run_id}/receipts/attempts/{failed['attempt_id']}.json"
+    ] = (canonical_json(failed) + "\n").encode("utf-8")
+    failed_status = imported_adapter.status_local(volume, run_id=plan.run_id)
+    assert failed_status["training"][plan.jobs[1].arm] == "failed"
+
+    adapter_path = next(
+        path for path in volume.files if path.endswith("/semantic/adapter_config.json")
+    )
+    volume.files[adapter_path] += b"corrupt"
+    invalid = imported_adapter.status_local(volume, run_id=plan.run_id)
+    assert invalid["training"][first.arm] == "invalid"
+    assert invalid["valid"] is False
+    assert invalid["stopped_before_behavior"] is False
+
+
+def test_status_rejects_unknown_or_unsafe_run_identity(
+    imported_adapter: ModuleType,
+) -> None:
+    """Would fail if status scanned an unbound or traversal-derived namespace."""
+    with pytest.raises(ValueError, match="canonical run ID"):
+        imported_adapter.status_local(RecordingVolume(), run_id="../secrets")
+    with pytest.raises(ValueError, match="unknown run"):
+        imported_adapter.status_local(
+            RecordingVolume(),
+            run_id="pilot-s42-cfg-11111111-split-22222222-src-333333333333",
+        )
+
+
+def test_status_does_not_accept_a_producer_directory_without_its_receipt(
+    imported_adapter: ModuleType, pilot_repo: Path,
+) -> None:
+    """Would fail if a canonical directory name alone implied completion."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    files, _receipt = _canonical_stage_a_files(plan, plan.jobs[0], "train")
+    receipt_path = next(path for path in files if "/receipts/canonical/" in path)
+    files.pop(receipt_path)
+
+    result = imported_adapter.status_local(StageARunsClient(files, []), run_id=plan.run_id)
+
+    assert result["training"][plan.jobs[0].arm] == "invalid"
+    assert result["valid"] is False
+
+
+def test_status_rejects_self_consistent_wrong_model_revision(
+    imported_adapter: ModuleType, pilot_repo: Path,
+) -> None:
+    """Would fail if internal consistency replaced the frozen model identity."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    files, receipt = _canonical_stage_a_files(plan, plan.jobs[0], "train")
+    manifest_path = next(path for path in files if path.endswith("run-manifest.json"))
+    receipt_path = next(path for path in files if "/receipts/canonical/" in path)
+    manifest = json.loads(files[manifest_path])
+    manifest["model_revision"] = "f" * 40
+    manifest["tokenizer_revision"] = "f" * 40
+    manifest_bytes = (canonical_json(manifest) + "\n").encode("utf-8")
+    files[manifest_path] = manifest_bytes
+    output_index = receipt["expected_outputs"].index("run-manifest.json")
+    receipt["output_hashes"][output_index] = hashlib.sha256(manifest_bytes).hexdigest()
+    unsigned = dict(receipt)
+    unsigned.pop("artifact_id")
+    receipt["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+    files[receipt_path] = (canonical_json(receipt) + "\n").encode("utf-8")
+
+    result = imported_adapter.status_local(StageARunsClient(files, []), run_id=plan.run_id)
+
+    assert result["training"][plan.jobs[0].arm] == "invalid"
+    assert result["valid"] is False
+
+
+def _add_downloadable_logs(
+    volume: StageARunsClient, plan: modal_plan.PilotPlan,
+) -> None:
+    for stage in ("train", "selection"):
+        for job in plan.jobs:
+            canonical_path = (
+                f"/runs/{plan.run_id}/receipts/canonical/{stage}/{job.arm}.json"
+            )
+            receipt = json.loads(volume.files[canonical_path])
+            attempt_id = str(receipt["attempt_id"])
+            volume.files[
+                f"/runs/{plan.run_id}/receipts/attempts/{attempt_id}.json"
+            ] = volume.files[canonical_path]
+            volume.files[
+                f"/runs/{plan.run_id}/attempts/{attempt_id}/logs/{stage}.log"
+            ] = f"{stage}:{job.arm}\n".encode("utf-8")
+
+
+def test_download_evidence_is_atomic_and_strictly_allowlisted(
+    imported_adapter: ModuleType, pilot_repo: Path, tmp_path: Path,
+) -> None:
+    """Would fail if weights, credentials, cache bytes, or arbitrary files escaped."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    _add_downloadable_logs(volume, plan)
+    run_root = f"/runs/{plan.run_id}"
+    volume.files[f"{run_root}/.modal.toml"] = b"token = 'secret'\n"
+    volume.files[f"{run_root}/arbitrary.bin"] = b"not evidence"
+    volume.files[f"{run_root}/model-cache/raw.bin"] = b"model"
+    destination = tmp_path / "stage-a-evidence"
+
+    downloaded = imported_adapter.download_evidence_local(
+        volume, run_id=plan.run_id, destination=destination,
+    )
+
+    assert destination.is_dir()
+    assert len(downloaded) == 61
+    relative = {path.relative_to(destination).as_posix() for path in downloaded}
+    assert "stage-a-summary.json" in relative
+    assert sum(path.endswith("run-manifest.json") for path in relative) == 6
+    assert sum(path.endswith("adapter_config.json") for path in relative) == 6
+    assert sum(
+        path.endswith("manifest.json") and "checkpoint-selections" in path
+        for path in relative
+    ) == 6
+    assert sum(path.endswith("evidence.jsonl") for path in relative) == 6
+    assert sum(path.endswith(".log") for path in relative) == 12
+    assert sum(path.startswith("receipts/canonical/") for path in relative) == 12
+    assert sum(path.startswith("receipts/attempts/") for path in relative) == 12
+    assert not any("adapter_model" in path or "model-cache" in path for path in relative)
+    assert ".modal.toml" not in relative
+    assert "arbitrary.bin" not in relative
+    assert all(path.is_file() for path in downloaded)
+
+
+def test_download_evidence_rejects_an_unreceipted_log_escape(
+    imported_adapter: ModuleType, pilot_repo: Path, tmp_path: Path,
+) -> None:
+    """Would fail if an arbitrary file under a log-shaped path were exportable."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    volume.files[
+        f"/runs/{plan.run_id}/attempts/not-a-receipted-attempt/logs/train.log"
+    ] = b"arbitrary bytes"
+
+    destination = tmp_path / "evidence"
+    with pytest.raises(ValueError, match="log lacks its bound attempt receipt"):
+        imported_adapter.download_evidence_local(
+            volume, run_id=plan.run_id, destination=destination,
+        )
+    assert not destination.exists()
+
+
+def test_download_evidence_refuses_existing_destination_and_invalid_status(
+    imported_adapter: ModuleType, pilot_repo: Path, tmp_path: Path,
+) -> None:
+    """Would fail if download overwrote local data or exported corrupt evidence."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    destination = tmp_path / "existing"
+    destination.mkdir()
+    sentinel = destination / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    with pytest.raises(FileExistsError, match="destination already exists"):
+        imported_adapter.download_evidence_local(
+            volume, run_id=plan.run_id, destination=destination,
+        )
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+    destination = tmp_path / "corrupt"
+    receipt_path = next(
+        path for path in volume.files
+        if path.endswith("/receipts/canonical/train/semantic.json")
+    )
+    volume.files[receipt_path] += b"corrupt"
+    with pytest.raises(ValueError, match="validated complete Stage A evidence"):
+        imported_adapter.download_evidence_local(
+            volume, run_id=plan.run_id, destination=destination,
+        )
+    assert not destination.exists()
