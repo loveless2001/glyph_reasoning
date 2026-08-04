@@ -24,6 +24,15 @@ from phase_marker.traces import TraceParseError, parse_legacy_trace
 GSM8K_DATASET = ("gsm8k", "main", "main")
 SVAMP_DATASET = ("ChilleD/SVAMP", None, "main")
 MATH_DATASET = ("EleutherAI/hendrycks_math", "all", "main")
+MATH_CONFIGS = (
+    "algebra",
+    "counting_and_probability",
+    "geometry",
+    "intermediate_algebra",
+    "number_theory",
+    "prealgebra",
+    "precalculus",
+)
 VALIDATION_PER_SOURCE = 300
 SVAMP_TEST_SIZE = 1000
 IMMUTABLE_REVISION = re.compile(r"[0-9a-f]{40}", re.IGNORECASE)
@@ -83,16 +92,26 @@ class OfflineDatasetLoader:
         try:
             import datasets
 
-            rows = datasets.load_dataset(
-                dataset_id,
-                config,
-                split=split,
-                revision=revision,
-                download_config=datasets.DownloadConfig(local_files_only=True),
+            configs = (
+                MATH_CONFIGS
+                if dataset_id == MATH_DATASET[0] and config == MATH_DATASET[1]
+                else (config,)
+            )
+            download_config = datasets.DownloadConfig(local_files_only=True)
+            rows = tuple(
+                dict(row)
+                for resolved_config in configs
+                for row in datasets.load_dataset(
+                    dataset_id,
+                    resolved_config,
+                    split=split,
+                    revision=revision,
+                    download_config=download_config,
+                )
             )
         except Exception as error:
             raise DatasetCacheMiss(dataset_id, revision) from error
-        return tuple(dict(row) for row in rows)
+        return rows
 
 
 def normalize_question(text: str) -> str:

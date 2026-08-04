@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +12,7 @@ from phase_marker.schema import CanonicalTrace, PhaseSpan
 from phase_marker.splits import (
     DatasetCacheMiss,
     DatasetExample,
+    OfflineDatasetLoader,
     SplitBundle,
     SplitOverlapError,
     assert_disjoint_splits,
@@ -74,6 +77,11 @@ class MissingDatasetLoader:
         self, dataset_id: str, config: str | None, split: str, revision: str
     ) -> Sequence[Mapping[str, object]]:
         raise DatasetCacheMiss(dataset_id, revision)
+
+
+class FakeDownloadConfig:
+    def __init__(self, *, local_files_only: bool):
+        self.local_files_only = local_files_only
 
 
 @pytest.fixture
@@ -166,6 +174,89 @@ def test_build_records_unmatched_and_ambiguous_source_recovery(fake_loader):
 def test_cache_miss_names_the_dataset_and_revision():
     with pytest.raises(DatasetCacheMiss, match=r"gsm8k@main"):
         build_split_bundle(TEST_CONFIG, MissingDatasetLoader(), [], [])
+
+
+def test_offline_loader_aggregates_all_pinned_math_configs_in_frozen_order(monkeypatch):
+    revision = "a" * 40
+    calls = []
+
+    def load_dataset(dataset_id, config, **kwargs):
+        calls.append((dataset_id, config, kwargs))
+        return ({"config": config, "row": 0}, {"config": config, "row": 1})
+
+    monkeypatch.setitem(
+        sys.modules,
+        "datasets",
+        SimpleNamespace(DownloadConfig=FakeDownloadConfig, load_dataset=load_dataset),
+    )
+
+    rows = OfflineDatasetLoader().load(
+        "EleutherAI/hendrycks_math", "all", "test", revision
+    )
+
+    expected_configs = (
+        "algebra",
+        "counting_and_probability",
+        "geometry",
+        "intermediate_algebra",
+        "number_theory",
+        "prealgebra",
+        "precalculus",
+    )
+    assert [config for _, config, _ in calls] == list(expected_configs)
+    assert all(dataset_id == "EleutherAI/hendrycks_math" for dataset_id, _, _ in calls)
+    assert all(kwargs["split"] == "test" for _, _, kwargs in calls)
+    assert all(kwargs["revision"] == revision for _, _, kwargs in calls)
+    assert all(
+        kwargs["download_config"].local_files_only is True for _, _, kwargs in calls
+    )
+    assert rows == tuple(
+        {"config": config, "row": row}
+        for config in expected_configs
+        for row in (0, 1)
+    )
+
+
+def test_offline_loader_keeps_non_math_all_requests_to_one_call(monkeypatch):
+    calls = []
+
+    def load_dataset(dataset_id, config, **kwargs):
+        calls.append((dataset_id, config, kwargs))
+        return ({"question": "one"},)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "datasets",
+        SimpleNamespace(DownloadConfig=FakeDownloadConfig, load_dataset=load_dataset),
+    )
+
+    rows = OfflineDatasetLoader().load("gsm8k", "main", "train", "b" * 40)
+
+    assert rows == ({"question": "one"},)
+    assert len(calls) == 1
+    assert calls[0][0:2] == ("gsm8k", "main")
+
+
+def test_offline_loader_normalizes_math_config_failure(monkeypatch):
+    def load_dataset(dataset_id, config, **kwargs):
+        del dataset_id, kwargs
+        if config == "geometry":
+            raise FileNotFoundError("not cached")
+        return ({"config": config},)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "datasets",
+        SimpleNamespace(DownloadConfig=FakeDownloadConfig, load_dataset=load_dataset),
+    )
+
+    with pytest.raises(
+        DatasetCacheMiss,
+        match=r"EleutherAI/hendrycks_math@cccccccccccccccccccccccccccccccccccccccc",
+    ):
+        OfflineDatasetLoader().load(
+            "EleutherAI/hendrycks_math", "all", "train", "c" * 40
+        )
 
 
 def test_cli_cache_miss_writes_no_partial_manifest(tmp_path):
