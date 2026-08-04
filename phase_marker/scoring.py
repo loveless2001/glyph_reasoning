@@ -86,6 +86,9 @@ def select_audit_sample(
     """Hash-select up to ``per_source`` records for each source deterministically."""
     if per_source < 1:
         raise ValueError("per_source must be positive")
+    generation_ids = [record.generation_id for record in records]
+    if len(generation_ids) != len(set(generation_ids)):
+        raise ValueError("generation_id values must be unique")
 
     grouped: dict[str, list[ScoreRecord]] = defaultdict(list)
     for record in records:

@@ -90,6 +90,13 @@ def test_audit_sample_retains_all_available_rows_when_source_has_under_quota():
     assert Counter(row.source for row in selected) == {"gsm8k": 1, "svamp": 2}
 
 
+def test_audit_sample_rejects_duplicate_generation_ids():
+    records = [_score("gsm8k", "duplicate"), _score("svamp", "duplicate")]
+
+    with pytest.raises(ValueError, match="generation_id values must be unique"):
+        select_audit_sample(records, per_source=1, seed=20260804)
+
+
 def _generation(source: str, gold_answer: str, raw_completion: str) -> GenerationRecord:
     return GenerationRecord(
         generation_id="generation-1",
