@@ -240,6 +240,7 @@ def test_frozen_publication_requires_immutable_dataset_specs_and_complete_input_
         dataset_specs=frozen_specs,
         input_lineage=lineage,
         source_pool_accounting={"input_rows": 0, "parsed": 0, "parse_exclusions": 0},
+        parse_exclusion_provenance=(),
     )
 
     manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
@@ -296,3 +297,43 @@ def test_same_source_duplicate_unified_questions_are_ambiguous(fake_loader):
     assert len(ambiguous) == 1
     assert "gsm8k:duplicate-1" in ambiguous[0].example_id
     assert "gsm8k:duplicate-2" in ambiguous[0].example_id
+
+
+def test_frozen_publication_rejects_parse_exclusion_provenance_mismatch(tmp_path):
+    output_root = tmp_path / "splits"
+    frozen_specs = (
+        {"source": "gsm8k", "dataset_id": "gsm8k", "config": "main", "requested_split": "train", "revision": "a" * 40},
+        {"source": "gsm8k", "dataset_id": "gsm8k", "config": "main", "requested_split": "test", "revision": "a" * 40},
+        {"source": "svamp", "dataset_id": "ChilleD/SVAMP", "config": None, "requested_split": "train", "revision": "a" * 40},
+        {"source": "math", "dataset_id": "EleutherAI/hendrycks_math", "config": "all", "requested_split": "train", "revision": "a" * 40},
+        {"source": "math", "dataset_id": "EleutherAI/hendrycks_math", "config": "all", "requested_split": "test", "revision": "a" * 40},
+    )
+    lineage = {
+        "traces": {"sha256": "a" * 64, "path": "data/sft_final.jsonl"},
+        "unified": {"sha256": "b" * 64, "path": "data/unified_dataset.jsonl"},
+    }
+    mismatched_bundle = SplitBundle(
+        exclusions=[
+            DatasetExample(
+                source="legacy",
+                split="excluded_parse_final_marker",
+                example_id="line-2",
+                question="",
+                answer="",
+                question_hash=question_hash("legacy", ""),
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="parse exclusion provenance"):
+        write_split_bundle(
+            output_root,
+            TEST_CONFIG,
+            mismatched_bundle,
+            dataset_specs=frozen_specs,
+            input_lineage=lineage,
+            source_pool_accounting={"input_rows": 1, "parsed": 0, "parse_exclusions": 1},
+            parse_exclusion_provenance=("line-2|invalid_messages",),
+        )
+
+    assert not output_root.exists()

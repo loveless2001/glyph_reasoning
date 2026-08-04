@@ -170,6 +170,7 @@ def write_split_bundle(
     dataset_specs: Sequence[Mapping[str, object]] | None = None,
     input_lineage: Mapping[str, Mapping[str, str]] | None = None,
     source_pool_accounting: Mapping[str, int] | None = None,
+    parse_exclusion_provenance: Sequence[str] | None = None,
 ) -> None:
     """Atomically publish a complete immutable bundle, never a partial manifest."""
     if output_root.exists():
@@ -178,6 +179,9 @@ def write_split_bundle(
     frozen_specs = _validate_frozen_dataset_specs(dataset_specs or _dataset_specs())
     frozen_lineage = _validate_input_lineage(input_lineage)
     accounting = _validate_source_pool_accounting(source_pool_accounting)
+    parse_provenance = _validate_parse_exclusion_provenance(
+        bundle, accounting, parse_exclusion_provenance
+    )
     output_root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output_root.parent, prefix=f".{output_root.name}-") as temporary:
         staging = Path(temporary)
@@ -199,6 +203,7 @@ def write_split_bundle(
                     "datasets": frozen_specs,
                     "input_lineage": frozen_lineage,
                     "source_pool_accounting": accounting,
+                    "parse_exclusion_provenance": parse_provenance,
                 }
             ),
             "config_hash": sha256_json(asdict(config)),
@@ -206,6 +211,7 @@ def write_split_bundle(
             "input_lineage": frozen_lineage,
             "overlap_count": 0,
             "source_pool_accounting": accounting,
+            "parse_exclusion_provenance": parse_provenance,
             "source_counts": {
                 name: dict(sorted(Counter(row.source for row in rows).items()))
                 for name, rows in (
@@ -523,6 +529,31 @@ def _validate_source_pool_accounting(
     return accounting
 
 
+def _validate_parse_exclusion_provenance(
+    bundle: SplitBundle,
+    accounting: Mapping[str, int],
+    parse_exclusion_provenance: Sequence[str] | None,
+) -> list[str]:
+    if parse_exclusion_provenance is None:
+        raise ValueError("frozen publication requires parse exclusion provenance")
+    claimed = sorted(parse_exclusion_provenance)
+    if len(claimed) != len(set(claimed)) or any(
+        re.fullmatch(r"line-[1-9][0-9]*\|[a-z_]+", item) is None for item in claimed
+    ):
+        raise ValueError("invalid parse exclusion provenance")
+    actual = sorted(
+        _parse_exclusion_identity(row)
+        for row in bundle.exclusions
+        if row.split.startswith("excluded_parse_")
+    )
+    if (
+        accounting["parse_exclusions"] != len(claimed)
+        or actual != claimed
+    ):
+        raise ValueError("parse exclusion provenance does not match frozen exclusions")
+    return claimed
+
+
 def _required_spec_text(spec: Mapping[str, object], key: str) -> str:
     value = spec.get(key)
     if not isinstance(value, str) or not value:
@@ -537,6 +568,11 @@ def _unified_row_id(row: Mapping[str, object], index: int) -> str:
 
 def _parse_exclusion(line_number: int, reason: str) -> DatasetExample:
     return _example("legacy", f"excluded_parse_{reason}", f"line-{line_number}", "", "")
+
+
+def _parse_exclusion_identity(row: DatasetExample) -> str:
+    reason = row.split.removeprefix("excluded_parse_")
+    return f"{row.example_id}|{reason}"
 
 
 def _sha256_file(path: Path) -> str:
@@ -600,6 +636,9 @@ def main(argv: Sequence[str] | None = None, *, loader: DatasetLoader | None = No
             dataset_specs=dataset_specs,
             input_lineage=input_lineage,
             source_pool_accounting=accounting,
+            parse_exclusion_provenance=tuple(
+                _parse_exclusion_identity(row) for row in parse_exclusions
+            ),
         )
         print(
             canonical_json(
