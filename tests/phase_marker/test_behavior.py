@@ -522,6 +522,8 @@ def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing
 
     evidence_path = output / "evidence.jsonl"
     evidence_rows = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    replay_config = replace(config, arms=("glyph",))
+    manifest["config_hash"] = sha256_json(asdict(replay_config))
     evidence_rows[0]["scorer_outputs"]["correct"] = True
     evidence_path.write_text(
         "".join(canonical_json(row) + "\n" for row in evidence_rows), encoding="utf-8"
@@ -533,7 +535,7 @@ def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing
     (output / "manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="scorer replay"):
         _load_checkpoint_selections(
-            (output / "manifest.json",), config, "pilot", (42,), allow_test=True,
+            (output / "manifest.json",), replay_config, "pilot", (42,), allow_test=True,
             tokenizer=_DeterministicTokenizer(),
         )
 
@@ -551,7 +553,7 @@ def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing
     (output / "manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="tokenizer replay"):
         _load_checkpoint_selections(
-            (output / "manifest.json",), config, "pilot", (42,), allow_test=True,
+            (output / "manifest.json",), replay_config, "pilot", (42,), allow_test=True,
             tokenizer=_DeterministicTokenizer(),
         )
 
@@ -562,7 +564,7 @@ def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing
     (output / "manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="origin verification"):
         _load_checkpoint_selections(
-            (output / "manifest.json",), config, "pilot", (42,), allow_test=True,
+            (output / "manifest.json",), replay_config, "pilot", (42,), allow_test=True,
             tokenizer=_DeterministicTokenizer(),
         )
 

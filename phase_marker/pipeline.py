@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 import shlex
 from typing import Any
@@ -168,10 +169,11 @@ class MechanismApprovalMetadata:
             raise ValueError("mechanism approval schema/hardware mismatch")
         if (self.job_count, self.command_count, len(self.expected_outputs)) != (1, 1, 2):
             raise ValueError("mechanism approval job/command/output counts mismatch")
-        if any(not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0
+        if any(not isinstance(value, (int, float)) or isinstance(value, bool)
+               or not math.isfinite(value) or value <= 0
                for value in (self.gpu_hours, self.max_duration_hours, self.estimated_spend_usd,
                               self.spend_cap_usd)):
-            raise ValueError("mechanism approval estimates must be positive")
+            raise ValueError("mechanism approval estimates must be finite and positive")
         if self.gpu_hours > self.max_duration_hours or self.estimated_spend_usd > self.spend_cap_usd:
             raise ValueError("mechanism approval exceeds duration or spend cap")
         if not _is_sha256(self.parent_hash):

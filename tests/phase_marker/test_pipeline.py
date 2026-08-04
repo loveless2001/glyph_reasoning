@@ -692,6 +692,42 @@ def test_mechanism_cli_parses_one_exact_stage_approval(tmp_path: Path) -> None:
     assert approval.job_count == approval.command_count == 1
 
 
+@pytest.mark.parametrize("field", (
+    "gpu_hours", "max_duration_hours", "estimated_spend_usd", "spend_cap_usd",
+))
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+def test_mechanism_approval_rejects_nonfinite_estimates(
+    tmp_path: Path, field: str, value: float,
+) -> None:
+    values = {
+        "schema_version": 1, "stage": "capture", "hardware": "1x H100",
+        "job_count": 1, "command_count": 1,
+        "expected_outputs": pipeline_module._mechanism_expected_outputs("capture", tmp_path),
+        "parent_hash": "a" * 64, "gpu_hours": 1.0, "max_duration_hours": 2.0,
+        "estimated_spend_usd": 4.0, "spend_cap_usd": 5.0,
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match="finite"):
+        MechanismApprovalMetadata(**values)
+
+
+@pytest.mark.parametrize("value", ("nan", "inf", "-inf"))
+def test_mechanism_cli_rejects_nonfinite_estimate(tmp_path: Path, value: str) -> None:
+    outputs = pipeline_module._mechanism_expected_outputs("capture", tmp_path)
+    with pytest.raises(ValueError, match="finite"):
+        main([
+            "gate", "--stage", "capture", "--kind", "pilot", "--seeds", "42",
+            "--config", str(CONFIG_PATH), "--artifact-root", str(tmp_path),
+            "--mechanism-schema-version", "1", "--mechanism-stage", "capture",
+            "--mechanism-hardware", "1x H100", "--mechanism-job-count", "1",
+            "--mechanism-command-count", "1", "--mechanism-expected-outputs", *outputs,
+            "--mechanism-parent-hash", "a" * 64, f"--mechanism-gpu-hours={value}",
+            "--mechanism-max-duration-hours", "2",
+            "--mechanism-estimated-spend-usd", "4", "--mechanism-spend-cap-usd", "5",
+        ])
+
+
 def test_intervention_approval_emits_nothing_before_activation_exists(
     tmp_path: Path, config: ExperimentConfig,
 ) -> None:
@@ -944,8 +980,12 @@ def test_behavior_gate_requires_training_completion_markers(
 
 
 def test_behavior_gate_requires_complete_validation_selection_matrix(
-    tmp_path: Path, config: ExperimentConfig
+    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "phase_marker.behavior._load_pinned_evidence_tokenizer",
+        lambda *_: pytest.fail("tokenizer loader was called for incomplete matrix"),
+    )
     _write_split(tmp_path, config)
     _write_materializations(tmp_path, config)
     _write_training_runs(tmp_path, config)
@@ -957,6 +997,39 @@ def test_behavior_gate_requires_complete_validation_selection_matrix(
 
     assert result.passed is False
     assert "selection" in result.reason
+
+
+@pytest.mark.parametrize("malformation", ("parent", "duplicate"))
+def test_behavior_gate_rejects_structural_selection_bundle_before_tokenizer_load(
+    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch,
+    malformation: str,
+) -> None:
+    monkeypatch.setattr(
+        "phase_marker.behavior._load_pinned_evidence_tokenizer",
+        lambda *_: pytest.fail("tokenizer loader was called for structural failure"),
+    )
+    _write_split(tmp_path, config)
+    _write_materializations(tmp_path, config)
+    _write_training_runs(tmp_path, config)
+    _write_checkpoint_selections(tmp_path, config)
+    path = tmp_path / "checkpoint-selections/confirmatory/seed-101/glyph/manifest.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if malformation == "parent":
+        payload["parent_hashes"] = ["0" * 64] * 3
+    else:
+        duplicate_source = (
+            tmp_path / "checkpoint-selections/confirmatory/seed-101/dot/manifest.json"
+        )
+        payload = json.loads(duplicate_source.read_text(encoding="utf-8"))
+    payload["artifact_id"] = sha256_json(
+        {key: value for key, value in payload.items() if key != "artifact_id"}
+    )
+    _write_json(path, payload)
+
+    result = run_gate("behavior", config, tmp_path)
+
+    assert result.passed is False
+    assert malformation in result.reason
 
 
 def test_behavior_gate_rejects_omitted_declared_checkpoint_candidate(

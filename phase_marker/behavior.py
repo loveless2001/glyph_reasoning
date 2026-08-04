@@ -1300,6 +1300,7 @@ def _load_checkpoint_selections(
 ) -> dict[tuple[int, str], dict[str, object]]:
     expected = {(seed, arm) for seed in seeds for arm in config.arms}
     result: dict[tuple[int, str], dict[str, object]] = {}
+    token_replays: list[tuple[Path, str, tuple[int, ...], tuple[str, ...]]] = []
     config_hash = sha256_json(asdict(config))
     evidence_tokenizer = tokenizer
     expected_tokenizer_revision = (
@@ -1441,35 +1442,9 @@ def _load_checkpoint_selections(
                 ):
                     raise ValueError(f"checkpoint selection token evidence mismatch: {path}")
                 assert isinstance(continuation, str)
-                if evidence_tokenizer is None:
-                    evidence_tokenizer = (
-                        _CodepointEvidenceTokenizer()
-                        if allow_test else _load_pinned_evidence_tokenizer(config.model_id)
-                    )
-                try:
-                    replayed_ids = tuple(evidence_tokenizer.encode(
-                        continuation, add_special_tokens=False
-                    ))
-                    replayed_pieces: list[str] = []
-                    previous = ""
-                    for width in range(1, len(replayed_ids) + 1):
-                        decoded = evidence_tokenizer.decode(
-                            replayed_ids[:width],
-                            skip_special_tokens=False,
-                            clean_up_tokenization_spaces=False,
-                        )
-                        replayed_pieces.append(decoded[len(previous):])
-                        previous = decoded
-                except (TypeError, ValueError) as error:
-                    raise ValueError(
-                        f"checkpoint selection tokenizer replay mismatch: {path}"
-                    ) from error
-                if (
-                    replayed_ids != tuple(token_ids)
-                    or tuple(replayed_pieces) != tuple(pieces)
-                    or previous != continuation
-                ):
-                    raise ValueError(f"checkpoint selection tokenizer replay mismatch: {path}")
+                token_replays.append((
+                    path, continuation, tuple(token_ids), tuple(pieces)
+                ))
                 strict.append(replayed.correct)
                 contributions.append(float(sum(logprobs)))
             if (
@@ -1494,6 +1469,36 @@ def _load_checkpoint_selections(
         raise ValueError(
             f"checkpoint selections must cover exact seed/arm matrix: missing={sorted(expected-set(result))}"
         )
+    if evidence_tokenizer is None:
+        evidence_tokenizer = (
+            _CodepointEvidenceTokenizer()
+            if allow_test else _load_pinned_evidence_tokenizer(config.model_id)
+        )
+    for path, continuation, token_ids, pieces in token_replays:
+        try:
+            replayed_ids = tuple(evidence_tokenizer.encode(
+                continuation, add_special_tokens=False
+            ))
+            replayed_pieces: list[str] = []
+            previous = ""
+            for width in range(1, len(replayed_ids) + 1):
+                decoded = evidence_tokenizer.decode(
+                    replayed_ids[:width],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                replayed_pieces.append(decoded[len(previous):])
+                previous = decoded
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"checkpoint selection tokenizer replay mismatch: {path}"
+            ) from error
+        if (
+            replayed_ids != token_ids
+            or tuple(replayed_pieces) != pieces
+            or previous != continuation
+        ):
+            raise ValueError(f"checkpoint selection tokenizer replay mismatch: {path}")
     return result
 
 
