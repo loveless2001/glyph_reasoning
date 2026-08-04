@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from phase_marker.config import ExperimentConfig
 from phase_marker.schema import CanonicalTrace, PhaseSpan
-from phase_marker.token_audit import SplitLineageUnavailable, materialize_training_arms
+from phase_marker.token_audit import (
+    QWEN25_7B_TOKENIZER_REVISION,
+    SplitLineageUnavailable,
+    _load_frozen_training_traces,
+    materialize_training_arms,
+)
 
 from tests.phase_marker.test_token_audit import FaithfulFakeTokenizer
 
@@ -84,7 +90,7 @@ def test_materialization_writes_six_real_jsonl_datasets_and_lineage_manifest(
         assert saved["parent_hashes"] == ["f" * 64]
         assert saved["metadata"]["row_hashes"]
         assert saved["metadata"]["neutral_delimiter"] == ". . ."
-        assert saved["metadata"]["tokenizer_revision"] == "fake-qwen-tokenizer-revision"
+        assert saved["metadata"]["tokenizer_revision"] == QWEN25_7B_TOKENIZER_REVISION
         assert saved["metadata"]["local_frequency_label"] == "local_corpus_frequency_proxy"
 
 
@@ -106,10 +112,126 @@ def test_manifest_binds_the_resolved_cached_qwen_revision(
         json.dumps({"artifact_id": "e" * 64}) + "\n", encoding="utf-8"
     )
     tokenizer = FaithfulFakeTokenizer()
-    tokenizer.revision = None
-    tokenizer.name_or_path = "Qwen/Qwen2.5-7B-Instruct"
-    tokenizer.init_kwargs = {"revision": "main"}
+    tokenizer.init_kwargs["revision"] = "main"
 
     manifests = materialize_training_arms(config, traces, tokenizer, tmp_path / "training-data")
 
-    assert manifests["dot"].metadata["tokenizer_revision"] == "a09a35458c702b33eeacc393d103063234e8bc28"
+    assert manifests["dot"].metadata["tokenizer_revision"] == QWEN25_7B_TOKENIZER_REVISION
+
+
+def test_materialization_rejects_a_subset_of_the_canonical_six_arms(
+    tmp_path: Path, config: ExperimentConfig, traces: list[CanonicalTrace]
+):
+    subset = replace(config, arms=("semantic",))
+
+    with pytest.raises(ValueError, match="exactly the canonical six arms"):
+        materialize_training_arms(subset, traces, FaithfulFakeTokenizer(), tmp_path / "training-data")
+
+    assert not (tmp_path / "training-data").exists()
+
+
+def test_materialization_rejects_unresolved_or_mismatched_qwen_provenance(
+    tmp_path: Path, config: ExperimentConfig, traces: list[CanonicalTrace]
+):
+    split_root = tmp_path / "splits"
+    split_root.mkdir()
+    (split_root / "manifest.json").write_text(
+        json.dumps({"artifact_id": "d" * 64}) + "\n", encoding="utf-8"
+    )
+    tokenizer = FaithfulFakeTokenizer()
+    tokenizer.init_kwargs = {"_commit_hash": "b" * 40, "revision": "main"}
+
+    with pytest.raises(ValueError, match="resolved tokenizer revision"):
+        materialize_training_arms(config, traces, tokenizer, tmp_path / "training-data")
+
+    assert not (tmp_path / "training-data").exists()
+
+
+def test_frozen_trace_loader_preserves_frozen_order_and_identity(
+    tmp_path: Path, traces: list[CanonicalTrace], monkeypatch: pytest.MonkeyPatch
+):
+    split_root = tmp_path / "splits"
+    split_root.mkdir()
+    rows = [
+        {
+            "example_id": "example-2",
+            "trace_id": "trace-2",
+            "source": "math",
+            "question": "What is 4 + 4?",
+            "answer": "8",
+            "split": "train",
+        },
+        {
+            "example_id": "example-1",
+            "trace_id": "trace-1",
+            "source": "gsm8k",
+            "question": "What is 2 + 3?",
+            "answer": "5",
+            "split": "train",
+        },
+    ]
+    (split_root / "train.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    monkeypatch.setattr("phase_marker.token_audit.parse_trace_pool", lambda _: (tuple(traces), (), {}))
+
+    selected = _load_frozen_training_traces(tmp_path / "training-data")
+
+    assert [trace.trace_id for trace in selected] == ["trace-2", "trace-1"]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {
+            "example_id": "example-1",
+            "source": "gsm8k",
+            "question": "What is 2 + 3?",
+            "answer": "5",
+            "split": "train",
+        },
+        {
+            "example_id": "example-1",
+            "trace_id": "trace-1",
+            "source": "gsm8k",
+            "question": "What is 2 + 3?",
+            "answer": "wrong",
+            "split": "train",
+        },
+    ],
+)
+def test_frozen_trace_loader_rejects_missing_or_mismatched_identity(
+    tmp_path: Path,
+    traces: list[CanonicalTrace],
+    monkeypatch: pytest.MonkeyPatch,
+    row: dict[str, str],
+):
+    split_root = tmp_path / "splits"
+    split_root.mkdir()
+    (split_root / "train.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    monkeypatch.setattr("phase_marker.token_audit.parse_trace_pool", lambda _: (tuple(traces), (), {}))
+
+    with pytest.raises(ValueError, match="frozen train row"):
+        _load_frozen_training_traces(tmp_path / "training-data")
+
+
+def test_frozen_trace_loader_rejects_duplicate_stable_ids(
+    tmp_path: Path, traces: list[CanonicalTrace], monkeypatch: pytest.MonkeyPatch
+):
+    split_root = tmp_path / "splits"
+    split_root.mkdir()
+    row = {
+        "example_id": "example-1",
+        "trace_id": "trace-1",
+        "source": "gsm8k",
+        "question": "What is 2 + 3?",
+        "answer": "5",
+        "split": "train",
+    }
+    (split_root / "train.jsonl").write_text(
+        json.dumps(row) + "\n" + json.dumps(row) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("phase_marker.token_audit.parse_trace_pool", lambda _: (tuple(traces), (), {}))
+
+    with pytest.raises(ValueError, match="duplicate"):
+        _load_frozen_training_traces(tmp_path / "training-data")

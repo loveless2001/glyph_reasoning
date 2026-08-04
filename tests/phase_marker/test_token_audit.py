@@ -8,9 +8,9 @@ from phase_marker.token_audit import audit_marker_set, select_neutral_delimiter
 class FaithfulFakeTokenizer:
     """Tiny tokenizer double with the HF methods consumed by the audit code."""
 
-    revision = "fake-qwen-tokenizer-revision"
-
     def __init__(self) -> None:
+        self.name_or_path = "Qwen/Qwen2.5-7B-Instruct"
+        self.init_kwargs = {"_commit_hash": "a09a35458c702b33eeacc393d103063234e8bc28"}
         self._encodings = {
             "🜞": [41, 42],
             "🜆": [43, 44],
@@ -30,6 +30,7 @@ class FaithfulFakeTokenizer:
             "♣": [19, 20],
             "♥": [21, 22],
             "♦": [23, 24],
+            "bc": [77],
         }
         self._vocabulary = {
             ".": 3,
@@ -81,4 +82,12 @@ def test_audit_records_token_and_unicode_measurements_without_pretraining_claims
     assert row.token_strings == ("tok-30", "tok-31")
     assert row.token_count == 2
     assert row.vocabulary_member is False
+    assert row.local_corpus_count == 0
+
+
+def test_local_frequency_does_not_join_neighboring_documents():
+    tokenizer = FaithfulFakeTokenizer()
+
+    row = audit_marker_set(tokenizer, ["bc"], local_corpus=("ab", "c"))[0]
+
     assert row.local_corpus_count == 0

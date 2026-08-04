@@ -10,7 +10,7 @@ from pathlib import Path
 import json
 import string
 
-from phase_marker.config import ExperimentConfig
+from phase_marker.config import ExperimentConfig, REQUIRED_MODEL_ID
 from phase_marker.io import canonical_json, read_jsonl, sha256_json, write_jsonl_atomic
 from phase_marker.schema import ArtifactManifest, CanonicalTrace
 from phase_marker.splits import parse_trace_pool
@@ -22,6 +22,7 @@ EMOJI_CONTROLS = ("🟦", "🟥", "🔶", "🔷")
 RANDOM_SYMBOL_CANDIDATES = ("♠", "♣", "♥", "♦")
 LOCAL_FREQUENCY_LABEL = "local_corpus_frequency_proxy"
 QWEN25_7B_TOKENIZER_REVISION = "a09a35458c702b33eeacc393d103063234e8bc28"
+CANONICAL_TRAINING_ARMS = ("semantic", "glyph", "dot", "random", "direct", "filler")
 
 
 class TokenWidthMismatch(ValueError):
@@ -56,7 +57,6 @@ def audit_marker_set(
     about pretraining frequency.
     """
     vocabulary = _vocabulary(tokenizer)
-    corpus = "".join(local_corpus)
     rows: list[TokenAuditRow] = []
     for symbol in symbols:
         if not symbol:
@@ -72,7 +72,7 @@ def audit_marker_set(
                 token_strings=token_strings,
                 token_count=len(token_ids),
                 vocabulary_member=symbol in vocabulary,
-                local_corpus_count=corpus.count(symbol),
+                local_corpus_count=sum(document.count(symbol) for document in local_corpus),
             )
         )
     return rows
@@ -98,6 +98,9 @@ def materialize_training_arms(
     output_root: Path,
 ) -> dict[str, ArtifactManifest]:
     """Emit all configured training arms only with approved frozen split lineage."""
+    if config.arms != CANONICAL_TRAINING_ARMS:
+        raise ValueError("materialization requires exactly the canonical six arms")
+    tokenizer_revision = _require_resolved_qwen_tokenizer_revision(config.model_id, tokenizer)
     split_hash = _parent_split_hash(output_root)
     if output_root.exists():
         raise FileExistsError(f"refusing to overwrite materialized training data: {output_root}")
@@ -142,7 +145,7 @@ def materialize_training_arms(
                 "row_hashes": row_hashes,
                 "exclusions": [],
                 "filler_length_counts": filler_lengths,
-                "tokenizer_revision": _tokenizer_revision(tokenizer, config.model_id),
+                "tokenizer_revision": tokenizer_revision,
                 "parent_split_hash": split_hash,
                 "neutral_delimiter": neutral_delimiter,
                 "target_marker_token_width": target_width,
@@ -277,25 +280,40 @@ def _filler_length_counts(rows: Sequence[Mapping[str, object]]) -> dict[str, int
     return dict(sorted(counts.items(), key=lambda item: int(item[0])))
 
 
-def _tokenizer_revision(tokenizer: object, model_id: str) -> str:
-    explicit = getattr(tokenizer, "revision", None)
-    if isinstance(explicit, str) and explicit:
-        return explicit
+def _require_resolved_qwen_tokenizer_revision(tokenizer_model_id: str, tokenizer: object) -> str:
+    if tokenizer_model_id != REQUIRED_MODEL_ID:
+        raise ValueError(f"unsupported tokenizer model id: {tokenizer_model_id}")
+    revision = _resolved_tokenizer_revision(tokenizer)
+    if revision != QWEN25_7B_TOKENIZER_REVISION:
+        raise ValueError(
+            "resolved tokenizer revision must be "
+            f"{QWEN25_7B_TOKENIZER_REVISION}, got {revision!r}"
+        )
+    return revision
+
+
+def _resolved_tokenizer_revision(tokenizer: object) -> str:
     init_kwargs = getattr(tokenizer, "init_kwargs", None)
+    candidates: set[str] = set()
     if isinstance(init_kwargs, Mapping):
         commit_hash = init_kwargs.get("_commit_hash")
         if isinstance(commit_hash, str) and commit_hash:
-            return commit_hash
-    if model_id == "Qwen/Qwen2.5-7B-Instruct":
-        return QWEN25_7B_TOKENIZER_REVISION
-    if isinstance(init_kwargs, Mapping):
-        revision = init_kwargs.get("revision")
-        if isinstance(revision, str) and revision:
-            return revision
-    name_or_path = getattr(tokenizer, "name_or_path", None)
-    if isinstance(name_or_path, str) and name_or_path:
-        return name_or_path
-    return "unknown"
+            candidates.add(commit_hash)
+        for value in init_kwargs.values():
+            if isinstance(value, str):
+                candidates.update(_snapshot_revisions(value))
+    if len(candidates) != 1:
+        raise ValueError("resolved tokenizer revision is unavailable or ambiguous")
+    return next(iter(candidates))
+
+
+def _snapshot_revisions(value: str) -> set[str]:
+    parts = Path(value).parts
+    return {
+        parts[index + 1]
+        for index, part in enumerate(parts[:-1])
+        if part == "snapshots" and len(parts[index + 1]) == 40
+    }
 
 
 def _write_manifest(path: Path, manifest: ArtifactManifest) -> None:
@@ -305,7 +323,13 @@ def _write_manifest(path: Path, manifest: ArtifactManifest) -> None:
 def _load_cached_tokenizer(model_id: str) -> object:
     from transformers import AutoTokenizer
 
-    return AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+    if model_id != REQUIRED_MODEL_ID:
+        raise ValueError(f"unsupported tokenizer model id: {model_id}")
+    return AutoTokenizer.from_pretrained(
+        model_id,
+        revision=QWEN25_7B_TOKENIZER_REVISION,
+        local_files_only=True,
+    )
 
 
 def _load_frozen_training_traces(output_root: Path) -> tuple[CanonicalTrace, ...]:
@@ -315,16 +339,42 @@ def _load_frozen_training_traces(output_root: Path) -> tuple[CanonicalTrace, ...
         raise SplitLineageUnavailable(
             f"frozen training split required at {train_path}; refusing to materialize unapproved traces"
         )
-    selected = {
-        (str(row["source"]), str(row["question"]))
-        for row in read_jsonl(train_path)
-        if row.get("split") == "train"
-    }
     traces, _, _ = parse_trace_pool(Path("data/sft_final.jsonl"))
-    # The split builder uses official-source labels while legacy traces retain their original
-    # source. Match the frozen question set and let the manifest remain the lineage authority.
-    questions = {question for _, question in selected}
-    return tuple(trace for trace in traces if trace.question in questions)
+    traces_by_id = {trace.trace_id: trace for trace in traces}
+    if len(traces_by_id) != len(traces):
+        raise ValueError("canonical trace pool has duplicate trace ids")
+    selected: list[CanonicalTrace] = []
+    seen_example_ids: set[str] = set()
+    seen_trace_ids: set[str] = set()
+    for line_number, row in enumerate(read_jsonl(train_path), start=1):
+        prefix = f"frozen train row {line_number}"
+        if row.get("split") != "train":
+            raise ValueError(f"{prefix} must have split='train'")
+        example_id = _frozen_row_text(row, "example_id", prefix)
+        trace_id = _frozen_row_text(row, "trace_id", prefix)
+        source = _frozen_row_text(row, "source", prefix)
+        question = _frozen_row_text(row, "question", prefix)
+        answer = _frozen_row_text(row, "answer", prefix)
+        if example_id in seen_example_ids:
+            raise ValueError(f"{prefix} has duplicate example_id {example_id!r}")
+        if trace_id in seen_trace_ids:
+            raise ValueError(f"{prefix} has duplicate trace_id {trace_id!r}")
+        trace = traces_by_id.get(trace_id)
+        if trace is None:
+            raise ValueError(f"{prefix} references missing trace_id {trace_id!r}")
+        if (trace.source, trace.question, trace.answer) != (source, question, answer):
+            raise ValueError(f"{prefix} does not match source/question/answer for {trace_id!r}")
+        seen_example_ids.add(example_id)
+        seen_trace_ids.add(trace_id)
+        selected.append(trace)
+    return tuple(selected)
+
+
+def _frozen_row_text(row: Mapping[str, object], key: str, prefix: str) -> str:
+    value = row.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{prefix} requires nonempty {key}")
+    return value
 
 
 def main(argv: Sequence[str] | None = None) -> None:
