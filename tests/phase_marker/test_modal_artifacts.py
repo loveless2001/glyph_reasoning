@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -27,6 +28,7 @@ from phase_marker.modal_artifacts import (
     write_attempt_receipt,
 )
 import phase_marker.modal_plan as modal_plan
+import phase_marker.modal_artifacts as modal_artifacts
 from tests.phase_marker.test_pipeline import _write_materializations, _write_split
 
 
@@ -406,7 +408,9 @@ def test_workspace_rejects_existing_attempt_directory(repo_fixture: Path, tmp_pa
         )
 
 
-def test_exact_command_uses_no_shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exact_command_uses_no_shell(
+    repo_fixture: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Would fail if command execution reintroduced a shell boundary."""
     calls: list[tuple[object, dict[str, object]]] = []
     monkeypatch.setattr(
@@ -415,22 +419,24 @@ def test_exact_command_uses_no_shell(tmp_path: Path, monkeypatch: pytest.MonkeyP
         lambda argv, **kw: calls.append((argv, kw)) or type("Result", (), {"returncode": 0})(),
     )
 
+    code_root = tmp_path / "code"
+    (code_root / ".venv/bin").mkdir(parents=True)
+    (code_root / ".venv/bin/python").touch()
+    (code_root / "phase_marker").mkdir()
+    workspace = prepare_ephemeral_workspace(
+        code_root=code_root, input_root=repo_fixture, run_root=tmp_path / "runs",
+        bundle=build_input_bundle(repo_fixture), stage="train", arm="glyph", attempt_id="a1",
+    )
     result = run_exact_command(
-        "./.venv/bin/python -m phase_marker.training train "
-        "--config configs/phase-marker-qwen25-7b.toml --arm glyph --seed 42 "
-        "--data artifacts/phase-marker/training-data/glyph.jsonl "
-        "--output-dir artifacts/phase-marker/checkpoints/pilot/seed-42/glyph "
-        "--manifest artifacts/phase-marker/checkpoints/pilot/seed-42/glyph/run-manifest.json",
-        workspace=tmp_path,
-        log_path=tmp_path / "logs/train.log",
-        env={"A": "B"},
+        _training_command("glyph"), workspace=workspace,
+        log_path=workspace.parent / "logs/train.log", env={"A": "B"},
     )
 
     assert result == 0
     assert calls[0][0][:4] == ["./.venv/bin/python", "-m", "phase_marker.training", "train"]
     assert calls[0][1]["shell"] is False
-    assert calls[0][1]["cwd"] == tmp_path
-    assert (tmp_path / "logs/train.log").is_file()
+    assert calls[0][1]["cwd"] == workspace
+    assert (workspace.parent / "logs/train.log").is_file()
 
 
 @pytest.mark.parametrize(
@@ -475,19 +481,23 @@ def test_receipt_rejects_stale_artifact_id(tmp_path: Path) -> None:
 
 def test_promotion_copies_attempt_bytes_once_and_refuses_existing_canonical(tmp_path: Path) -> None:
     """Would fail if promotion overwrote a canonical result or changed output bytes."""
-    source = tmp_path / "workspace-output"
-    source.mkdir()
+    receipt = _receipt_for_file("adapter.bin", b"frozen adapter bytes")
+    attempt_root = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = (
+        attempt_root / "workspace"
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    )
+    source.mkdir(parents=True)
     (source / "adapter.bin").write_bytes(b"frozen adapter bytes")
-    attempt_root = tmp_path / "runs/attempts/a1"
-    canonical = tmp_path / "canonical/glyph"
+    canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
 
-    promoted = promote_validated_output(source, attempt_root, canonical, receipt_fixture())
+    promoted = promote_validated_output(source, attempt_root, canonical, receipt)
 
     assert promoted == canonical
     assert (canonical / "adapter.bin").read_bytes() == b"frozen adapter bytes"
     assert (source / "adapter.bin").read_bytes() == b"frozen adapter bytes"
     with pytest.raises(FileExistsError, match="canonical output already exists"):
-        promote_validated_output(source, tmp_path / "runs/attempts/a2", canonical, receipt_fixture())
+        promote_validated_output(source, attempt_root, canonical, receipt)
 
 
 def test_rescheduled_executions_get_distinct_uuid_attempt_ids() -> None:
@@ -497,3 +507,188 @@ def test_rescheduled_executions_get_distinct_uuid_attempt_ids() -> None:
     assert first != second
     assert len(first) == 36
     assert len(second) == 36
+
+
+def _workspace_code_root(tmp_path: Path) -> Path:
+    code_root = tmp_path / "code"
+    (code_root / ".venv/bin").mkdir(parents=True)
+    (code_root / ".venv/bin/python").write_text("#!/bin/sh\n", encoding="utf-8")
+    (code_root / "phase_marker").mkdir()
+    (code_root / "phase_marker/__init__.py").write_text("", encoding="utf-8")
+    return code_root
+
+
+def _training_command(arm: str) -> str:
+    output = f"artifacts/phase-marker/checkpoints/pilot/seed-42/{arm}"
+    return (
+        "./.venv/bin/python -m phase_marker.training train "
+        "--config configs/phase-marker-qwen25-7b.toml "
+        f"--arm {arm} --seed 42 "
+        f"--data artifacts/phase-marker/training-data/{arm}.jsonl "
+        f"--output-dir {output} --manifest {output}/run-manifest.json"
+    )
+
+
+def _receipt_for_file(path: str, content: bytes, **changes: object) -> AttemptReceipt:
+    return receipt_fixture(
+        expected_outputs=(path,),
+        output_hashes=(hashlib.sha256(content).hexdigest(),),
+        **changes,
+    )
+
+
+def test_workspace_setup_failure_keeps_partial_attempt_quarantined(
+    repo_fixture: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if setup errors erase forensic evidence from an attempt."""
+    original_copy = modal_artifacts.shutil.copyfile
+
+    def copy_then_fail(source: Path, destination: Path) -> str:
+        original_copy(source, destination)
+        raise OSError("simulated copy interruption")
+
+    monkeypatch.setattr(modal_artifacts.shutil, "copyfile", copy_then_fail)
+    with pytest.raises(OSError, match="copy interruption"):
+        prepare_ephemeral_workspace(
+            code_root=_workspace_code_root(tmp_path), input_root=repo_fixture,
+            run_root=tmp_path / "runs", bundle=build_input_bundle(repo_fixture),
+            stage="train", arm="glyph", attempt_id="attempt-keep",
+        )
+
+    retained = tmp_path / "runs/attempts/attempt-keep/workspace"
+    assert (retained / ".venv/bin/python").is_symlink()
+    assert (retained / "configs/phase-marker-qwen25-7b.toml").is_file()
+
+
+def test_failed_output_copy_keeps_staging_quarantined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a byte-validation failure deleted the attempt copy."""
+    receipt = _receipt_for_file("adapter.bin", b"adapter")
+    attempt = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = (
+        attempt / "workspace"
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    )
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"adapter")
+    canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    monkeypatch.setattr(
+        modal_artifacts,
+        "_tree_hashes",
+        lambda root: (("adapter.bin", 7, "a" * 64),)
+        if Path(root).resolve() == source.resolve()
+        else (("adapter.bin", 7, "b" * 64),),
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        promote_validated_output(source, attempt, canonical, receipt)
+
+    assert (attempt / "promotion-staging/adapter.bin").read_bytes() == b"adapter"
+
+
+def test_workspace_metadata_rejects_another_arm_command(
+    repo_fixture: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a glyph workspace could execute a different frozen arm."""
+    workspace = prepare_ephemeral_workspace(
+        code_root=_workspace_code_root(tmp_path), input_root=repo_fixture,
+        run_root=tmp_path / "runs", bundle=build_input_bundle(repo_fixture),
+        stage="train", arm="glyph", attempt_id="attempt-glyph",
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("ran drifted command"))
+
+    with pytest.raises(ValueError, match="workspace command"):
+        run_exact_command(
+            _training_command("dot"), workspace=workspace,
+            log_path=workspace / "logs/drift.log", env={},
+        )
+
+
+def test_log_must_be_outside_workspace_and_producer_paths(
+    repo_fixture: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a producer tree could be polluted with execution logs."""
+    workspace = prepare_ephemeral_workspace(
+        code_root=_workspace_code_root(tmp_path), input_root=repo_fixture,
+        run_root=tmp_path / "runs", bundle=build_input_bundle(repo_fixture),
+        stage="train", arm="glyph", attempt_id="attempt-logs",
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("ran with producer log"))
+
+    with pytest.raises(ValueError, match="outside the ephemeral workspace"):
+        run_exact_command(
+            _training_command("glyph"), workspace=workspace,
+            log_path=workspace / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph/train.log",
+            env={},
+        )
+
+
+@pytest.mark.parametrize("attempt_id", (".", ".."))
+def test_workspace_rejects_dot_path_identity(
+    repo_fixture: Path, tmp_path: Path, attempt_id: str,
+) -> None:
+    """Would fail if dot components could escape an attempt namespace."""
+    with pytest.raises(ValueError, match="attempt ID"):
+        prepare_ephemeral_workspace(
+            code_root=_workspace_code_root(tmp_path), input_root=repo_fixture,
+            run_root=tmp_path / "runs", bundle=build_input_bundle(repo_fixture),
+            stage="train", arm="glyph", attempt_id=attempt_id,
+        )
+
+
+def test_promotion_rejects_output_bytes_not_named_by_receipt(tmp_path: Path) -> None:
+    """Would fail if a valid receipt could promote different bytes than it records."""
+    receipt = _receipt_for_file("adapter.bin", b"expected bytes")
+    source = (
+        tmp_path / "runs/attempts" / receipt.attempt_id / "workspace"
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    )
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"wrong bytes")
+
+    with pytest.raises(ValueError, match="receipt output hash"):
+        promote_validated_output(
+            source, tmp_path / "runs/attempts" / receipt.attempt_id,
+            tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph", receipt,
+        )
+
+
+def test_promotion_binds_receipt_arm_to_canonical_destination(tmp_path: Path) -> None:
+    """Would fail if a glyph receipt could publish into another arm's canonical root."""
+    receipt = _receipt_for_file("adapter.bin", b"adapter")
+    source = (
+        tmp_path / "runs/attempts" / receipt.attempt_id / "workspace"
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    )
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"adapter")
+
+    with pytest.raises(ValueError, match="canonical destination"):
+        promote_validated_output(
+            source, source.parents[6],
+            tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/dot",
+            receipt,
+        )
+
+
+def test_promotion_rejects_different_filesystem_before_staging(tmp_path: Path) -> None:
+    """Would fail if cross-filesystem promotion staged bytes before refusing rename."""
+    receipt = _receipt_for_file("adapter.bin", b"adapter")
+    attempt = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = (
+        attempt / "workspace"
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    )
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"adapter")
+    other_filesystem = tmp_path / "runs/artifacts"
+    other_filesystem.symlink_to("/proc", target_is_directory=True)
+
+    with pytest.raises(ValueError, match="same filesystem"):
+        promote_validated_output(
+            source, attempt,
+            other_filesystem / "phase-marker/checkpoints/pilot/seed-42/glyph", receipt,
+        )
+
+    assert not (attempt / "promotion-staging").exists()

@@ -42,6 +42,7 @@ _MANIFEST_PATHS = (
 _SHA256_CHARS = frozenset("0123456789abcdef")
 _PILOT_KIND = "pilot"
 _PILOT_SEED = 42
+_WORKSPACE_METADATA = "workspace-metadata.json"
 
 
 class VolumeClient(Protocol):
@@ -122,7 +123,7 @@ def prepare_ephemeral_workspace(
         raise ValueError("workspace stage is invalid")
     if arm not in _ARMS:
         raise ValueError("workspace arm is invalid")
-    if not attempt_id or Path(attempt_id).name != attempt_id:
+    if not _is_path_identity(attempt_id):
         raise ValueError("attempt ID must be a single path component")
 
     code = Path(code_root).resolve()
@@ -141,30 +142,27 @@ def prepare_ephemeral_workspace(
     if attempt_root.exists():
         raise FileExistsError("attempt workspace already exists")
     workspace = attempt_root / "workspace"
-    try:
-        workspace.mkdir(parents=True)
-        _symlink_exact_path(python, workspace / ".venv/bin/python")
-        _symlink_exact_path(package, workspace / "phase_marker", directory=True)
-        adapter = code / "modal_phase_marker.py"
-        if adapter.is_file():
-            _symlink_exact_path(adapter, workspace / "modal_phase_marker.py")
-        for item in bundle.files:
-            destination = workspace / item.path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(inputs / item.path, destination)
-            destination.chmod(0o444)
-        if canonical_training_root is not None:
-            training = Path(canonical_training_root).resolve()
-            if not training.is_dir():
-                raise ValueError("canonical training root is missing")
-            target = (
-                workspace / _ARTIFACT_ROOT / "checkpoints" / _PILOT_KIND
-                / f"seed-{_PILOT_SEED}" / arm
-            )
-            _symlink_exact_path(training, target, directory=True)
-    except BaseException:
-        shutil.rmtree(attempt_root, ignore_errors=True)
-        raise
+    workspace.mkdir(parents=True)
+    _symlink_exact_path(python, workspace / ".venv/bin/python")
+    _symlink_exact_path(package, workspace / "phase_marker", directory=True)
+    adapter = code / "modal_phase_marker.py"
+    if adapter.is_file():
+        _symlink_exact_path(adapter, workspace / "modal_phase_marker.py")
+    for item in bundle.files:
+        destination = workspace / item.path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(inputs / item.path, destination)
+        destination.chmod(0o444)
+    if canonical_training_root is not None:
+        training = Path(canonical_training_root).resolve()
+        if not training.is_dir():
+            raise ValueError("canonical training root is missing")
+        target = (
+            workspace / _ARTIFACT_ROOT / "checkpoints" / _PILOT_KIND
+            / f"seed-{_PILOT_SEED}" / arm
+        )
+        _symlink_exact_path(training, target, directory=True)
+    _write_workspace_metadata(workspace, attempt_id, stage, arm)
     return workspace
 
 
@@ -180,9 +178,11 @@ def run_exact_command(
     root = Path(workspace).resolve()
     if not root.is_dir():
         raise ValueError("workspace is missing")
+    attempt_root = _validate_workspace_metadata(root, argv)
     log = Path(log_path).resolve()
-    if not _is_within(log, root):
-        raise ValueError("log path must remain inside the ephemeral workspace")
+    logs_root = (attempt_root / "logs").resolve()
+    if log == logs_root or not _is_within(log, logs_root):
+        raise ValueError("log path must remain outside the ephemeral workspace")
     if any(not isinstance(key, str) or not isinstance(value, str) for key, value in env.items()):
         raise ValueError("subprocess environment must contain string keys and values")
 
@@ -240,17 +240,19 @@ def promote_validated_output(
     if not source_path.is_dir():
         raise ValueError("promotion source is missing or not a directory")
     target = Path(canonical_root).resolve()
+    root = Path(attempt_root).resolve()
+    _validate_promotion_paths(source_path, root, target, receipt)
     if target.exists():
         raise FileExistsError("canonical output already exists")
+    if _filesystem_device(root) != _filesystem_device(target.parent):
+        raise ValueError("attempt and canonical destinations must share the same filesystem")
+    _validate_receipt_outputs(source_path, receipt)
 
-    root = Path(attempt_root).resolve()
-    root.mkdir(parents=True, exist_ok=True)
     staged = root / "promotion-staging"
     if staged.exists():
         raise FileExistsError("attempt promotion staging already exists")
     shutil.copytree(source_path, staged, copy_function=shutil.copy2)
     if _tree_hashes(source_path) != _tree_hashes(staged):
-        shutil.rmtree(staged)
         raise ValueError("attempt output copy does not match source bytes")
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -277,10 +279,65 @@ def _receipt_payload(receipt: AttemptReceipt, *, include_artifact_id: bool) -> d
     return payload
 
 
+def _write_workspace_metadata(workspace: Path, attempt_id: str, stage: str, arm: str) -> None:
+    payload = {
+        "schema_version": 1,
+        "attempt_id": attempt_id,
+        "stage": stage,
+        "arm": arm,
+        "workspace_name": "workspace",
+        "allowed_argv": _workspace_command(stage, arm),
+    }
+    path = workspace.parent / _WORKSPACE_METADATA
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(canonical_json(payload) + "\n")
+    path.chmod(0o444)
+
+
+def _validate_workspace_metadata(workspace: Path, argv: list[str]) -> Path:
+    metadata_path = workspace.parent / _WORKSPACE_METADATA
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("workspace metadata is missing or invalid") from error
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version", "attempt_id", "stage", "arm", "workspace_name", "allowed_argv",
+    }:
+        raise ValueError("workspace metadata is missing or invalid")
+    attempt_id = payload["attempt_id"]
+    stage = payload["stage"]
+    arm = payload["arm"]
+    allowed_argv = payload["allowed_argv"]
+    if (
+        payload["schema_version"] != 1
+        or payload["workspace_name"] != "workspace"
+        or not _is_path_identity(attempt_id)
+        or stage not in {"train", "selection"}
+        or arm not in _ARMS
+        or workspace.name != "workspace"
+        or workspace.parent.name != attempt_id
+        or not isinstance(allowed_argv, list)
+        or not all(isinstance(token, str) for token in allowed_argv)
+        or allowed_argv != _workspace_command(stage, arm)
+    ):
+        raise ValueError("workspace metadata is missing or invalid")
+    if argv != allowed_argv:
+        raise ValueError("command does not match the prepared workspace command")
+    return workspace.parent
+
+
+def _workspace_command(stage: str, arm: str) -> list[str]:
+    if stage == "train":
+        return _workspace_training_command(arm)
+    if stage == "selection":
+        return _workspace_selection_command(arm)
+    raise ValueError("workspace stage is invalid")
+
+
 def _validate_receipt(receipt: AttemptReceipt) -> None:
     if receipt.schema_version != 1:
         raise ValueError("receipt schema version is invalid")
-    if not receipt.run_id or not receipt.attempt_id or Path(receipt.attempt_id).name != receipt.attempt_id:
+    if not receipt.run_id or not _is_path_identity(receipt.attempt_id):
         raise ValueError("receipt identity is invalid")
     if receipt.stage not in {"train", "selection"} or receipt.arm not in _ARMS:
         raise ValueError("receipt stage or arm is invalid")
@@ -317,12 +374,75 @@ def _validate_receipt(receipt: AttemptReceipt) -> None:
         or isinstance(receipt.exit_status, bool)
         or not isinstance(receipt.validated, bool)
         or not isinstance(receipt.promoted, bool)
-        or not all(isinstance(path, str) and path for path in receipt.expected_outputs)
+        or not _valid_output_records(receipt.expected_outputs, receipt.output_hashes)
         or (receipt.failure_reason is not None and not isinstance(receipt.failure_reason, str))
     ):
         raise ValueError("receipt fields are invalid")
     if receipt.artifact_id != receipt.recomputed_artifact_id():
         raise ValueError("receipt artifact ID does not match its fields")
+
+
+def _valid_output_records(paths: tuple[str, ...], hashes: tuple[str, ...]) -> bool:
+    """Output path/hash records are parallel, source-relative tuples in stable order."""
+    if not paths or len(paths) != len(hashes) or len(set(paths)) != len(paths):
+        return False
+    for path in paths:
+        if not isinstance(path, str) or not path:
+            return False
+        candidate = PurePosixPath(path)
+        if (
+            candidate.is_absolute()
+            or "." in candidate.parts
+            or ".." in candidate.parts
+        ):
+            return False
+    return True
+
+
+def _validate_promotion_paths(
+    source: Path, attempt_root: Path, canonical_root: Path, receipt: AttemptReceipt,
+) -> None:
+    if attempt_root.name != receipt.attempt_id or attempt_root.parent.name != "attempts":
+        raise ValueError("attempt destination does not match receipt identity")
+    run_root = attempt_root.parent.parent
+    producer = _producer_relative_path(receipt.stage, receipt.arm)
+    expected_source = (attempt_root / "workspace" / producer).resolve()
+    expected_canonical = (run_root / producer).resolve()
+    if source != expected_source:
+        raise ValueError("promotion source does not match receipt identity")
+    if canonical_root != expected_canonical:
+        raise ValueError("canonical destination does not match receipt stage and arm")
+
+
+def _producer_relative_path(stage: str, arm: str) -> Path:
+    if stage == "train":
+        kind = "checkpoints"
+    elif stage == "selection":
+        kind = "checkpoint-selections"
+    else:
+        raise ValueError("receipt stage is invalid")
+    return Path(_ARTIFACT_ROOT) / kind / _PILOT_KIND / f"seed-{_PILOT_SEED}" / arm
+
+
+def _validate_receipt_outputs(source: Path, receipt: AttemptReceipt) -> None:
+    for relative, expected_hash in zip(
+        receipt.expected_outputs, receipt.output_hashes, strict=True,
+    ):
+        path = (source / PurePosixPath(relative)).resolve()
+        if not _is_within(path, source) or path.is_symlink() or not path.is_file():
+            raise ValueError("receipt output path is missing or unsafe")
+        if _file_sha256(path) != expected_hash:
+            raise ValueError("receipt output hash does not match source bytes")
+
+
+def _filesystem_device(path: Path) -> int:
+    candidate = Path(path)
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            raise ValueError("filesystem root is missing")
+        candidate = parent
+    return candidate.stat().st_dev
 
 
 def _approved_command_argv(command: str) -> list[str]:
@@ -372,6 +492,14 @@ def _is_within(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _is_path_identity(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value not in {"", ".", ".."}
+        and Path(value).name == value
+    )
 
 
 def _tree_hashes(root: Path) -> tuple[tuple[str, int, str], ...]:
