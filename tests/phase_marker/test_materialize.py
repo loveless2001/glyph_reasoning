@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -13,6 +15,7 @@ from phase_marker.splits import question_hash
 from phase_marker.token_audit import (
     QWEN25_7B_TOKENIZER_REVISION,
     SplitLineageUnavailable,
+    _load_cached_tokenizer,
     _load_frozen_training_traces,
     main,
     materialize_training_arms,
@@ -147,6 +150,65 @@ def test_manifest_binds_the_resolved_cached_qwen_revision(
     manifests = materialize_training_arms(config, traces, tokenizer, tmp_path / "training-data")
 
     assert manifests["dot"].metadata["tokenizer_revision"] == QWEN25_7B_TOKENIZER_REVISION
+
+
+def test_cached_tokenizer_loader_uses_exact_filesystem_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    snapshot = (
+        tmp_path
+        / "models--Qwen--Qwen2.5-7B-Instruct"
+        / "snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer_config.json").write_text("{}\n", encoding="utf-8")
+    (snapshot / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+    calls: list[tuple[object, dict[str, object]]] = []
+    sentinel = object()
+    transformers = ModuleType("transformers")
+    transformers.AutoTokenizer = SimpleNamespace(  # type: ignore[attr-defined]
+        from_pretrained=lambda source, **kwargs: (
+            calls.append((source, kwargs)), sentinel
+        )[1]
+    )
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(tmp_path / "ignored"))
+
+    loaded = _load_cached_tokenizer("Qwen/Qwen2.5-7B-Instruct")
+
+    assert loaded is sentinel
+    assert calls == [(str(snapshot), {"local_files_only": True})]
+
+
+@pytest.mark.parametrize("snapshot_state", ("missing", "missing-config", "missing-assets"))
+def test_cached_tokenizer_loader_rejects_incomplete_snapshot_before_transformers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, snapshot_state: str
+):
+    snapshot = (
+        tmp_path
+        / "models--Qwen--Qwen2.5-7B-Instruct"
+        / "snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+    if snapshot_state != "missing":
+        snapshot.mkdir(parents=True)
+    if snapshot_state == "missing-config":
+        (snapshot / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+    elif snapshot_state == "missing-assets":
+        (snapshot / "tokenizer_config.json").write_text("{}\n", encoding="utf-8")
+    transformers = ModuleType("transformers")
+    transformers.AutoTokenizer = SimpleNamespace(  # type: ignore[attr-defined]
+        from_pretrained=lambda *_args, **_kwargs: pytest.fail(
+            "transformers loader was called"
+        )
+    )
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+
+    with pytest.raises(FileNotFoundError, match="pinned tokenizer snapshot"):
+        _load_cached_tokenizer("Qwen/Qwen2.5-7B-Instruct")
 
 
 def test_materialization_rejects_a_subset_of_the_canonical_six_arms(

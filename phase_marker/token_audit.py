@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import json
+import os
 import string
 
 from phase_marker.config import ExperimentConfig, REQUIRED_MODEL_ID
@@ -320,14 +321,45 @@ def _write_manifest(path: Path, manifest: ArtifactManifest) -> None:
     path.write_text(canonical_json(asdict(manifest)) + "\n", encoding="utf-8")
 
 
-def _load_cached_tokenizer(model_id: str) -> object:
-    from transformers import AutoTokenizer
-
+def _pinned_tokenizer_snapshot_path(model_id: str) -> Path:
     if model_id != REQUIRED_MODEL_ID:
         raise ValueError(f"unsupported tokenizer model id: {model_id}")
+    cache = os.environ.get("HF_HUB_CACHE")
+    if cache is None:
+        cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if cache is None:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        cache = HF_HUB_CACHE
+    return (
+        Path(cache).expanduser()
+        / "models--Qwen--Qwen2.5-7B-Instruct"
+        / "snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+
+
+def _load_cached_tokenizer(model_id: str) -> object:
+    snapshot = _pinned_tokenizer_snapshot_path(model_id)
+    if not snapshot.is_dir():
+        raise FileNotFoundError(f"missing pinned tokenizer snapshot directory: {snapshot}")
+    tokenizer_config = snapshot / "tokenizer_config.json"
+    standalone_assets = tuple(
+        snapshot / name for name in ("tokenizer.json", "tokenizer.model", "spiece.model")
+    )
+    split_assets = (snapshot / "vocab.json", snapshot / "merges.txt")
+    if (
+        not tokenizer_config.is_file()
+        or not (
+            any(path.is_file() for path in standalone_assets)
+            or all(path.is_file() for path in split_assets)
+        )
+    ):
+        raise FileNotFoundError(f"pinned tokenizer snapshot lacks config/assets: {snapshot}")
+    from transformers import AutoTokenizer
+
     return AutoTokenizer.from_pretrained(
-        model_id,
-        revision=QWEN25_7B_TOKENIZER_REVISION,
+        str(snapshot),
         local_files_only=True,
     )
 
