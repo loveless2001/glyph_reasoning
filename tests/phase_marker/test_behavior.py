@@ -1,4 +1,6 @@
 from dataclasses import asdict, replace
+import json
+from pathlib import Path
 
 import pytest
 
@@ -15,9 +17,10 @@ from phase_marker.behavior import (
     build_behavior_matrix,
     records_from_outputs,
     serialize_generation_record,
+    main as behavior_main,
 )
 from phase_marker.config import ExperimentConfig
-from phase_marker.io import sha256_json
+from phase_marker.io import canonical_json, sha256_json
 from phase_marker.schema import ArtifactManifest, GenerationRecord
 from phase_marker.splits import DatasetExample
 from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
@@ -388,3 +391,106 @@ def test_provenance_envelope_rejects_empty_or_mismatched_production_lineage(
         )
     with pytest.raises(ValueError, match="adapter seed"):
         build_provenance_envelope(replace(record, seed=101), config, split_manifest)
+
+
+def test_run_cli_tiny_fixture_emits_versioned_plumbing_manifest(
+    tmp_path: Path, config: ExperimentConfig
+) -> None:
+    config_path = Path("configs/phase-marker-qwen25-7b.toml")
+    config_hash = sha256_json(asdict(config))
+    split_path = tmp_path / "split-manifest.json"
+    split_payload = {
+        "artifact_id": "a" * 64,
+        "config_hash": config_hash,
+        "overlap_count": 0,
+        "source_counts": {"test": {"gsm8k": 1}},
+    }
+    split_path.write_text(canonical_json(split_payload) + "\n", encoding="utf-8")
+    examples_path = tmp_path / "examples.jsonl"
+    example = {
+        "source": "gsm8k",
+        "split": "test",
+        "example_id": "fixture-1",
+        "question": "What is 1 + 1?",
+        "answer": "2",
+        "question_hash": "q" * 64,
+    }
+    examples_path.write_text(canonical_json(example) + "\n", encoding="utf-8")
+    selections: list[str] = []
+    for arm in config.arms:
+        payload = {
+            "schema_version": 1,
+            "kind": "phase_marker_checkpoint_selection",
+            "config_hash": config_hash,
+            "run_kind": "pilot",
+            "arm": arm,
+            "seed": 42,
+            "selected_on": "validation",
+            "checkpoint_path": f"/fixture/{arm}",
+            "training_manifest_hash": sha256_json({"training": arm}),
+            "materialization_artifact_id": sha256_json({"materialization": arm}),
+            "completed": True,
+        }
+        payload["artifact_id"] = sha256_json(payload)
+        selection_path = tmp_path / f"{arm}.selection.json"
+        selection_path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+        selections.append(str(selection_path))
+    output_root = tmp_path / "behavior-output"
+
+    assert behavior_main(
+        [
+            "run",
+            "--config",
+            str(config_path),
+            "--kind",
+            "pilot",
+            "--seeds",
+            "42",
+            "--split-manifest",
+            str(split_path),
+            "--examples",
+            str(examples_path),
+            "--checkpoint-manifests",
+            *selections,
+            "--backend",
+            "tiny-fixture",
+            "--allow-test-backend",
+            "--output-root",
+            str(output_root),
+        ]
+    ) == 0
+
+    manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
+    assert manifest["kind"] == "phase_marker_behavior_generations"
+    assert manifest["evidence_scope"] == "plumbing_only"
+    assert manifest["backend"] == "tiny-fixture"
+    assert manifest["completed"] is True
+    assert manifest["row_count"] > 0
+    assert (output_root / "records.jsonl").is_file()
+
+
+def test_run_cli_rejects_test_backend_without_explicit_flag(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="allow-test-backend"):
+        behavior_main(
+            [
+                "run",
+                "--config",
+                "configs/phase-marker-qwen25-7b.toml",
+                "--kind",
+                "pilot",
+                "--seeds",
+                "42",
+                "--split-manifest",
+                str(tmp_path / "missing-split.json"),
+                "--examples",
+                str(tmp_path / "missing-examples.jsonl"),
+                "--checkpoint-manifests",
+                str(tmp_path / "missing-checkpoint.json"),
+                "--backend",
+                "tiny-fixture",
+                "--output-root",
+                str(tmp_path / "must-not-exist"),
+            ]
+        )
+    assert not (tmp_path / "must-not-exist").exists()

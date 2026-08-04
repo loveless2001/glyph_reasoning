@@ -82,13 +82,31 @@ For example, the excluded pilot training gate is:
   --kind pilot \
   --seeds 42 \
   --config configs/phase-marker-qwen25-7b.toml \
-  --artifact-root artifacts/phase-marker
+  --artifact-root artifacts/phase-marker \
+  --hardware '1x A100 80GB' \
+  --max-duration-hours 8 \
+  --estimated-gpu-hours 6 \
+  --spend-cap-usd 25 \
+  --estimated-spend-usd 18 \
+  --evaluation-workload 'six pilot adapters plus frozen behavior evaluation'
 ```
 
 That command only validates manifest hashes, lineage, counts, exclusions, and
 completion evidence, then prints the six exact GPU commands as data. It never
-launches them. A passing gate is not launch approval; every executable or paid
-GPU command still requires fresh, explicit approval.
+launches them. A train, behavior, capture, or intervention gate fails closed
+unless every approval field above is present and the estimates remain within
+the declared duration and spend caps. The dry run remains planning-only and
+never reports approval readiness.
+
+Behavior runs additionally require the immutable split manifest, exact example
+file, and one validation-selected checkpoint manifest for every requested
+seed/arm pair. Synthetic production builds require
+`artifacts/phase-marker/synthetic-preregistration.json`, a schema-v1 envelope
+that fixes the seed, split counts, family balance, workspace conditions and
+lengths, and protocol hash. Capture and intervention commands consume explicit
+schema-v1 selection, batch/pair, checkpoint, and parent manifests; the
+`tiny-fixture` backends require `--allow-test-backend` and emit
+`evidence_scope=plumbing_only`, which production gates reject.
 
 Compact Markdown, TOML, JSON, and JSONL manifests/summaries remain eligible for
 version control. Large phase-marker checkpoints and activation/raw-generation

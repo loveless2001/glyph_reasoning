@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +19,8 @@ from phase_marker.interventions import (
     transplant_cache_rows,
     transplant_kv_positions,
 )
+from phase_marker.config import ExperimentConfig
+from phase_marker.io import canonical_json, sha256_json
 
 
 class TinyLayer(nn.Module):
@@ -643,3 +647,67 @@ def test_smoke_cli_writes_provenance_bound_metrics(tmp_path: Path):
         "random_donor",
         "matched_non_marker_position",
     ]
+
+
+def test_run_cli_rejects_tiny_backend_without_explicit_opt_in(tmp_path: Path):
+    from phase_marker.interventions import main
+
+    with pytest.raises(ValueError, match="allow-test-backend"):
+        main(
+            (
+                "run", "--config", "configs/phase-marker-qwen25-7b.toml",
+                "--validation-selection-manifest", "missing.json",
+                "--aligned-pairs-manifest", "missing.json",
+                "--activation-manifest", "missing.json", "--checkpoint-manifest", "missing.json",
+                "--model-id", "Qwen/Qwen2.5-7B-Instruct", "--model-revision", "deadbeef",
+                "--backend", "tiny-fixture", "--output-root", str(tmp_path),
+            )
+        )
+
+
+def test_run_cli_tiny_fixture_emits_plumbing_only_envelope(tmp_path: Path):
+    from phase_marker.interventions import main
+
+    config_path = Path("configs/phase-marker-qwen25-7b.toml")
+    config = ExperimentConfig.load(config_path)
+    config_hash = sha256_json(asdict(config))
+
+    def parent(name: str, **values: object) -> Path:
+        payload = {"schema_version": 1, "kind": name, "config_hash": config_hash, **values}
+        payload["artifact_id"] = sha256_json(payload)
+        path = tmp_path / f"{name}.json"
+        path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+        return path
+
+    selection = parent("selection", selected_on="validation")
+    activation = parent("activation", evidence_scope="experiment")
+    checkpoint = parent(
+        "checkpoint", model_id=config.model_id, model_revision="deadbeef", checkpoint_path="/fixture"
+    )
+    row = {
+        "pair_id": "pair-1", "recipient_id": "r", "donor_id": "d",
+        "recipient_batch_path": "/fixture/r.pt", "donor_batch_path": "/fixture/d.pt",
+        "target_token_ids": [4], "method": "residual_patch", "layer": 0,
+        "positions": [2, 3], "norm_match": False, "control_name": "donor",
+    }
+    rows_path = tmp_path / "pairs.jsonl"
+    rows_path.write_text(canonical_json(row) + "\n", encoding="utf-8")
+    pairs = parent(
+        "aligned_pairs", rows_file=rows_path.name,
+        rows_hash=hashlib.sha256(rows_path.read_bytes()).hexdigest(),
+        row_count=1, row_hashes=[sha256_json(row)],
+    )
+    output = tmp_path / "interventions"
+    assert main(
+        (
+            "run", "--config", str(config_path), "--validation-selection-manifest", str(selection),
+            "--aligned-pairs-manifest", str(pairs), "--activation-manifest", str(activation),
+            "--checkpoint-manifest", str(checkpoint), "--model-id", config.model_id,
+            "--model-revision", "deadbeef", "--backend", "tiny-fixture",
+            "--allow-test-backend", "--output-root", str(output),
+        )
+    ) == 0
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
+    assert manifest["evidence_scope"] == "plumbing_only"
+    assert manifest["backend"] == "tiny-fixture"

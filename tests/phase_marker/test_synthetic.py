@@ -167,11 +167,16 @@ def test_build_smoke_writes_family_counts_zero_overlap_and_exact_scorer_evidence
             "4",
             "--output-root",
             str(output_root),
+            "--backend",
+            "tiny-fixture",
+            "--allow-test-backend",
         ]
     ) == 0
 
     reported = json.loads(capsys.readouterr().out)
     manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
+    assert manifest["evidence_scope"] == "plumbing_only"
     assert reported["parameter_overlap"] == {"train_test": 0, "train_validation": 0, "validation_test": 0}
     assert manifest["exact_scorer_agreement"] == {"agreeing": 16, "total": 16}
     assert manifest["family_counts"] == {
@@ -192,3 +197,16 @@ def test_build_smoke_writes_family_counts_zero_overlap_and_exact_scorer_evidence
     assert random_64["actual_token_count"] == 64
     assert random_64["region_widths"] == [16, 16, 16, 16]
     assert len((output_root / "train.jsonl").read_text(encoding="utf-8").splitlines()) == 8
+
+
+def test_build_rejects_tiny_backend_without_explicit_opt_in(tmp_path):
+    from phase_marker.synthetic import main
+
+    with pytest.raises(ValueError, match="allow-test-backend"):
+        main(
+            [
+                "build", "--seed", "101", "--train", "1", "--validation", "1",
+                "--test", "1", "--output-root", str(tmp_path / "synthetic"),
+                "--backend", "tiny-fixture",
+            ]
+        )

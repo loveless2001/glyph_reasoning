@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ import torch
 from torch import nn
 
 from phase_marker.io import canonical_json, sha256_json
+from phase_marker.config import ExperimentConfig, REQUIRED_MODEL_ID
 from phase_marker.schema import InterventionRecord
 
 
@@ -28,6 +30,24 @@ _METADATA_KEYS = frozenset(
         "matched_positions",
     }
 )
+_INTERVENTION_PARENT_FIELDS = {
+    "selection": {"schema_version", "kind", "config_hash", "selected_on", "artifact_id"},
+    "checkpoint": {
+        "schema_version", "kind", "config_hash", "model_id", "model_revision",
+        "checkpoint_path", "artifact_id",
+    },
+    "aligned_pairs": {
+        "schema_version", "kind", "config_hash", "rows_file", "rows_hash", "row_count",
+        "row_hashes", "artifact_id",
+    },
+    "activation": {
+        "schema_version", "kind", "evidence_scope", "backend", "config_hash", "model_id",
+        "model_revision", "mode", "example_ids", "conditions", "layers", "positions",
+        "parent_hashes", "tensor_file", "tensor_hash", "tensors", "checkpoint_artifact_id",
+        "validation_selection_artifact_id", "behavior_artifact_id", "synthetic_artifact_id",
+        "tokenized_batch_artifact_id", "tokenized_batch_manifest_hash", "completed", "artifact_id",
+    },
+}
 
 
 class AlignmentError(ValueError):
@@ -929,14 +949,135 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     smoke = subparsers.add_parser("smoke", help="run a tiny local CPU intervention smoke")
     smoke.add_argument("--output-root", type=Path, required=True)
+    run = subparsers.add_parser("run", help="run provenance-bound interventions")
+    run.add_argument("--config", type=Path, required=True)
+    run.add_argument("--validation-selection-manifest", type=Path, required=True)
+    run.add_argument("--aligned-pairs-manifest", type=Path, required=True)
+    run.add_argument("--activation-manifest", type=Path, required=True)
+    run.add_argument("--checkpoint-manifest", type=Path, required=True)
+    run.add_argument("--model-id", required=True)
+    run.add_argument("--model-revision", required=True)
+    run.add_argument("--backend", choices=("hf", "tiny-fixture"), required=True)
+    run.add_argument("--allow-test-backend", action="store_true")
+    run.add_argument("--output-root", type=Path, required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    manifest = _smoke(args.output_root)
+    manifest = _smoke(args.output_root) if args.command == "smoke" else _run(args)
     print(canonical_json(manifest))
     return 0
+
+
+def _run(args: argparse.Namespace) -> dict[str, object]:
+    if args.backend == "tiny-fixture" and not args.allow_test_backend:
+        raise ValueError("tiny-fixture requires explicit --allow-test-backend")
+    config = ExperimentConfig.load(args.config)
+    config_hash = sha256_json(config.__dict__)
+    if args.model_id != REQUIRED_MODEL_ID:
+        raise ValueError("intervention model id does not match the frozen configuration")
+    fixture = args.backend == "tiny-fixture"
+    selection = _load_intervention_parent(args.validation_selection_manifest, "selection", config_hash, allow_fixture=fixture)
+    activation = _load_intervention_parent(args.activation_manifest, "activation", config_hash, allow_fixture=fixture)
+    checkpoint = _load_intervention_parent(args.checkpoint_manifest, "checkpoint", config_hash, allow_fixture=fixture)
+    if selection.get("selected_on") != "validation":
+        raise ValueError("intervention selection must be selected_on=validation")
+    if activation.get("evidence_scope") == "plumbing_only" and args.backend != "tiny-fixture":
+        raise ValueError("production intervention rejects plumbing-only activation evidence")
+    if checkpoint.get("model_id") != args.model_id or checkpoint.get("model_revision") != args.model_revision:
+        raise ValueError("intervention checkpoint model identity mismatch")
+    pairs = _load_intervention_parent(args.aligned_pairs_manifest, "aligned_pairs", config_hash, allow_fixture=fixture)
+    rows_file = pairs.get("rows_file")
+    if not isinstance(rows_file, str):
+        raise ValueError("aligned pairs manifest rows_file is malformed")
+    rows_path = args.aligned_pairs_manifest.parent / rows_file
+    if pairs.get("rows_hash") != hashlib.sha256(rows_path.read_bytes()).hexdigest():
+        raise ValueError("aligned pairs rows hash mismatch")
+    rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines() if line]
+    required = {
+        "pair_id", "recipient_id", "donor_id", "recipient_batch_path", "donor_batch_path",
+        "target_token_ids", "method", "layer", "positions", "norm_match", "control_name",
+    }
+    if not rows or any(not isinstance(row, dict) or set(row) != required for row in rows):
+        raise ValueError("aligned pair rows must use the exact schema")
+    if pairs.get("row_count") != len(rows) or pairs.get("row_hashes") != [sha256_json(row) for row in rows]:
+        raise ValueError("aligned pair row count or hashes mismatch")
+    if args.backend == "tiny-fixture":
+        manifest = _smoke(args.output_root)
+    else:
+        from transformers import AutoModelForCausalLM
+
+        checkpoint_path = checkpoint.get("checkpoint_path")
+        if not isinstance(checkpoint_path, str) or not Path(checkpoint_path).is_dir():
+            raise ValueError("intervention checkpoint path is missing")
+        model = AutoModelForCausalLM.from_pretrained(
+            checkpoint_path, revision=args.model_revision, local_files_only=True
+        ).eval()
+        produced: list[InterventionRecord] = []
+        for row in rows:
+            recipient = torch.load(row["recipient_batch_path"], map_location="cpu", weights_only=True)
+            donor = torch.load(row["donor_batch_path"], map_location="cpu", weights_only=True)
+            spec = InterventionSpec(
+                row["method"], (row["layer"],), tuple(row["positions"]), row["norm_match"],
+                tuple(row["target_token_ids"]), row["control_name"],
+            )
+            if row["method"] == "residual_patch":
+                result = patch_residual_positions(model, recipient, donor, spec)
+            elif row["method"] == "ablate":
+                result = ablate_positions(model, recipient, spec)
+            else:
+                result = transplant_kv_positions(model, recipient, donor, spec)
+            produced.extend(result.records)
+        args.output_root.mkdir(parents=True, exist_ok=False)
+        records_path = args.output_root / "records.jsonl"
+        records_path.write_text("".join(canonical_json(asdict(record)) + "\n" for record in produced), encoding="utf-8")
+        manifest = {"records_file": records_path.name, "metrics": {}, "parent_hashes": []}
+    records_path = args.output_root / str(manifest["records_file"])
+    envelope: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "phase_marker_intervention_results",
+        "evidence_scope": "plumbing_only" if args.backend == "tiny-fixture" else "experiment",
+        "backend": args.backend,
+        "config_hash": config_hash,
+        "model_id": args.model_id,
+        "model_revision": args.model_revision,
+        "selection_artifact_id": selection["artifact_id"],
+        "aligned_pairs_artifact_id": pairs["artifact_id"],
+        "activation_artifact_id": activation["artifact_id"],
+        "checkpoint_artifact_id": checkpoint["artifact_id"],
+        "records_file": records_path.name,
+        "records_hash": hashlib.sha256(records_path.read_bytes()).hexdigest(),
+        "row_count": sum(1 for line in records_path.read_text(encoding="utf-8").splitlines() if line),
+        "metrics": manifest.get("metrics", {}),
+        "completed": True,
+    }
+    envelope["parent_hashes"] = [selection["artifact_id"], pairs["artifact_id"], activation["artifact_id"], checkpoint["artifact_id"]]
+    envelope["artifact_id"] = sha256_json(envelope)
+    (args.output_root / "manifest.json").write_text(canonical_json(envelope) + "\n", encoding="utf-8")
+    return envelope
+
+
+def _load_intervention_parent(
+    path: Path, label: str, config_hash: str, *, allow_fixture: bool
+) -> dict[str, object]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError(f"{label} parent must be a schema-v1 object")
+    if payload.get("config_hash") != config_hash:
+        raise ValueError(f"{label} parent config hash mismatch")
+    if not allow_fixture and set(payload) != _INTERVENTION_PARENT_FIELDS[label]:
+        raise ValueError(f"{label} parent fields do not match the exact schema")
+    artifact_id = payload.get("artifact_id")
+    unsigned = dict(payload)
+    unsigned.pop("artifact_id", None)
+    if (
+        not isinstance(artifact_id, str)
+        or len(artifact_id) != 64
+        or artifact_id != sha256_json(unsigned)
+    ):
+        raise ValueError(f"{label} parent artifact id is malformed")
+    return payload
 
 
 if __name__ == "__main__":

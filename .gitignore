@@ -165,6 +165,10 @@ experiments/*.png
 /checkpoints
 
 # Phase-marker: keep compact manifests/summaries; ignore only large payloads.
-artifacts/phase-marker/checkpoints/
+# Keep compact checkpoint manifests; ignore only model payloads.
+artifacts/phase-marker/checkpoints/**/*.safetensors
+artifacts/phase-marker/checkpoints/**/*.bin
+artifacts/phase-marker/checkpoints/**/*.pt
+artifacts/phase-marker/checkpoints/**/*.pth
 artifacts/phase-marker/activations/**/*.pt
 artifacts/phase-marker/raw-generations/**/*.pt

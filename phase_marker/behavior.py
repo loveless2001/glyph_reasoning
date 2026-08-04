@@ -6,11 +6,13 @@ import argparse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
+import json
 from pathlib import Path
+import tempfile
 from typing import Any, Protocol
 
 from phase_marker.config import ExperimentConfig
-from phase_marker.io import sha256_json, write_jsonl_atomic
+from phase_marker.io import canonical_json, read_jsonl, sha256_json, write_jsonl_atomic
 from phase_marker.prompts import MarkerSet, render_perturbation, render_prompt
 from phase_marker.schema import ArtifactManifest, GenerationRecord
 from phase_marker.scoring import score_generation
@@ -612,10 +614,285 @@ def main(argv: Sequence[str] | None = None) -> int:
     dry_run.add_argument("--backend", choices=("fake",), required=True)
     dry_run.add_argument("--limit", type=int, required=True)
     dry_run.add_argument("--output", type=Path, required=True)
+    run = subparsers.add_parser("run")
+    run.add_argument("--config", type=Path, required=True)
+    run.add_argument("--kind", choices=("pilot", "confirmatory"), required=True)
+    run.add_argument("--seeds", type=int, nargs="+", required=True)
+    run.add_argument("--split-manifest", type=Path, required=True)
+    run.add_argument("--examples", type=Path, required=True)
+    run.add_argument("--checkpoint-manifests", type=Path, nargs="+", required=True)
+    run.add_argument("--backend", choices=("vllm", "tiny-fixture"), required=True)
+    run.add_argument("--allow-test-backend", action="store_true")
+    run.add_argument("--output-root", type=Path, required=True)
     arguments = parser.parse_args(argv)
     if arguments.command == "dry-run":
         return _dry_run(arguments)
+    if arguments.command == "run":
+        return _run_behavior(arguments)
     raise AssertionError("unreachable")
+
+
+_CHECKPOINT_SELECTION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "config_hash",
+        "run_kind",
+        "arm",
+        "seed",
+        "selected_on",
+        "checkpoint_path",
+        "training_manifest_hash",
+        "materialization_artifact_id",
+        "completed",
+        "artifact_id",
+    }
+)
+
+
+def _run_behavior(arguments: argparse.Namespace) -> int:
+    if arguments.backend == "tiny-fixture" and not arguments.allow_test_backend:
+        raise SystemExit("--allow-test-backend is required for tiny-fixture")
+    config = ExperimentConfig.load(arguments.config)
+    seeds = tuple(arguments.seeds)
+    _require_frozen_run(config, arguments.kind, seeds)
+    split_payload = _load_json_object(arguments.split_manifest, "split manifest")
+    config_hash = sha256_json(asdict(config))
+    if split_payload.get("config_hash") != config_hash:
+        raise ValueError("split manifest config hash mismatch")
+    split_id = _required_hash(split_payload, "artifact_id", "split manifest")
+    examples = tuple(_example_from_row(row) for row in read_jsonl(arguments.examples))
+    if not examples:
+        raise ValueError("behavior examples must be nonempty")
+    selections = _load_checkpoint_selections(
+        arguments.checkpoint_manifests,
+        config,
+        arguments.kind,
+        seeds,
+    )
+    if arguments.backend == "vllm":
+        for identity, selection in selections.items():
+            checkpoint_root = Path(str(selection["checkpoint_path"]))
+            training_manifest = checkpoint_root / "run-manifest.json"
+            if not checkpoint_root.is_dir() or not training_manifest.is_file():
+                raise FileNotFoundError(
+                    f"selected production checkpoint manifest is missing for {identity}: {training_manifest}"
+                )
+            if selection["training_manifest_hash"] != _file_hash(training_manifest):
+                raise ValueError(f"selected training manifest hash mismatch for {identity}")
+    if arguments.output_root.exists():
+        raise FileExistsError(f"refusing to overwrite behavior output: {arguments.output_root}")
+
+    split_parents = _split_parent_hashes(split_payload)
+    split_manifest = ArtifactManifest(
+        artifact_id=split_id,
+        kind="phase_marker_splits",
+        config_hash=config_hash,
+        parent_hashes=split_parents,
+        row_count=len(examples),
+        metadata={"source_counts": split_payload.get("source_counts", {})},
+    )
+    rows: list[dict[str, object]] = []
+    for seed in seeds:
+        for cell in build_behavior_matrix(config, split_manifest):
+            selection = selections[(seed, cell.training_arm)]
+            checkpoint = str(selection["checkpoint_path"])
+            if arguments.backend == "tiny-fixture":
+                requests = build_generation_requests(
+                    cell,
+                    examples,
+                    config,
+                    checkpoint=f"fake://{cell.training_arm}",
+                    adapter_seed=seed,
+                    fake=True,
+                )
+                backend: GenerationBackend = FakeGenerationBackend()
+                record_parents = (split_id, str(selection["artifact_id"]))
+            else:
+                if not Path(checkpoint).is_dir():
+                    raise FileNotFoundError(
+                        f"selected production checkpoint is missing: {checkpoint}"
+                    )
+                from transformers import AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(
+                    config.model_id,
+                    revision=QWEN25_7B_TOKENIZER_REVISION,
+                    local_files_only=True,
+                )
+                requests = build_generation_requests(
+                    cell,
+                    examples,
+                    config,
+                    checkpoint=checkpoint,
+                    tokenize=lambda value: tokenizer.encode(value, add_special_tokens=False),
+                    tokenizer_revision=QWEN25_7B_TOKENIZER_REVISION,
+                    split_manifest=split_manifest,
+                    adapter_seed=seed,
+                )
+                backend = VLLMGenerationBackend(checkpoint, adapter_seed=seed)
+                record_parents = (split_id, *split_parents, str(selection["artifact_id"]))
+            records = records_from_outputs(
+                cell,
+                examples,
+                requests,
+                backend.generate(requests),
+                record_parents,
+            )
+            for record in records:
+                envelope = build_provenance_envelope(record, config, split_manifest)
+                row = serialize_generation_record(record, envelope)
+                row["score"] = asdict(score_generation(record))
+                row["checkpoint_selection_artifact_id"] = selection["artifact_id"]
+                rows.append(row)
+
+    arguments.output_root.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=arguments.output_root.parent, prefix=f".{arguments.output_root.name}-"
+    ) as temporary:
+        staging = Path(temporary)
+        records_path = staging / "records.jsonl"
+        write_jsonl_atomic(records_path, rows)
+        selection_values = tuple(selections[key] for key in sorted(selections))
+        manifest: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "phase_marker_behavior_generations",
+            "evidence_scope": (
+                "plumbing_only"
+                if arguments.backend == "tiny-fixture"
+                else "experiment_candidate"
+            ),
+            "backend": arguments.backend,
+            "config_hash": config_hash,
+            "run_kind": arguments.kind,
+            "seeds": list(seeds),
+            "split_artifact_id": split_id,
+            "split_manifest_hash": _file_hash(arguments.split_manifest),
+            "materialization_artifact_ids": {
+                f"{item['seed']}:{item['arm']}": item["materialization_artifact_id"]
+                for item in selection_values
+            },
+            "checkpoint_artifact_ids": {
+                f"{item['seed']}:{item['arm']}": item["artifact_id"]
+                for item in selection_values
+            },
+            "checkpoint_manifest_hashes": {
+                f"{item['seed']}:{item['arm']}": item["manifest_hash"]
+                for item in selection_values
+            },
+            "checkpoint_manifests": {
+                f"{item['seed']}:{item['arm']}": item["manifest_path"]
+                for item in selection_values
+            },
+            "examples_file": str(arguments.examples),
+            "examples_hash": _file_hash(arguments.examples),
+            "records_file": records_path.name,
+            "records_hash": _file_hash(records_path),
+            "row_count": len(rows),
+            "record_hashes": [sha256_json(row) for row in rows],
+            "exclusions": [],
+            "parent_hashes": [
+                split_id,
+                *(str(item["artifact_id"]) for item in selection_values),
+            ],
+            "completed": True,
+        }
+        manifest["artifact_id"] = sha256_json(manifest)
+        (staging / "manifest.json").write_text(
+            canonical_json(manifest) + "\n", encoding="utf-8"
+        )
+        staging.replace(arguments.output_root)
+    print(canonical_json(manifest))
+    return 0
+
+
+def _require_frozen_run(
+    config: ExperimentConfig, kind: str, seeds: tuple[int, ...]
+) -> None:
+    if tuple(config.arms) != ("semantic", "glyph", "dot", "random", "direct", "filler"):
+        raise ValueError("behavior run requires the frozen six-arm protocol")
+    expected = (42,) if kind == "pilot" else (101, 202, 303)
+    if seeds != expected:
+        raise ValueError(f"{kind} behavior run requires exact seeds {expected}")
+
+
+def _load_checkpoint_selections(
+    paths: Sequence[Path],
+    config: ExperimentConfig,
+    kind: str,
+    seeds: tuple[int, ...],
+) -> dict[tuple[int, str], dict[str, object]]:
+    expected = {(seed, arm) for seed in seeds for arm in config.arms}
+    result: dict[tuple[int, str], dict[str, object]] = {}
+    config_hash = sha256_json(asdict(config))
+    for path in paths:
+        payload = dict(_load_json_object(path, "checkpoint selection manifest"))
+        if set(payload) != _CHECKPOINT_SELECTION_FIELDS:
+            raise ValueError(f"checkpoint selection schema mismatch: {path}")
+        if (
+            payload["schema_version"] != 1
+            or payload["kind"] != "phase_marker_checkpoint_selection"
+            or payload["config_hash"] != config_hash
+            or payload["run_kind"] != kind
+            or payload["selected_on"] != "validation"
+            or payload["completed"] is not True
+        ):
+            raise ValueError(f"checkpoint selection provenance mismatch: {path}")
+        artifact_id = payload.pop("artifact_id")
+        if artifact_id != sha256_json(payload):
+            raise ValueError(f"checkpoint selection artifact hash mismatch: {path}")
+        payload["artifact_id"] = artifact_id
+        payload["manifest_hash"] = _file_hash(path)
+        payload["manifest_path"] = str(path)
+        identity = (payload["seed"], payload["arm"])
+        if identity in result:
+            raise ValueError(f"duplicate checkpoint selection: {identity}")
+        result[identity] = payload
+    if set(result) != expected:
+        raise ValueError(
+            f"checkpoint selections must cover exact seed/arm matrix: missing={sorted(expected-set(result))}"
+        )
+    return result
+
+
+def _load_json_object(path: Path, label: str) -> Mapping[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise FileNotFoundError(f"missing {label}: {path}") from None
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{label} must be a JSON object: {path}")
+    return payload
+
+
+def _example_from_row(row: Mapping[str, object]) -> DatasetExample:
+    required = {"source", "split", "example_id", "question", "answer", "question_hash"}
+    if set(row) != required or any(not isinstance(row[field], str) for field in required):
+        raise ValueError("behavior example schema mismatch")
+    return DatasetExample(**row)  # type: ignore[arg-type]
+
+
+def _split_parent_hashes(payload: Mapping[str, object]) -> tuple[str, ...]:
+    lineage = payload.get("input_lineage")
+    if not isinstance(lineage, Mapping):
+        return ()
+    hashes = []
+    for name in ("traces", "unified"):
+        item = lineage.get(name)
+        if isinstance(item, Mapping) and isinstance(item.get("sha256"), str):
+            hashes.append(str(item["sha256"]))
+    return tuple(hashes)
+
+
+def _required_hash(payload: Mapping[str, object], field: str, label: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or len(value) != 64:
+        raise ValueError(f"{label} missing {field}")
+    return value
+
+
+def _file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 if __name__ == "__main__":

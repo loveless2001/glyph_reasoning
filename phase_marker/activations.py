@@ -12,6 +12,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -21,11 +22,35 @@ import torch
 from torch import nn
 
 from phase_marker.io import canonical_json, sha256_json
+from phase_marker.config import ExperimentConfig, REQUIRED_MODEL_ID
 
 
 MAX_ATTENTION_EXAMPLES = 16
 MAX_ATTENTION_SEQUENCE = 256
 CAPTURE_MODES = frozenset(("teacher_forced", "free_generation"))
+_CAPTURE_PARENT_FIELDS = {
+    "validation_selection": {"schema_version", "kind", "config_hash", "selected_on", "artifact_id"},
+    "checkpoint": {
+        "schema_version", "kind", "config_hash", "model_id", "model_revision",
+        "checkpoint_path", "artifact_id",
+    },
+    "tokenized_batch": {
+        "schema_version", "kind", "config_hash", "batch_file", "batch_hash", "layers",
+        "positions", "artifact_id",
+    },
+    "behavior": {
+        "schema_version", "kind", "evidence_scope", "backend", "config_hash", "run_kind",
+        "seeds", "split_artifact_id", "split_manifest_hash", "materialization_artifact_ids",
+        "checkpoint_artifact_ids", "checkpoint_manifest_hashes", "checkpoint_manifests",
+        "examples_file", "examples_hash", "records_file", "records_hash", "row_count",
+        "record_hashes", "exclusions", "parent_hashes", "completed", "artifact_id",
+    },
+    "synthetic": {
+        "schema_version", "kind", "seed", "counts", "family_counts", "split_counts",
+        "parameter_overlap", "exact_scorer_agreement", "evidence_scope", "backend",
+        "config_hash", "preregistration_hash", "completed", "data_hashes", "artifact_id",
+    },
+}
 _BATCH_METADATA_KEYS = frozenset(
     (
         "example_ids",
@@ -715,16 +740,141 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     smoke = subparsers.add_parser("smoke", help="run the tiny local torch capture smoke")
     smoke.add_argument("--output-root", type=Path, required=True)
+    capture = subparsers.add_parser("capture", help="capture from provenance-bound inputs")
+    capture.add_argument("--config", type=Path, required=True)
+    capture.add_argument("--mode", choices=tuple(sorted(CAPTURE_MODES)), required=True)
+    capture.add_argument("--validation-selection-manifest", type=Path, required=True)
+    capture.add_argument("--tokenized-batch-manifest", type=Path, required=True)
+    capture.add_argument("--tokenized-batch", type=Path, required=True)
+    capture.add_argument("--model-id", required=True)
+    capture.add_argument("--model-revision", required=True)
+    capture.add_argument("--checkpoint-manifest", type=Path, required=True)
+    capture.add_argument("--behavior-manifest", type=Path, required=True)
+    capture.add_argument("--synthetic-manifest", type=Path, required=True)
+    capture.add_argument("--backend", choices=("hf", "tiny-fixture"), required=True)
+    capture.add_argument("--allow-test-backend", action="store_true")
+    capture.add_argument("--output-root", type=Path, required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.command != "smoke":  # pragma: no cover - argparse currently has one command
-        raise ValueError(f"unknown command {args.command!r}")
-    manifest = _smoke(args.output_root)
+    if args.command == "smoke":
+        manifest = _smoke(args.output_root)
+    else:
+        manifest = _run_capture(args)
     print(canonical_json(manifest))
     return 0
+
+
+def _run_capture(args: argparse.Namespace) -> dict[str, object]:
+    if args.backend == "tiny-fixture" and not args.allow_test_backend:
+        raise ValueError("tiny-fixture requires explicit --allow-test-backend")
+    config = ExperimentConfig.load(args.config)
+    config_hash = sha256_json(config.__dict__)
+    if args.model_id != REQUIRED_MODEL_ID:
+        raise ValueError("capture model id does not match the frozen configuration")
+    parents = {
+        name: _load_capture_parent(
+            path, name, config_hash, allow_fixture=args.backend == "tiny-fixture"
+        )
+        for name, path in (
+            ("validation_selection", args.validation_selection_manifest),
+            ("checkpoint", args.checkpoint_manifest),
+            ("behavior", args.behavior_manifest),
+            ("synthetic", args.synthetic_manifest),
+        )
+    }
+    if parents["validation_selection"].get("selected_on") != "validation":
+        raise ValueError("capture selection must be selected_on=validation")
+    if args.backend == "hf" and (
+        parents["behavior"].get("evidence_scope") != "experiment_candidate"
+        or parents["behavior"].get("backend") != "vllm"
+        or parents["synthetic"].get("evidence_scope") != "experiment"
+        or parents["synthetic"].get("backend") != "production"
+    ):
+        raise ValueError("production capture requires production behavior and synthetic evidence")
+    checkpoint = parents["checkpoint"]
+    if checkpoint.get("model_id") != args.model_id or checkpoint.get("model_revision") != args.model_revision:
+        raise ValueError("capture checkpoint model identity mismatch")
+    batch_manifest = _load_capture_parent(
+        args.tokenized_batch_manifest, "tokenized_batch", config_hash,
+        allow_fixture=args.backend == "tiny-fixture",
+    )
+    if batch_manifest.get("batch_file") != str(args.tokenized_batch):
+        raise ValueError("tokenized batch path mismatch")
+    if batch_manifest.get("batch_hash") != hashlib.sha256(args.tokenized_batch.read_bytes()).hexdigest():
+        raise ValueError("tokenized batch hash mismatch")
+    if args.backend == "tiny-fixture":
+        manifest = _smoke(args.output_root)
+    else:  # model loading happens only after every immutable input has passed validation
+        from transformers import AutoModelForCausalLM
+
+        checkpoint_path = checkpoint.get("checkpoint_path")
+        if not isinstance(checkpoint_path, str) or not Path(checkpoint_path).is_dir():
+            raise ValueError("capture checkpoint path is missing")
+        model = AutoModelForCausalLM.from_pretrained(
+            checkpoint_path, revision=args.model_revision, local_files_only=True
+        ).eval()
+        batch = torch.load(args.tokenized_batch, map_location="cpu", weights_only=True)
+        if not isinstance(batch, Mapping):
+            raise ValueError("tokenized batch must contain a mapping")
+        layers = tuple(batch_manifest.get("layers", ()))
+        positions = tuple(batch_manifest.get("positions", ()))
+        captured = capture_selected_states(model, batch, CaptureSpec(layers, positions))
+        manifest = save_activation_artifact(captured, args.output_root, mode=args.mode)
+    tensor_path = args.output_root / str(manifest["tensor_file"])
+    envelope: dict[str, object] = {
+        **manifest,
+        "schema_version": 1,
+        "evidence_scope": "plumbing_only" if args.backend == "tiny-fixture" else "experiment",
+        "backend": args.backend,
+        "config_hash": config_hash,
+        "model_id": args.model_id,
+        "model_revision": args.model_revision,
+        "checkpoint_artifact_id": checkpoint["artifact_id"],
+        "validation_selection_artifact_id": parents["validation_selection"]["artifact_id"],
+        "behavior_artifact_id": parents["behavior"]["artifact_id"],
+        "synthetic_artifact_id": parents["synthetic"]["artifact_id"],
+        "tokenized_batch_artifact_id": batch_manifest["artifact_id"],
+        "tokenized_batch_manifest_hash": hashlib.sha256(args.tokenized_batch_manifest.read_bytes()).hexdigest(),
+        "tensor_hash": hashlib.sha256(tensor_path.read_bytes()).hexdigest(),
+        "completed": True,
+    }
+    envelope["parent_hashes"] = [
+        envelope["validation_selection_artifact_id"], envelope["tokenized_batch_artifact_id"],
+        envelope["checkpoint_artifact_id"], envelope["behavior_artifact_id"],
+        envelope["synthetic_artifact_id"],
+    ]
+    envelope.pop("artifact_id", None)
+    envelope["artifact_id"] = sha256_json(envelope)
+    _write_json_atomic(args.output_root / "manifest.json", envelope)
+    return envelope
+
+
+def _load_capture_parent(
+    path: Path, label: str, config_hash: str, *, allow_fixture: bool
+) -> dict[str, object]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError(f"{label} parent must be a schema-v1 object")
+    if payload.get("config_hash") != config_hash:
+        raise ValueError(f"{label} parent config hash mismatch")
+    expected_fields = _CAPTURE_PARENT_FIELDS.get(label)
+    if not allow_fixture and expected_fields is not None and set(payload) != expected_fields:
+        raise ValueError(f"{label} parent fields do not match the exact schema")
+    artifact_id = payload.get("artifact_id")
+    unsigned = dict(payload)
+    unsigned.pop("artifact_id", None)
+    if (
+        not isinstance(artifact_id, str)
+        or len(artifact_id) != 64
+        or artifact_id != sha256_json(unsigned)
+    ):
+        raise ValueError(f"{label} parent artifact id is malformed")
+    if payload.get("evidence_scope") == "plumbing_only" and label in {"behavior", "synthetic"}:
+        raise ValueError(f"production capture rejects plumbing-only {label} evidence")
+    return payload
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from typing import Any
 
 from phase_marker.config import ExperimentConfig
 from phase_marker.io import canonical_json, sha256_json
+from phase_marker.splits import question_hash
 from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
 
 
@@ -34,8 +35,46 @@ STAGES = (
     "capture",
     "intervene",
 )
+CANONICAL_ARMS = ("semantic", "glyph", "dot", "random", "direct", "filler")
+CANONICAL_PILOT_SEED = 42
+CANONICAL_CONFIRMATORY_SEEDS = (101, 202, 303)
 DEFAULT_CONFIG_PATH = Path("configs/phase-marker-qwen25-7b.toml")
 _SHA256_LENGTH = 64
+_APPROVAL_FIELDS = (
+    "hardware",
+    "max_duration_hours",
+    "estimated_gpu_hours",
+    "spend_cap_usd",
+    "estimated_spend_usd",
+    "evaluation_workload",
+)
+_BEHAVIOR_MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "evidence_scope",
+        "backend",
+        "config_hash",
+        "run_kind",
+        "seeds",
+        "split_artifact_id",
+        "split_manifest_hash",
+        "materialization_artifact_ids",
+        "checkpoint_artifact_ids",
+        "checkpoint_manifest_hashes",
+        "checkpoint_manifests",
+        "examples_file",
+        "examples_hash",
+        "records_file",
+        "records_hash",
+        "row_count",
+        "record_hashes",
+        "exclusions",
+        "parent_hashes",
+        "completed",
+        "artifact_id",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +90,37 @@ class GateResult:
         object.__setattr__(self, "next_commands", tuple(self.next_commands))
 
 
+@dataclass(frozen=True)
+class ApprovalMetadata:
+    hardware: str
+    max_duration_hours: float
+    estimated_gpu_hours: float
+    spend_cap_usd: float
+    estimated_spend_usd: float
+    evaluation_workload: str
+
+    def __post_init__(self) -> None:
+        if not self.hardware.strip() or not self.evaluation_workload.strip():
+            raise ValueError("approval hardware and evaluation workload must be nonempty")
+        numeric = (
+            self.max_duration_hours,
+            self.estimated_gpu_hours,
+            self.spend_cap_usd,
+            self.estimated_spend_usd,
+        )
+        if any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or value <= 0
+            for value in numeric
+        ):
+            raise ValueError("approval duration, GPU-hours, and spend values must be positive")
+        if self.estimated_gpu_hours > self.max_duration_hours:
+            raise ValueError("estimated GPU-hours cannot exceed the maximum duration")
+        if self.estimated_spend_usd > self.spend_cap_usd:
+            raise ValueError("estimated spend cannot exceed the spend cap")
+
+
 class GateFailure(ValueError):
     """An immutable prerequisite is absent, malformed, or stale."""
 
@@ -59,6 +129,18 @@ def validate_run_request(
     kind: str, seeds: Sequence[int], config: ExperimentConfig
 ) -> GateResult:
     """Enforce the excluded pilot and exact confirmatory seed partitions."""
+    if (
+        tuple(config.arms) != CANONICAL_ARMS
+        or config.pilot_seed != CANONICAL_PILOT_SEED
+        or tuple(config.confirmatory_seeds) != CANONICAL_CONFIRMATORY_SEEDS
+    ):
+        return GateResult(
+            "run_request",
+            False,
+            "configuration drifts from the frozen protocol arms or seeds",
+            (),
+            (),
+        )
     normalized = tuple(seeds)
     if any(not isinstance(seed, int) or isinstance(seed, bool) for seed in normalized):
         return GateResult("run_request", False, "seeds must be integers", (), ())
@@ -91,6 +173,7 @@ def build_command_manifest(
     seeds: Sequence[int],
     config_path: Path = DEFAULT_CONFIG_PATH,
     arms: Sequence[str] | None = None,
+    approval: ApprovalMetadata | None = None,
 ) -> tuple[dict[str, object], ...]:
     """Return exact training commands and expected outputs as inert data."""
     request = validate_run_request(kind, seeds, config)
@@ -131,7 +214,14 @@ def build_command_manifest(
                     "model_id": config.model_id,
                     "model_revision": QWEN25_7B_TOKENIZER_REVISION,
                     "approval_required": True,
-                    "estimated_gpu_hours": None,
+                    "approval_ready": approval is not None,
+                    "missing_approval_fields": (
+                        [] if approval is not None else list(_APPROVAL_FIELDS)
+                    ),
+                    "approval": None if approval is None else asdict(approval),
+                    "estimated_gpu_hours": (
+                        None if approval is None else approval.estimated_gpu_hours
+                    ),
                     "command": shlex.join(arguments),
                     "expected_outputs": [
                         str(output_dir / "adapter_config.json"),
@@ -154,6 +244,7 @@ def run_gate(
         kind="confirmatory",
         seeds=config.confirmatory_seeds,
         config_path=DEFAULT_CONFIG_PATH,
+        approval=None,
     )
 
 
@@ -165,6 +256,7 @@ def _run_gate(
     kind: str,
     seeds: Sequence[int],
     config_path: Path,
+    approval: ApprovalMetadata | None,
 ) -> GateResult:
     if stage not in STAGES:
         return GateResult(stage, False, f"unknown stage {stage!r}", (), ())
@@ -222,13 +314,24 @@ def _run_gate(
                 )
             elif stage == "capture":
                 checked.append(_validate_synthetic_manifest(artifact_root, config))
+                checked.extend(_validate_capture_inputs(artifact_root, config))
         elif stage == "intervene":
-            checked.append(_validate_activation_manifest(artifact_root))
-        # ``splits`` and ``synthetic`` are root stages.  The validated frozen
-        # ExperimentConfig is their sole immutable parent.
+            checked.append(_validate_activation_manifest(artifact_root, config))
+            checked.extend(_validate_intervention_inputs(artifact_root, config))
+        elif stage == "synthetic":
+            checked.append(_validate_synthetic_preregistration(artifact_root, config))
+        # ``splits`` is the sole root stage. Synthetic counts are preregistered.
     except (GateFailure, OSError, UnicodeError) as error:
         return GateResult(stage, False, str(error), tuple(checked), ())
 
+    if stage in {"train", "behavior", "capture", "intervene"} and approval is None:
+        return GateResult(
+            stage,
+            False,
+            f"{stage} prerequisites passed but approval metadata is missing",
+            tuple(dict.fromkeys(checked)),
+            (),
+        )
     commands = _commands_for_stage(
         stage,
         config,
@@ -236,6 +339,7 @@ def _run_gate(
         kind=kind,
         seeds=tuple(seeds),
         config_path=config_path,
+        approval=approval,
     )
     return GateResult(
         stage,
@@ -272,11 +376,24 @@ def _validate_split_manifest(
     if canonical_root is not None:
         if not isinstance(source_counts, Mapping):
             raise GateFailure(f"split manifest missing source counts: {path}")
+        split_rows: dict[str, tuple[Mapping[str, Any], ...]] = {}
+        seen_live: dict[str, str] = {}
         for split_name in ("train", "validation", "test", "exclusions"):
             split_path = canonical_root / f"{split_name}.jsonl"
             if not split_path.is_file():
                 raise GateFailure(f"missing split completion output: {split_path}")
             rows = _jsonl_rows(split_path)
+            split_rows[split_name] = rows
+            for row in rows:
+                _validate_split_row(row, split_name, split_path)
+                if split_name != "exclusions":
+                    row_hash = str(row["question_hash"])
+                    prior = seen_live.get(row_hash)
+                    if prior is not None and prior != split_name:
+                        raise GateFailure(
+                            f"normalized question hash overlap between {prior} and {split_name}"
+                        )
+                    seen_live[row_hash] = split_name
             expected = source_counts.get(split_name)
             if not isinstance(expected, Mapping):
                 raise GateFailure(f"split manifest missing {split_name} source counts")
@@ -295,7 +412,63 @@ def _validate_split_manifest(
         provenance = payload.get("parse_exclusion_provenance")
         if not isinstance(provenance, list) or len(provenance) != values[2]:
             raise GateFailure("split manifest parse exclusion provenance mismatch")
+        train_counts = Counter(str(row["source"]) for row in split_rows["train"])
+        if train_counts.get("svamp", 0) != 0:
+            raise GateFailure("split protocol retains SVAMP in training")
+        validation_counts = Counter(
+            str(row["source"]) for row in split_rows["validation"]
+        )
+        if validation_counts != Counter({"gsm8k": 300, "math": 300}):
+            raise GateFailure(
+                "split protocol requires exactly 300 GSM8K and 300 MATH validation rows"
+            )
+        test_counts = Counter(str(row["source"]) for row in split_rows["test"])
+        if test_counts != Counter({"gsm8k": 1319, "svamp": 1000, "math": 5000}):
+            raise GateFailure(
+                "split protocol requires full official tests: GSM8K 1319, SVAMP 1000, MATH 5000"
+            )
+        datasets = payload.get("datasets")
+        input_lineage = payload.get("input_lineage")
+        if not isinstance(datasets, list) or not isinstance(input_lineage, Mapping):
+            raise GateFailure("split manifest dataset/input lineage is malformed")
+        expected_artifact_id = sha256_json(
+            {
+                "config": asdict(config),
+                "train": list(split_rows["train"]),
+                "validation": list(split_rows["validation"]),
+                "test": list(split_rows["test"]),
+                "exclusions": list(split_rows["exclusions"]),
+                "datasets": datasets,
+                "input_lineage": dict(input_lineage),
+                "source_pool_accounting": dict(accounting),
+                "parse_exclusion_provenance": provenance,
+            }
+        )
+        if artifact_id != expected_artifact_id:
+            raise GateFailure(
+                f"split artifact hash does not match recomputed producer artifact: {path}"
+            )
     return _LoadedManifest(path, payload, artifact_id)
+
+
+def _validate_split_row(
+    row: Mapping[str, Any], split_name: str, path: Path
+) -> None:
+    required = {"source", "split", "example_id", "question", "answer", "question_hash"}
+    if set(row) != required:
+        raise GateFailure(f"split row schema mismatch: {path}")
+    for field in required:
+        if not isinstance(row[field], str):
+            raise GateFailure(f"split row {field} is malformed: {path}")
+    recorded_split = str(row["split"])
+    if split_name == "exclusions":
+        if not recorded_split.startswith("excluded_"):
+            raise GateFailure(f"split exclusion row has invalid split marker: {path}")
+    elif recorded_split != split_name:
+        raise GateFailure(f"split row split marker mismatch: {path}")
+    expected_hash = question_hash(str(row["source"]), str(row["question"]))
+    if row["question_hash"] != expected_hash:
+        raise GateFailure(f"split row normalized question hash mismatch: {path}")
 
 
 def _validate_materializations(
@@ -331,6 +504,19 @@ def _validate_materializations(
         row_hashes = metadata.get("row_hashes")
         if row_hashes != [sha256_json(row) for row in rows]:
             raise GateFailure(f"materialization row hash mismatch: {path}")
+        expected_artifact_id = sha256_json(
+            {
+                "arm": arm,
+                "config_hash": _config_hash(config),
+                "parent_split_hash": split_hash,
+                "row_hashes": row_hashes,
+                "metadata": dict(metadata),
+            }
+        )
+        if artifact_id != expected_artifact_id:
+            raise GateFailure(
+                f"materialization artifact id does not match producer payload: {path}"
+            )
         semantic_hash = metadata.get("semantic_dataset_hash")
         if not isinstance(semantic_hash, str) or not semantic_hash:
             raise GateFailure(f"materialization semantic hash is missing: {path}")
@@ -414,6 +600,25 @@ def _validate_training_runs(
                 or payload.get("tokenizer_revision") != QWEN25_7B_TOKENIZER_REVISION
             ):
                 raise GateFailure(f"training run model/tokenizer revision mismatch: {path}")
+            data_path = artifact_root / "training-data" / f"{arm}.jsonl"
+            if payload.get("dataset_path") != str(data_path):
+                raise GateFailure(f"training run dataset path mismatch: {path}")
+            if payload.get("dataset_hash") != sha256_json(
+                data_path.read_bytes().hex()
+            ):
+                raise GateFailure(f"training run dataset hash mismatch: {path}")
+            for required_file in (
+                "adapter_config.json",
+                "adapter_model.safetensors",
+                "tokenizer_config.json",
+                "trainer_state.json",
+            ):
+                if not (path.parent / required_file).is_file():
+                    raise GateFailure(
+                        f"training run completion file is missing: {path.parent / required_file}"
+                    )
+            if payload.get("output_hash") != _directory_hash(path.parent):
+                raise GateFailure(f"training run output tree hash mismatch: {path}")
         elif saved is not None and (
             not isinstance(saved, list) or not required_saved.issubset(set(saved))
         ):
@@ -449,6 +654,14 @@ def _validate_behavior_manifest(
         "behavior manifest",
     )
     payload = _read_object(path, "behavior manifest")
+    if set(payload) != _BEHAVIOR_MANIFEST_FIELDS:
+        raise GateFailure(f"behavior manifest schema_version 1 fields mismatch: {path}")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("evidence_scope") != "experiment_candidate"
+        or payload.get("backend") != "vllm"
+    ):
+        raise GateFailure(f"production behavior gate rejects test/plumbing evidence: {path}")
     _require_completion(payload, path, canonical=False)
     _require_kind(payload, "phase_marker_behavior_generations", path)
     _require_config(payload, config, path)
@@ -457,8 +670,55 @@ def _validate_behavior_manifest(
     exclusions = payload.get("exclusions")
     if not isinstance(exclusions, list) or exclusions:
         raise GateFailure(f"behavior exclusion mismatch: {path}")
-    _validate_manifest_data_files(payload, path)
-    return _artifact_id(payload, path, allow_derived=True)
+    records_file = payload.get("records_file")
+    if not isinstance(records_file, str) or not records_file:
+        raise GateFailure(f"behavior records file is missing: {path}")
+    records_path = path.parent / records_file
+    rows = _jsonl_rows_required(records_path, "behavior records")
+    if not rows or len(rows) != payload.get("row_count"):
+        raise GateFailure(f"behavior row count mismatch: {path}")
+    if payload.get("records_hash") != _sha256_file(records_path):
+        raise GateFailure(f"behavior records file hash mismatch: {path}")
+    if payload.get("record_hashes") != [sha256_json(row) for row in rows]:
+        raise GateFailure(f"behavior record hashes mismatch: {path}")
+    examples_file = payload.get("examples_file")
+    if not isinstance(examples_file, str) or not Path(examples_file).is_file():
+        raise GateFailure(f"behavior examples completion file is missing: {path}")
+    if payload.get("examples_hash") != _sha256_file(Path(examples_file)):
+        raise GateFailure(f"behavior examples hash mismatch: {path}")
+    split = _validate_split_manifest(artifact_root, config)
+    if payload.get("split_artifact_id") != split.artifact_id:
+        raise GateFailure(f"behavior split parent mismatch: {path}")
+    if payload.get("split_manifest_hash") != _sha256_file(split.path):
+        raise GateFailure(f"behavior split manifest byte hash mismatch: {path}")
+    checkpoint_paths = payload.get("checkpoint_manifests")
+    checkpoint_hashes = payload.get("checkpoint_manifest_hashes")
+    checkpoint_ids = payload.get("checkpoint_artifact_ids")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (checkpoint_paths, checkpoint_hashes, checkpoint_ids)
+    ):
+        raise GateFailure(f"behavior checkpoint lineage maps are malformed: {path}")
+    assert isinstance(checkpoint_paths, Mapping)
+    assert isinstance(checkpoint_hashes, Mapping)
+    assert isinstance(checkpoint_ids, Mapping)
+    if set(checkpoint_paths) != set(checkpoint_hashes) or set(checkpoint_paths) != set(checkpoint_ids):
+        raise GateFailure(f"behavior checkpoint lineage key mismatch: {path}")
+    for key, value in checkpoint_paths.items():
+        if not isinstance(value, str) or not Path(value).is_file():
+            raise GateFailure(f"behavior checkpoint manifest is missing for {key}: {value}")
+        if checkpoint_hashes[key] != _sha256_file(Path(value)):
+            raise GateFailure(f"behavior checkpoint manifest hash mismatch for {key}")
+    parents = _string_list(payload.get("parent_hashes"), "parent hashes", path)
+    expected_parents = (split.artifact_id, *(str(checkpoint_ids[key]) for key in checkpoint_ids))
+    if parents != expected_parents:
+        raise GateFailure(f"behavior parent hashes mismatch: {path}")
+    artifact_id = payload.get("artifact_id")
+    unsigned = dict(payload)
+    unsigned.pop("artifact_id")
+    if artifact_id != sha256_json(unsigned):
+        raise GateFailure(f"behavior artifact hash mismatch: {path}")
+    return str(artifact_id)
 
 
 def _validate_audit_manifest(
@@ -501,10 +761,18 @@ def _validate_synthetic_manifest(
         "synthetic manifest",
     )
     payload = _read_object(path, "synthetic manifest")
+    expected_fields = {
+        "schema_version", "kind", "seed", "counts", "family_counts", "split_counts",
+        "parameter_overlap", "exact_scorer_agreement", "evidence_scope", "backend",
+        "config_hash", "preregistration_hash", "completed", "data_hashes", "artifact_id",
+    }
+    if set(payload) != expected_fields or payload.get("schema_version") != 1:
+        raise GateFailure(f"synthetic manifest must use the exact schema-v1 envelope: {path}")
+    if payload.get("evidence_scope") != "experiment" or payload.get("backend") != "production":
+        raise GateFailure(f"production gate rejects plumbing-only synthetic evidence: {path}")
     _require_completion(payload, path, canonical=path.name == "manifest.json")
     _require_kind(payload, "phase_marker_synthetic_four_state_suite", path)
-    if "config_hash" in payload:
-        _require_config(payload, config, path)
+    _require_config(payload, config, path)
     overlap = payload.get("parameter_overlap")
     if not isinstance(overlap, Mapping) or any(value != 0 for value in overlap.values()):
         raise GateFailure(f"synthetic split exclusion/overlap mismatch: {path}")
@@ -518,24 +786,88 @@ def _validate_synthetic_manifest(
     ):
         raise GateFailure(f"synthetic row counts are malformed: {path}")
     if path.name == "manifest.json":
+        data_hashes = payload.get("data_hashes")
+        if not isinstance(data_hashes, Mapping) or set(data_hashes) != set(counts):
+            raise GateFailure(f"synthetic data-file hashes are malformed: {path}")
         for split_name, expected in counts.items():
-            rows = _jsonl_rows_required(path.parent / f"{split_name}.jsonl", "synthetic split")
+            split_path = path.parent / f"{split_name}.jsonl"
+            rows = _jsonl_rows_required(split_path, "synthetic split")
             if len(rows) != expected:
                 raise GateFailure(f"synthetic {split_name} row count mismatch")
-    return _artifact_id(payload, path, allow_derived=True)
+            if data_hashes[split_name] != _sha256_file(split_path):
+                raise GateFailure(f"synthetic {split_name} file hash mismatch")
+    artifact_id = payload.get("artifact_id")
+    unsigned = dict(payload)
+    unsigned.pop("artifact_id", None)
+    if artifact_id != sha256_json(unsigned):
+        raise GateFailure(f"synthetic artifact hash mismatch: {path}")
+    return str(artifact_id)
 
 
-def _validate_activation_manifest(artifact_root: Path) -> str:
+def _validate_synthetic_preregistration(artifact_root: Path, config: ExperimentConfig) -> str:
+    path = artifact_root / "synthetic-preregistration.json"
+    payload = _read_required_object(path, "synthetic preregistration")
+    expected = {
+        "schema_version", "kind", "config_hash", "seed", "counts", "family_balance",
+        "conditions", "workspace_lengths", "protocol_hash",
+    }
+    if set(payload) != expected or payload.get("schema_version") != 1:
+        raise GateFailure(f"synthetic preregistration must use the exact schema-v1 envelope: {path}")
+    if payload.get("kind") != "phase_marker_synthetic_preregistration":
+        raise GateFailure(f"synthetic preregistration kind mismatch: {path}")
+    _require_config(payload, config, path)
+    counts = payload.get("counts")
+    if not isinstance(counts, Mapping) or set(counts) != {"train", "validation", "test"} or any(
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in counts.values()
+    ):
+        raise GateFailure(f"synthetic preregistration counts are malformed: {path}")
+    if payload.get("family_balance") != [
+        "modular_chain", "affine_chain", "two_source_numeric_composition",
+        "string_transformation_composition",
+    ]:
+        raise GateFailure(f"synthetic preregistration family balance mismatch: {path}")
+    if set(payload.get("conditions", ())) != {
+        "glyph", "dot", "repeated_glyph", "permuted_glyph", "random_symbol", "no_slot"
+    } or set(payload.get("workspace_lengths", ())) != {12, 16, 64}:
+        raise GateFailure(f"synthetic preregistration conditions or lengths mismatch: {path}")
+    protocol = {key: value for key, value in payload.items() if key != "protocol_hash"}
+    if payload.get("protocol_hash") != sha256_json(protocol):
+        raise GateFailure(f"synthetic preregistration protocol hash mismatch: {path}")
+    return _sha256_file(path)
+
+
+def _validate_activation_manifest(artifact_root: Path, config: ExperimentConfig) -> str:
     path = _first_file(
         (artifact_root / "activations" / "manifest.json", artifact_root / "capture.json"),
         "activation manifest",
     )
     payload = _read_object(path, "activation manifest")
+    expected_fields = {
+        "schema_version", "kind", "evidence_scope", "backend", "config_hash", "model_id",
+        "model_revision", "mode", "example_ids", "conditions", "layers", "positions",
+        "parent_hashes", "tensor_file", "tensor_hash", "tensors", "checkpoint_artifact_id",
+        "validation_selection_artifact_id", "behavior_artifact_id", "synthetic_artifact_id",
+        "tokenized_batch_artifact_id", "tokenized_batch_manifest_hash", "completed", "artifact_id",
+    }
+    if set(payload) != expected_fields or payload.get("schema_version") != 1:
+        raise GateFailure(f"activation manifest must use the exact schema-v1 envelope: {path}")
+    if payload.get("evidence_scope") != "experiment" or payload.get("backend") != "hf":
+        raise GateFailure(f"production gate rejects plumbing-only activation evidence: {path}")
     _require_completion(payload, path, canonical=path.name == "manifest.json")
     _require_kind(payload, "phase_marker_selected_activations", path)
+    _require_config(payload, config, path)
+    if payload.get("model_id") != config.model_id or payload.get("model_revision") != QWEN25_7B_TOKENIZER_REVISION:
+        raise GateFailure(f"activation model identity mismatch: {path}")
     parents = _string_list(payload.get("parent_hashes"), "parent hashes", path)
-    if not parents:
-        raise GateFailure(f"activation manifest has no parents: {path}")
+    expected_parents = tuple(
+        str(payload[key])
+        for key in (
+            "validation_selection_artifact_id", "tokenized_batch_artifact_id",
+            "checkpoint_artifact_id", "behavior_artifact_id", "synthetic_artifact_id",
+        )
+    )
+    if parents != expected_parents or any(not _is_sha256(value) for value in parents):
+        raise GateFailure(f"activation manifest parents mismatch: {path}")
     tensor_name = payload.get("tensor_file")
     tensor_hash = payload.get("tensor_hash")
     if not isinstance(tensor_name, str) or not isinstance(tensor_hash, str):
@@ -545,7 +877,105 @@ def _validate_activation_manifest(artifact_root: Path) -> str:
         raise GateFailure(f"missing activation tensor: {tensor_path}")
     if _sha256_file(tensor_path) != tensor_hash:
         raise GateFailure(f"activation tensor hash mismatch: {tensor_path}")
-    return _artifact_id(payload, path)
+    artifact_id = payload.get("artifact_id")
+    unsigned = dict(payload)
+    unsigned.pop("artifact_id", None)
+    if artifact_id != sha256_json(unsigned):
+        raise GateFailure(f"activation artifact hash mismatch: {path}")
+    return str(artifact_id)
+
+
+def _validate_capture_inputs(artifact_root: Path, config: ExperimentConfig) -> tuple[str, ...]:
+    selection = _validate_stage_parent(
+        artifact_root / "capture-selection.json", "capture selection", config,
+        {"schema_version", "kind", "config_hash", "selected_on", "artifact_id"},
+    )
+    if selection["payload"].get("selected_on") != "validation":
+        raise GateFailure("capture selection must be selected_on=validation")
+    checkpoint = _validate_stage_parent(
+        artifact_root / "capture-checkpoint.json", "capture checkpoint", config,
+        {
+            "schema_version", "kind", "config_hash", "model_id", "model_revision",
+            "checkpoint_path", "artifact_id",
+        },
+    )
+    if (
+        checkpoint["payload"].get("model_id") != config.model_id
+        or checkpoint["payload"].get("model_revision") != QWEN25_7B_TOKENIZER_REVISION
+        or not Path(str(checkpoint["payload"].get("checkpoint_path"))).is_dir()
+    ):
+        raise GateFailure("capture checkpoint model identity or path mismatch")
+    batch = _validate_stage_parent(
+        artifact_root / "capture-batch" / "manifest.json", "capture batch", config,
+        {
+            "schema_version", "kind", "config_hash", "batch_file", "batch_hash",
+            "layers", "positions", "artifact_id",
+        },
+    )
+    batch_file = batch["payload"].get("batch_file")
+    if not isinstance(batch_file, str):
+        raise GateFailure("capture batch path is malformed")
+    batch_path = Path(batch_file)
+    if not batch_path.is_file() or batch["payload"].get("batch_hash") != _sha256_file(batch_path):
+        raise GateFailure("capture batch file is missing or hash-mismatched")
+    return tuple(str(item["artifact_id"]) for item in (selection, checkpoint, batch))
+
+
+def _validate_intervention_inputs(artifact_root: Path, config: ExperimentConfig) -> tuple[str, ...]:
+    selection = _validate_stage_parent(
+        artifact_root / "intervention-selection.json", "intervention selection", config,
+        {"schema_version", "kind", "config_hash", "selected_on", "artifact_id"},
+    )
+    if selection["payload"].get("selected_on") != "validation":
+        raise GateFailure("intervention selection must be selected_on=validation")
+    checkpoint = _validate_stage_parent(
+        artifact_root / "capture-checkpoint.json", "intervention checkpoint", config,
+        {
+            "schema_version", "kind", "config_hash", "model_id", "model_revision",
+            "checkpoint_path", "artifact_id",
+        },
+    )
+    if checkpoint["payload"].get("model_id") != config.model_id or checkpoint["payload"].get("model_revision") != QWEN25_7B_TOKENIZER_REVISION:
+        raise GateFailure("intervention checkpoint model identity mismatch")
+    pairs = _validate_stage_parent(
+        artifact_root / "aligned-pairs" / "manifest.json", "aligned pairs", config,
+        {
+            "schema_version", "kind", "config_hash", "rows_file", "rows_hash",
+            "row_count", "row_hashes", "artifact_id",
+        },
+    )
+    rows_file = pairs["payload"].get("rows_file")
+    if not isinstance(rows_file, str):
+        raise GateFailure("aligned-pairs rows path is malformed")
+    rows_path = (artifact_root / "aligned-pairs") / rows_file
+    rows = _jsonl_rows_required(rows_path, "aligned pairs")
+    required = {
+        "pair_id", "recipient_id", "donor_id", "recipient_batch_path", "donor_batch_path",
+        "target_token_ids", "method", "layer", "positions", "norm_match", "control_name",
+    }
+    if (
+        not rows
+        or any(set(row) != required for row in rows)
+        or pairs["payload"].get("rows_hash") != _sha256_file(rows_path)
+        or pairs["payload"].get("row_count") != len(rows)
+        or pairs["payload"].get("row_hashes") != [sha256_json(row) for row in rows]
+    ):
+        raise GateFailure("aligned-pairs rows schema, count, or hashes mismatch")
+    return tuple(str(item["artifact_id"]) for item in (selection, checkpoint, pairs))
+
+
+def _validate_stage_parent(
+    path: Path, label: str, config: ExperimentConfig, fields: set[str]
+) -> Mapping[str, object]:
+    payload = _read_required_object(path, label)
+    if set(payload) != fields or payload.get("schema_version") != 1:
+        raise GateFailure(f"{label} must use its exact schema-v1 envelope: {path}")
+    _require_config(payload, config, path)
+    unsigned = dict(payload)
+    artifact_id = unsigned.pop("artifact_id", None)
+    if artifact_id != sha256_json(unsigned):
+        raise GateFailure(f"{label} artifact hash mismatch: {path}")
+    return {"payload": payload, "artifact_id": artifact_id}
 
 
 def _commands_for_stage(
@@ -556,6 +986,7 @@ def _commands_for_stage(
     kind: str,
     seeds: tuple[int, ...],
     config_path: Path,
+    approval: ApprovalMetadata | None,
 ) -> tuple[str, ...]:
     if stage == "train":
         return tuple(
@@ -566,8 +997,18 @@ def _commands_for_stage(
                 kind=kind,
                 seeds=seeds,
                 config_path=config_path,
+                approval=approval,
             )
         )
+    synthetic_counts: Mapping[str, Any] = {}
+    if stage == "synthetic":
+        preregistration = _read_required_object(
+            artifact_root / "synthetic-preregistration.json", "synthetic preregistration"
+        )
+        value = preregistration.get("counts")
+        if not isinstance(value, Mapping):
+            raise GateFailure("synthetic preregistration counts are malformed")
+        synthetic_counts = value
     commands: dict[str, tuple[str, ...]] = {
         "splits": (
             shlex.join(
@@ -589,26 +1030,32 @@ def _commands_for_stage(
                 ("./.venv/bin/python", "-m", "phase_marker.token_audit", "materialize", "--config", str(config_path), "--limit", "2455", "--output-root", str(artifact_root / "training-data"))
             ),
         ),
-        "behavior": tuple(
-            shlex.join(
-                ("./.venv/bin/python", "-m", "phase_marker.behavior", "run", "--config", str(config_path), "--kind", kind, "--seed", str(seed), "--artifact-root", str(artifact_root))
-            )
-            for seed in seeds
+        "behavior": (
+            shlex.join((
+                "./.venv/bin/python", "-m", "phase_marker.behavior", "run", "--config", str(config_path),
+                "--kind", kind, "--seeds", *(str(seed) for seed in seeds),
+                "--split-manifest", str(artifact_root / "splits" / "manifest.json"),
+                "--examples", str(artifact_root / "splits" / "test.jsonl"),
+                "--checkpoint-manifests", *(
+                    str(artifact_root / "checkpoint-selections" / kind / f"seed-{seed}" / f"{arm}.json")
+                    for seed in seeds for arm in config.arms
+                ), "--backend", "vllm", "--output-root", str(artifact_root / "raw-generations" / kind),
+            )),
         ),
         "audit": (
-            shlex.join(("./.venv/bin/python", "-m", "phase_marker.statistics", "audit", "--artifact-root", str(artifact_root))),
+            shlex.join(("./.venv/bin/python", "-m", "phase_marker.statistics", "audit", "--config", str(config_path), "--kind", kind, "--seeds", *(str(seed) for seed in seeds), "--generations", str(artifact_root / "raw-generations" / kind), "--manual-labels", str(artifact_root / "audit" / "manual-labels.jsonl"), "--output-root", str(artifact_root / "audit"))),
         ),
         "statistics": (
             shlex.join(("./.venv/bin/python", "-m", "phase_marker.statistics", "analyze", "--config", str(config_path), "--generations", str(artifact_root / "raw-generations"), "--manual-audit", str(artifact_root / "audit" / "manual-labels.tsv"), "--output-root", str(artifact_root / "analysis"))),
         ),
         "synthetic": (
-            shlex.join(("./.venv/bin/python", "-m", "phase_marker.synthetic", "build", "--seed", str(seeds[0]), "--train", "100", "--validation", "20", "--test", "20", "--output-root", str(artifact_root / "synthetic"))),
+            shlex.join(("./.venv/bin/python", "-m", "phase_marker.synthetic", "build", "--config", str(config_path), "--preregistration", str(artifact_root / "synthetic-preregistration.json"), "--seed", str(seeds[0]), "--train", str(synthetic_counts["train"]), "--validation", str(synthetic_counts["validation"]), "--test", str(synthetic_counts["test"]), "--backend", "production", "--output-root", str(artifact_root / "synthetic"))),
         ),
         "capture": (
-            shlex.join(("./.venv/bin/python", "-m", "phase_marker.activations", "capture", "--config", str(config_path), "--artifact-root", str(artifact_root))),
+            shlex.join(("./.venv/bin/python", "-m", "phase_marker.activations", "capture", "--config", str(config_path), "--mode", "teacher_forced", "--validation-selection-manifest", str(artifact_root / "capture-selection.json"), "--tokenized-batch-manifest", str(artifact_root / "capture-batch" / "manifest.json"), "--tokenized-batch", str(artifact_root / "capture-batch" / "batch.pt"), "--model-id", config.model_id, "--model-revision", QWEN25_7B_TOKENIZER_REVISION, "--checkpoint-manifest", str(artifact_root / "capture-checkpoint.json"), "--behavior-manifest", str(artifact_root / "raw-generations" / kind / "manifest.json"), "--synthetic-manifest", str(artifact_root / "synthetic" / "manifest.json"), "--backend", "hf", "--output-root", str(artifact_root / "activations"))),
         ),
         "intervene": (
-            shlex.join(("./.venv/bin/python", "-m", "phase_marker.interventions", "run", "--config", str(config_path), "--artifact-root", str(artifact_root))),
+            shlex.join(("./.venv/bin/python", "-m", "phase_marker.interventions", "run", "--config", str(config_path), "--validation-selection-manifest", str(artifact_root / "intervention-selection.json"), "--aligned-pairs-manifest", str(artifact_root / "aligned-pairs" / "manifest.json"), "--activation-manifest", str(artifact_root / "activations" / "manifest.json"), "--checkpoint-manifest", str(artifact_root / "capture-checkpoint.json"), "--model-id", config.model_id, "--model-revision", QWEN25_7B_TOKENIZER_REVISION, "--backend", "hf", "--output-root", str(artifact_root / "interventions"))),
         ),
     }
     return commands[stage]
@@ -763,6 +1210,18 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _directory_hash(path: Path) -> str:
+    records = [
+        {
+            "path": str(candidate.relative_to(path)),
+            "sha256": _sha256_file(candidate),
+        }
+        for candidate in sorted(path.rglob("*"))
+        if candidate.is_file() and candidate.name != "run-manifest.json"
+    ]
+    return sha256_json(records)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -776,6 +1235,7 @@ def _parser() -> argparse.ArgumentParser:
     gate.add_argument("--seeds", type=int, nargs="+", required=True)
     gate.add_argument("--config", type=Path, required=True)
     gate.add_argument("--artifact-root", type=Path, required=True)
+    _add_approval_arguments(gate)
 
     listed = commands.add_parser("commands", help="serialize exact training commands")
     listed.add_argument("--kind", choices=("pilot", "confirmatory"), required=True)
@@ -783,7 +1243,36 @@ def _parser() -> argparse.ArgumentParser:
     listed.add_argument("--seeds", type=int, nargs="+", required=True)
     listed.add_argument("--config", type=Path, required=True)
     listed.add_argument("--artifact-root", type=Path, required=True)
+    _add_approval_arguments(listed)
     return parser
+
+
+def _add_approval_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--hardware")
+    parser.add_argument("--max-duration-hours", type=float)
+    parser.add_argument("--estimated-gpu-hours", type=float)
+    parser.add_argument("--spend-cap-usd", type=float)
+    parser.add_argument("--estimated-spend-usd", type=float)
+    parser.add_argument("--evaluation-workload")
+
+
+def _approval_from_arguments(arguments: argparse.Namespace) -> ApprovalMetadata | None:
+    values = tuple(
+        getattr(arguments, field.replace("_usd", "_usd"), None)
+        for field in _APPROVAL_FIELDS
+    )
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        return None
+    return ApprovalMetadata(
+        hardware=arguments.hardware,
+        max_duration_hours=arguments.max_duration_hours,
+        estimated_gpu_hours=arguments.estimated_gpu_hours,
+        spend_cap_usd=arguments.spend_cap_usd,
+        estimated_spend_usd=arguments.estimated_spend_usd,
+        evaluation_workload=arguments.evaluation_workload,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -796,6 +1285,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             kind="confirmatory",
             seeds=config.confirmatory_seeds,
             config_path=arguments.config,
+            approval=None,
         )
         print(
             canonical_json(
@@ -821,12 +1311,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seeds=tuple(arguments.seeds),
                 arms=tuple(arguments.arms),
                 config_path=arguments.config,
+                approval=_approval_from_arguments(arguments),
             )
         except ValueError as error:
             print(canonical_json({"passed": False, "reason": str(error), "jobs": []}))
             return 1
-        print(canonical_json({"passed": True, "jobs": list(jobs)}))
-        return 0
+        ready = all(job["approval_ready"] is True for job in jobs)
+        print(
+            canonical_json(
+                {
+                    "passed": ready,
+                    "approval_ready": ready,
+                    "reason": (
+                        "approval metadata complete"
+                        if ready
+                        else "approval metadata is missing"
+                    ),
+                    "jobs": list(jobs),
+                }
+            )
+        )
+        return 0 if ready else 1
     result = _run_gate(
         arguments.stage,
         config,
@@ -834,6 +1339,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         kind=arguments.kind,
         seeds=tuple(arguments.seeds),
         config_path=arguments.config,
+        approval=_approval_from_arguments(arguments),
     )
     print(canonical_json(asdict(result)))
     return 0 if result.passed else 1

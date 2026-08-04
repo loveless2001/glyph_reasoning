@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from dataclasses import asdict
+import hashlib
+import json
 
 import pytest
 import torch
@@ -17,6 +20,8 @@ from phase_marker.activations import (
     fit_phase_probe,
     save_activation_artifact,
 )
+from phase_marker.config import ExperimentConfig
+from phase_marker.io import canonical_json, sha256_json
 
 
 class TinyRMSNorm(nn.Module):
@@ -242,6 +247,66 @@ def test_activation_artifact_manifest_binds_mode_shapes_ids_and_parents(
     }
     assert tuple(payload["residual"].shape) == (1, 1, 2, 8)
     assert (tmp_path / "manifest.json").is_file()
+
+
+def test_capture_cli_rejects_tiny_backend_without_explicit_opt_in(tmp_path: Path):
+    from phase_marker.activations import main
+
+    with pytest.raises(ValueError, match="allow-test-backend"):
+        main(
+            (
+                "capture", "--config", "configs/phase-marker-qwen25-7b.toml",
+                "--mode", "teacher_forced", "--validation-selection-manifest", "missing.json",
+                "--tokenized-batch-manifest", "missing.json", "--tokenized-batch", "missing.pt",
+                "--model-id", "Qwen/Qwen2.5-7B-Instruct", "--model-revision", "deadbeef",
+                "--checkpoint-manifest", "missing.json", "--behavior-manifest", "missing.json",
+                "--synthetic-manifest", "missing.json", "--backend", "tiny-fixture",
+                "--output-root", str(tmp_path),
+            )
+        )
+
+
+def test_capture_cli_tiny_fixture_emits_plumbing_only_envelope(tmp_path: Path):
+    from phase_marker.activations import main
+
+    config_path = Path("configs/phase-marker-qwen25-7b.toml")
+    config = ExperimentConfig.load(config_path)
+    config_hash = sha256_json(asdict(config))
+
+    def parent(name: str, **values: object) -> Path:
+        payload = {"schema_version": 1, "kind": name, "config_hash": config_hash, **values}
+        payload["artifact_id"] = sha256_json(payload)
+        path = tmp_path / f"{name}.json"
+        path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+        return path
+
+    batch_path = tmp_path / "batch.pt"
+    batch_path.write_bytes(b"tiny fixture batch")
+    selection = parent("selection", selected_on="validation")
+    checkpoint = parent(
+        "checkpoint", model_id=config.model_id, model_revision="deadbeef", checkpoint_path="/fixture"
+    )
+    behavior = parent("behavior", evidence_scope="experiment_candidate")
+    synthetic = parent("synthetic", evidence_scope="experiment")
+    batch = parent(
+        "tokenized_batch", batch_file=str(batch_path),
+        batch_hash=hashlib.sha256(batch_path.read_bytes()).hexdigest(), layers=[0], positions=[1]
+    )
+    output = tmp_path / "capture"
+    assert main(
+        (
+            "capture", "--config", str(config_path), "--mode", "teacher_forced",
+            "--validation-selection-manifest", str(selection), "--tokenized-batch-manifest", str(batch),
+            "--tokenized-batch", str(batch_path), "--model-id", config.model_id,
+            "--model-revision", "deadbeef", "--checkpoint-manifest", str(checkpoint),
+            "--behavior-manifest", str(behavior), "--synthetic-manifest", str(synthetic),
+            "--backend", "tiny-fixture", "--allow-test-backend", "--output-root", str(output),
+        )
+    ) == 0
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
+    assert manifest["evidence_scope"] == "plumbing_only"
+    assert manifest["backend"] == "tiny-fixture"
 
 
 def _probe_batch(condition: str, *, informative: bool) -> ActivationBatch:

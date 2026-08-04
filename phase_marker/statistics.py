@@ -10,6 +10,7 @@ import argparse
 from collections import Counter
 import csv
 from dataclasses import asdict, dataclass, replace
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -22,9 +23,25 @@ import pandas as pd
 from scipy.stats import binomtest
 from statsmodels.genmod.bayes_mixed_glm import BinomialBayesMixedGLM
 
-from phase_marker.io import read_jsonl
+from phase_marker.config import ExperimentConfig
+from phase_marker.io import canonical_json, read_jsonl, sha256_json
 from phase_marker.schema import ScoreRecord
 from phase_marker.scoring import select_audit_sample
+
+
+_BEHAVIOR_ENVELOPE_FIELDS = {
+    "schema_version", "kind", "evidence_scope", "backend", "config_hash", "run_kind",
+    "seeds", "split_artifact_id", "split_manifest_hash", "materialization_artifact_ids",
+    "checkpoint_artifact_ids", "checkpoint_manifest_hashes", "checkpoint_manifests",
+    "examples_file", "examples_hash", "records_file", "records_hash", "row_count",
+    "record_hashes", "exclusions", "parent_hashes", "completed", "artifact_id",
+}
+_AUDIT_ENVELOPE_FIELDS = {
+    "schema_version", "kind", "evidence_scope", "config_hash", "run_kind", "seeds",
+    "behavior_artifact_id", "behavior_manifest_hash", "labels_file", "labels_hash",
+    "row_count", "source_counts", "disagreements", "total", "rate", "passed",
+    "parent_hashes", "completed", "artifact_id",
+}
 
 
 PAIR_KEY_FIELDS = ("source", "question_hash", "seed")
@@ -1053,10 +1070,229 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     smoke = subparsers.add_parser("smoke")
     smoke.add_argument("--output-root", type=Path, required=True)
+    audit = subparsers.add_parser("audit")
+    audit.add_argument("--config", type=Path, required=True)
+    audit.add_argument("--kind", choices=("pilot", "confirmatory"), required=True)
+    audit.add_argument("--seeds", type=int, nargs="+", required=True)
+    audit.add_argument("--generations", type=Path, required=True)
+    audit.add_argument("--manual-labels", type=Path, required=True)
+    audit.add_argument("--output-root", type=Path, required=True)
+    audit.add_argument("--allow-test-evidence", action="store_true")
+    analyze = subparsers.add_parser("analyze")
+    analyze.add_argument("--config", type=Path, required=True)
+    analyze.add_argument("--generations", type=Path, required=True)
+    analyze.add_argument("--manual-audit", type=Path, required=True)
+    analyze.add_argument("--output-root", type=Path, required=True)
+    analyze.add_argument("--allow-test-evidence", action="store_true")
     arguments = parser.parse_args(argv)
     if arguments.command == "smoke":
         return _run_smoke(arguments.output_root)
+    if arguments.command == "audit":
+        return _run_audit(arguments)
+    if arguments.command == "analyze":
+        return _run_analyze(arguments)
     raise AssertionError("unreachable")
+
+
+def _run_audit(arguments: argparse.Namespace) -> int:
+    config = ExperimentConfig.load(arguments.config)
+    behavior_path, behavior = _load_behavior_envelope(arguments.generations)
+    _validate_analysis_parent(
+        behavior_path, behavior, config, arguments.allow_test_evidence,
+        kind=arguments.kind, seeds=tuple(arguments.seeds)
+    )
+    records_path = behavior_path.parent / str(behavior["records_file"])
+    records = load_score_records(records_path)
+    selected = tuple(select_audit_sample(records, per_source=100, seed=20260804))
+    source_counts = Counter(record.source for record in selected)
+    if len(selected) != 300 or source_counts != Counter(
+        {"gsm8k": 100, "svamp": 100, "math": 100}
+    ):
+        raise ValueError("manual audit requires exactly 300 labels and 100 per source")
+    manual = read_manual_audit_tsv(arguments.manual_labels)
+    result = apply_audit_gate(selected, manual, threshold=0.01)
+    if arguments.output_root.exists():
+        raise FileExistsError(f"refusing to overwrite audit output: {arguments.output_root}")
+    arguments.output_root.mkdir(parents=True)
+    manifest: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "phase_marker_manual_audit",
+        "evidence_scope": behavior["evidence_scope"],
+        "config_hash": sha256_json(asdict(config)),
+        "run_kind": arguments.kind,
+        "seeds": list(arguments.seeds),
+        "behavior_artifact_id": behavior["artifact_id"],
+        "behavior_manifest_hash": _statistics_file_hash(behavior_path),
+        "labels_file": str(arguments.manual_labels),
+        "labels_hash": _statistics_file_hash(arguments.manual_labels),
+        "row_count": len(selected),
+        "source_counts": dict(sorted(source_counts.items())),
+        "disagreements": result.disagreements,
+        "total": result.total,
+        "rate": result.rate,
+        "passed": result.passed,
+        "parent_hashes": [behavior["artifact_id"]],
+        "completed": True,
+    }
+    manifest["artifact_id"] = sha256_json(manifest)
+    _atomic_json(arguments.output_root / "manifest.json", manifest)
+    print(canonical_json(manifest))
+    return 0 if result.passed else 1
+
+
+def _run_analyze(arguments: argparse.Namespace) -> int:
+    config = ExperimentConfig.load(arguments.config)
+    behavior_path, behavior = _load_behavior_envelope(arguments.generations)
+    kind = behavior.get("run_kind")
+    seeds = behavior.get("seeds")
+    if not isinstance(kind, str) or not isinstance(seeds, list):
+        raise ValueError("behavior manifest lacks run identity")
+    _validate_analysis_parent(
+        behavior_path, behavior, config, arguments.allow_test_evidence,
+        kind=kind, seeds=tuple(seeds)
+    )
+    audit_path = arguments.manual_audit.parent / "manifest.json"
+    audit = _statistics_read_object(audit_path, "audit manifest")
+    if (
+        set(audit) != _AUDIT_ENVELOPE_FIELDS
+        or audit.get("schema_version") != 1
+        or audit.get("kind") != "phase_marker_manual_audit"
+        or audit.get("config_hash") != sha256_json(asdict(config))
+        or audit.get("behavior_artifact_id") != behavior.get("artifact_id")
+        or audit.get("labels_file") != str(arguments.manual_audit)
+        or audit.get("labels_hash") != _statistics_file_hash(arguments.manual_audit)
+        or audit.get("completed") is not True
+        or audit.get("passed") is not True
+    ):
+        raise ValueError("manual audit manifest lineage or completion mismatch")
+    unsigned_audit = dict(audit)
+    audit_id = unsigned_audit.pop("artifact_id", None)
+    if audit_id != sha256_json(unsigned_audit):
+        raise ValueError("manual audit artifact hash mismatch")
+    records = load_score_records(behavior_path.parent / str(behavior["records_file"]))
+    primary = [record for record in records if record.evaluation_kind == "primary"]
+    contrasts = (
+        ContrastSpec("glyph-glyph-v-semantic-neutral", "glyph", "glyph", "semantic", "neutral"),
+        ContrastSpec("glyph-glyph-v-dot-dot", "glyph", "glyph", "dot", "dot", secondary=True),
+        ContrastSpec("glyph-glyph-v-glyph-dot", "glyph", "glyph", "glyph", "dot", secondary=True),
+    )
+    results = build_contrast_results(
+        primary, contrasts, bootstrap_seed=20260804, draws=CONFIRMATORY_BOOTSTRAP_DRAWS
+    )
+    model = fit_hierarchical_logit(primary)
+    manual = read_manual_audit_tsv(arguments.manual_audit)
+    by_id = {record.generation_id: record for record in records}
+    audited = [by_id[generation_id] for generation_id in manual]
+    paths = write_confirmatory_outputs(
+        arguments.output_root,
+        results,
+        model,
+        audited,
+        manual,
+        synthetic=behavior.get("evidence_scope") == "plumbing_only",
+    )
+    manifest: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "phase_marker_confirmatory_analysis",
+        "evidence_scope": behavior["evidence_scope"],
+        "config_hash": sha256_json(asdict(config)),
+        "run_kind": kind,
+        "seeds": seeds,
+        "behavior_artifact_id": behavior["artifact_id"],
+        "audit_artifact_id": audit_id,
+        "output_hashes": {
+            name: _statistics_file_hash(path) for name, path in sorted(paths.items())
+        },
+        "parent_hashes": [behavior["artifact_id"], audit_id],
+        "completed": True,
+    }
+    manifest["artifact_id"] = sha256_json(manifest)
+    _atomic_json(arguments.output_root / "manifest.json", manifest)
+    print(canonical_json(manifest))
+    return 0
+
+
+def _load_behavior_envelope(generations: Path) -> tuple[Path, Mapping[str, object]]:
+    path = generations / "manifest.json" if generations.is_dir() else generations
+    return path, _statistics_read_object(path, "behavior manifest")
+
+
+def _validate_analysis_parent(
+    behavior_path: Path,
+    behavior: Mapping[str, object],
+    config: ExperimentConfig,
+    allow_test: bool,
+    *,
+    kind: str,
+    seeds: tuple[object, ...],
+) -> None:
+    expected_seeds = (42,) if kind == "pilot" else (101, 202, 303)
+    if (
+        set(behavior) != _BEHAVIOR_ENVELOPE_FIELDS
+        or behavior.get("schema_version") != 1
+        or behavior.get("kind") != "phase_marker_behavior_generations"
+        or behavior.get("config_hash") != sha256_json(asdict(config))
+        or behavior.get("run_kind") != kind
+        or tuple(behavior.get("seeds", ())) != expected_seeds
+        or seeds != expected_seeds
+        or behavior.get("completed") is not True
+    ):
+        raise ValueError("behavior manifest config/run lineage mismatch")
+    if behavior.get("evidence_scope") == "plumbing_only" and not allow_test:
+        raise ValueError("production analysis rejects plumbing-only behavior evidence")
+    expected_backend = (
+        "tiny-fixture" if behavior.get("evidence_scope") == "plumbing_only" else "vllm"
+    )
+    if behavior.get("backend") != expected_backend:
+        raise ValueError("behavior manifest backend/evidence scope mismatch")
+    unsigned = dict(behavior)
+    artifact_id = unsigned.pop("artifact_id", None)
+    if artifact_id != sha256_json(unsigned):
+        raise ValueError("behavior manifest artifact hash mismatch")
+    records_path = behavior_path.parent / str(behavior.get("records_file"))
+    rows = [
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if (
+        not rows
+        or behavior.get("records_hash") != _statistics_file_hash(records_path)
+        or behavior.get("row_count") != len(rows)
+        or behavior.get("record_hashes") != [sha256_json(row) for row in rows]
+    ):
+        raise ValueError("behavior records count or hashes mismatch")
+    examples_path = Path(str(behavior.get("examples_file")))
+    if behavior.get("examples_hash") != _statistics_file_hash(examples_path):
+        raise ValueError("behavior examples hash mismatch")
+    manifests = behavior.get("checkpoint_manifests")
+    manifest_hashes = behavior.get("checkpoint_manifest_hashes")
+    if (
+        not isinstance(manifests, Mapping)
+        or not isinstance(manifest_hashes, Mapping)
+        or set(manifests) != set(manifest_hashes)
+    ):
+        raise ValueError("behavior checkpoint lineage maps mismatch")
+    for key, value in manifests.items():
+        if (
+            not isinstance(value, str)
+            or manifest_hashes[key] != _statistics_file_hash(Path(value))
+        ):
+            raise ValueError("behavior checkpoint manifest hash mismatch")
+
+
+def _statistics_read_object(path: Path, label: str) -> Mapping[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise FileNotFoundError(f"missing {label}: {path}") from None
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{label} must be a JSON object")
+    return payload
+
+
+def _statistics_file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 if __name__ == "__main__":

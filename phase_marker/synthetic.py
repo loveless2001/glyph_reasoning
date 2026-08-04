@@ -13,9 +13,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import random
+import hashlib
+import json
 from typing import Literal
 
-from phase_marker.config import REQUIRED_PHASE_MARKERS
+from phase_marker.config import ExperimentConfig, REQUIRED_PHASE_MARKERS
 from phase_marker.io import canonical_json, sha256_json, write_jsonl_atomic
 from phase_marker.prompts import UNSEEN_MARKERS
 from phase_marker.scoring import answers_equivalent
@@ -521,6 +523,10 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--validation", type=int, required=True)
     build.add_argument("--test", type=int, required=True)
     build.add_argument("--output-root", type=Path, required=True)
+    build.add_argument("--config", type=Path)
+    build.add_argument("--preregistration", type=Path)
+    build.add_argument("--backend", choices=("production", "tiny-fixture"), default="production")
+    build.add_argument("--allow-test-backend", action="store_true")
     return parser
 
 
@@ -528,21 +534,66 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command != "build":  # pragma: no cover - argparse currently has one command
         raise ValueError(f"unknown command {args.command!r}")
+    if args.backend == "tiny-fixture" and not args.allow_test_backend:
+        raise ValueError("tiny-fixture requires explicit --allow-test-backend")
+    if args.backend == "production" and (args.config is None or args.preregistration is None):
+        raise ValueError("production synthetic build requires --config and --preregistration")
+    config_hash: str | None = None
+    preregistration_hash: str | None = None
+    if args.config is not None:
+        config = ExperimentConfig.load(args.config)
+        config_hash = sha256_json(asdict(config))
+    if args.preregistration is not None:
+        preregistration = json.loads(args.preregistration.read_text(encoding="utf-8"))
+        expected_fields = {
+            "schema_version", "kind", "config_hash", "seed", "counts",
+            "family_balance", "conditions", "workspace_lengths", "protocol_hash",
+        }
+        if not isinstance(preregistration, dict) or set(preregistration) != expected_fields:
+            raise ValueError("synthetic preregistration must have the exact schema-v1 fields")
+        if preregistration["schema_version"] != 1 or preregistration["kind"] != "phase_marker_synthetic_preregistration":
+            raise ValueError("synthetic preregistration schema or kind mismatch")
+        requested_counts = {"train": args.train, "validation": args.validation, "test": args.test}
+        if preregistration["config_hash"] != config_hash or preregistration["seed"] != args.seed or preregistration["counts"] != requested_counts:
+            raise ValueError("synthetic preregistration does not match config, seed, or counts")
+        if preregistration["family_balance"] != list(FAMILIES):
+            raise ValueError("synthetic preregistration family balance mismatch")
+        if set(preregistration["conditions"]) != WORKSPACE_CONDITIONS or set(preregistration["workspace_lengths"]) != WORKSPACE_LENGTHS:
+            raise ValueError("synthetic preregistration conditions or lengths mismatch")
+        protocol_payload = {key: value for key, value in preregistration.items() if key != "protocol_hash"}
+        if preregistration["protocol_hash"] != sha256_json(protocol_payload):
+            raise ValueError("synthetic preregistration protocol hash mismatch")
+        preregistration_hash = hashlib.sha256(args.preregistration.read_bytes()).hexdigest()
     bundle = generate_synthetic_suite(args.seed, SplitCounts(args.train, args.validation, args.test))
     representative = next(
         row for split in (bundle.train, bundle.validation, bundle.test) for row in split.examples
     )
+    manifest = {
+        **bundle.manifest,
+        "schema_version": 1,
+        "evidence_scope": "plumbing_only" if args.backend == "tiny-fixture" else "experiment",
+        "backend": args.backend,
+        "config_hash": config_hash,
+        "preregistration_hash": preregistration_hash,
+        "completed": True,
+    }
+    if args.backend == "tiny-fixture":
+        manifest["workspace_layouts"] = _smoke_workspace_layouts(representative)
     bundle = SyntheticBundle(
         train=bundle.train,
         validation=bundle.validation,
         test=bundle.test,
-        manifest={
-            **bundle.manifest,
-            "workspace_layouts": _smoke_workspace_layouts(representative),
-        },
+        manifest=manifest,
     )
     _write_bundle(args.output_root, bundle)
-    print(canonical_json(bundle.manifest))
+    data_hashes = {
+        name: hashlib.sha256((args.output_root / f"{name}.jsonl").read_bytes()).hexdigest()
+        for name in ("train", "validation", "test")
+    }
+    final_manifest = {**bundle.manifest, "data_hashes": data_hashes}
+    final_manifest["artifact_id"] = sha256_json(final_manifest)
+    (args.output_root / "manifest.json").write_text(canonical_json(final_manifest) + "\n", encoding="utf-8")
+    print(canonical_json(final_manifest))
     return 0
 
 
