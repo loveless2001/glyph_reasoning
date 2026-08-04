@@ -8,6 +8,10 @@ import tomllib
 
 
 ALLOWED_ARMS = frozenset({"semantic", "glyph", "dot", "random", "direct", "filler"})
+REQUIRED_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+REQUIRED_PHASE_MARKERS = ("🜞", "🜆", "🜂", "🜃")
+REQUIRED_FINAL_DELIMITER = "Final answer:"
+LEGACY_FINAL_DELIMITER = "🝞"
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,14 @@ class ExperimentConfig:
         return config
 
     def _validate(self) -> None:
+        if self.model_id != REQUIRED_MODEL_ID:
+            raise ValueError(f"model_id must be {REQUIRED_MODEL_ID!r}")
+        if self.phase_markers != REQUIRED_PHASE_MARKERS:
+            raise ValueError(f"phase_markers must be {REQUIRED_PHASE_MARKERS!r}")
+        if LEGACY_FINAL_DELIMITER in self.final_delimiter:
+            raise ValueError("final delimiter must not contain the legacy 🝞 marker")
+        if self.final_delimiter != REQUIRED_FINAL_DELIMITER:
+            raise ValueError(f"final_delimiter must be {REQUIRED_FINAL_DELIMITER!r}")
         if not self.arms or any(arm not in ALLOWED_ARMS for arm in self.arms):
             raise ValueError(f"unknown experiment arm in {self.arms!r}")
         if len(set(self.arms)) != len(self.arms):
