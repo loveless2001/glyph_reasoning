@@ -369,11 +369,18 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
     assert gpu_options["image"] is imported_adapter.gpu_image
     assert gpu_options["timeout"] == 14_400
     assert gpu_options["max_containers"] == 2
+    assert gpu_options["retries"] == 0
     assert gpu_options["volumes"]["/mnt/inputs"].volume is imported_adapter.inputs_volume
     assert gpu_options["volumes"]["/mnt/model"].volume is imported_adapter.model_volume
     assert gpu_options["volumes"]["/mnt/runs"] is imported_adapter.runs_volume
     assert gpu_options["volumes"]["/mnt/inputs"].read_only is True
     assert gpu_options["volumes"]["/mnt/model"].read_only is True
+
+    status_options = next(
+        call[1] for call in fake.declaration_calls
+        if call[0] == "function" and set(call[1]["volumes"]) == {"/mnt/runs"}
+    )
+    assert "gpu" not in status_options
 
     assert set(imported_adapter.app.remote_functions) == {"gpu_resources", "status_resources"}
     assert isinstance(imported_adapter.gpu_resources, imported_adapter.RemoteFunction)

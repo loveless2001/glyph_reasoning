@@ -68,6 +68,7 @@ cpu_image = gpu_image
     gpu=GPU,
     timeout=GPU_TIMEOUT_SECONDS,
     max_containers=MAX_GPU_CONTAINERS,
+    retries=0,
     volumes={
         "/mnt/inputs": inputs_volume.read_only(),
         "/mnt/model": model_volume.read_only(),
