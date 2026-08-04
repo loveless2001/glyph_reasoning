@@ -692,3 +692,44 @@ def test_promotion_rejects_different_filesystem_before_staging(tmp_path: Path) -
         )
 
     assert not (attempt / "promotion-staging").exists()
+
+
+def test_promotion_rejects_unlisted_regular_output_before_staging(tmp_path: Path) -> None:
+    """Would fail if a receipt could omit a regular file copied into canonical output."""
+    receipt = _receipt_for_file("adapter.bin", b"adapter")
+    attempt = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = (
+        attempt / "workspace"
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    )
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"adapter")
+    (source / "unlisted.txt").write_bytes(b"not in receipt")
+    canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+
+    with pytest.raises(ValueError, match="complete source file set"):
+        promote_validated_output(source, attempt, canonical, receipt)
+
+    assert not (attempt / "promotion-staging").exists()
+    assert not canonical.exists()
+
+
+def test_promotion_rejects_symlink_entry_before_staging(tmp_path: Path) -> None:
+    """Would fail if a symlink's followed bytes could evade the receipt file manifest."""
+    receipt = _receipt_for_file("adapter.bin", b"adapter")
+    attempt = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = (
+        attempt / "workspace"
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    )
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"adapter")
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"symlink target")
+    (source / "linked.bin").symlink_to(outside)
+    canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+
+    with pytest.raises(ValueError, match="regular files"):
+        promote_validated_output(source, attempt, canonical, receipt)
+
+    assert not (attempt / "promotion-staging").exists()

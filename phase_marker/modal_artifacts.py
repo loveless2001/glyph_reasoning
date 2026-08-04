@@ -425,14 +425,21 @@ def _producer_relative_path(stage: str, arm: str) -> Path:
 
 
 def _validate_receipt_outputs(source: Path, receipt: AttemptReceipt) -> None:
-    for relative, expected_hash in zip(
-        receipt.expected_outputs, receipt.output_hashes, strict=True,
-    ):
-        path = (source / PurePosixPath(relative)).resolve()
-        if not _is_within(path, source) or path.is_symlink() or not path.is_file():
-            raise ValueError("receipt output path is missing or unsafe")
-        if _file_sha256(path) != expected_hash:
-            raise ValueError("receipt output hash does not match source bytes")
+    expected = tuple(zip(receipt.expected_outputs, receipt.output_hashes, strict=True))
+    actual = _source_output_records(source)
+    if actual != expected:
+        raise ValueError("receipt output hash or complete source file set does not match")
+
+
+def _source_output_records(root: Path) -> tuple[tuple[str, str], ...]:
+    """Return every regular producer file as sorted source-relative path/hash records."""
+    records: list[tuple[str, str]] = []
+    for path in sorted(root.rglob("*"), key=lambda value: value.relative_to(root).as_posix()):
+        if path.is_symlink() or (not path.is_dir() and not path.is_file()):
+            raise ValueError("producer output must contain only regular files and directories")
+        if path.is_file():
+            records.append((path.relative_to(root).as_posix(), _file_sha256(path)))
+    return tuple(records)
 
 
 def _filesystem_device(path: Path) -> int:
