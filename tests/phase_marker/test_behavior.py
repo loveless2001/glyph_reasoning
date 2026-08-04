@@ -1,9 +1,11 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import pytest
 
 from phase_marker.behavior import (
     _vllm_sampling_parameters,
+    _validate_production_request,
+    build_provenance_envelope,
     EvaluationCell,
     FakeGenerationBackend,
     GenerationOutput,
@@ -14,8 +16,10 @@ from phase_marker.behavior import (
     serialize_generation_record,
 )
 from phase_marker.config import ExperimentConfig
-from phase_marker.schema import ArtifactManifest
+from phase_marker.io import sha256_json
+from phase_marker.schema import ArtifactManifest, GenerationRecord
 from phase_marker.splits import DatasetExample
+from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
 
 
 @pytest.fixture
@@ -100,10 +104,6 @@ def test_records_preserve_ordered_raw_outputs_and_are_independently_rescorable()
     assert records[0].parent_hashes == ("parent" * 8,)
     assert asdict(records[0])["gold_answer"] == "2"
 
-    persisted = serialize_generation_record(records[0])
-    assert persisted["prompt_token_count"] == 2
-    assert persisted["completion_token_count"] == 2
-    assert persisted["raw_prompt"] == "prompt 1"
 
 
 def test_records_reject_missing_duplicate_or_reordered_output_ids():
@@ -132,7 +132,9 @@ def test_sampled_cells_expand_to_five_deterministic_independent_completions(conf
         DatasetExample("gsm8k", "test", "two", "2 + 2", "4", "question-2"),
     )
 
-    requests = build_generation_requests(cell, examples, config)
+    requests = build_generation_requests(
+        cell, examples, config, checkpoint="fake://glyph", fake=True
+    )
 
     assert len(requests) == 10
     assert [request.generation_id for request in requests] == [
@@ -143,10 +145,20 @@ def test_sampled_cells_expand_to_five_deterministic_independent_completions(conf
     assert [request.decoding["completion_index"] for request in requests] == [
         index for _ in examples for index in range(5)
     ]
+    assert [request.decoding["seed"] for request in requests] == [
+        42 + index for _ in examples for index in range(5)
+    ]
     assert all(request.decoding["n"] == 1 for request in requests)
     assert all(request.decoding["temperature"] == 0.7 for request in requests)
     assert all(request.decoding["top_p"] == 0.95 for request in requests)
-    assert requests == build_generation_requests(cell, examples, config)
+    assert requests == build_generation_requests(
+        cell, examples, config, checkpoint="fake://glyph", fake=True
+    )
+
+    sampling_parameters = [_vllm_sampling_parameters((request,)) for request in requests]
+    assert [parameters["seed"] for parameters in sampling_parameters] == [
+        42 + index for _ in examples for index in range(5)
+    ]
 
     outputs = FakeGenerationBackend().generate(requests)
     records = records_from_outputs(cell, examples, requests, outputs, ("parent" * 8,))
@@ -157,14 +169,20 @@ def test_sampled_cells_expand_to_five_deterministic_independent_completions(conf
     assert [record.gold_answer for record in records] == ["2"] * 5 + ["4"] * 5
 
 
-def test_vllm_batching_ignores_per_completion_provenance_not_sampling_settings(config):
+def test_vllm_sampling_parameters_retain_the_request_sample_seed(config):
     cell = EvaluationCell("sampled", "glyph", "glyph", None, "sampled")
     examples = (
         DatasetExample("gsm8k", "test", "one", "1 + 1", "2", "question-1"),
         DatasetExample("gsm8k", "test", "two", "2 + 2", "4", "question-2"),
     )
 
-    parameters = _vllm_sampling_parameters(build_generation_requests(cell, examples, config))
+    parameters = _vllm_sampling_parameters(
+        (
+            build_generation_requests(
+                cell, examples, config, checkpoint="fake://glyph", fake=True
+            )[0],
+        )
+    )
 
     assert parameters == {
         "seed": 42,
@@ -173,3 +191,102 @@ def test_vllm_batching_ignores_per_completion_provenance_not_sampling_settings(c
         "top_p": 0.95,
         "n": 1,
     }
+
+
+def test_production_request_construction_rejects_fake_tokenizer_or_checkpoint(config, split_manifest):
+    cell = EvaluationCell("primary", "glyph", "glyph", None, "greedy")
+    examples = (DatasetExample("gsm8k", "test", "one", "1 + 1", "2", "question-1"),)
+    with pytest.raises(ValueError, match="tokenizer revision"):
+        build_generation_requests(
+            cell,
+            examples,
+            config,
+            checkpoint="/checkpoints/glyph",
+            tokenize=lambda _: (1,),
+            tokenizer_revision="wrong-revision",
+            split_manifest=split_manifest,
+        )
+    with pytest.raises(ValueError, match="checkpoint"):
+        build_generation_requests(
+            cell,
+            examples,
+            config,
+            checkpoint="unconfigured://checkpoint",
+            tokenize=lambda _: (1,),
+            tokenizer_revision=QWEN25_7B_TOKENIZER_REVISION,
+            split_manifest=split_manifest,
+        )
+
+
+def test_vllm_preflight_rejects_fake_or_unpinned_requests_before_import():
+    request = GenerationRequest(
+        "generation-1",
+        "prompt",
+        (1,),
+        64,
+        {
+            "seed": 42,
+            "checkpoint": "fake://glyph",
+            "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
+            "run_kind": "production",
+        },
+    )
+    with pytest.raises(ValueError, match="checkpoint"):
+        _validate_production_request(request)
+    with pytest.raises(ValueError, match="tokenizer revision"):
+        _validate_production_request(
+            replace(
+                request,
+                decoding={
+                    **request.decoding,
+                    "checkpoint": "/checkpoints/glyph",
+                    "tokenizer_revision": "wrong-revision",
+                },
+            )
+        )
+
+
+def test_provenance_envelope_rejects_empty_or_mismatched_production_lineage(
+    config, split_manifest
+):
+    split_manifest = replace(
+        split_manifest, config_hash=sha256_json(asdict(config))
+    )
+    record = GenerationRecord(
+        generation_id="generation-1",
+        source="gsm8k",
+        question_hash="question-1",
+        gold_answer="2",
+        training_arm="glyph",
+        seed=42,
+        checkpoint="/checkpoints/glyph",
+        prompt_condition="glyph",
+        prompt_hash="prompt-1",
+        raw_prompt="prompt",
+        raw_completion="Final answer: 2",
+        prompt_token_ids=(1,),
+        completion_token_ids=(2,),
+        decoding={
+            "run_kind": "production",
+            "config_hash": sha256_json(asdict(config)),
+            "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
+            "split_artifact_id": split_manifest.artifact_id,
+            "split_parent_hashes": split_manifest.parent_hashes,
+        },
+        parent_hashes=(split_manifest.artifact_id, *split_manifest.parent_hashes),
+    )
+
+    provenance = build_provenance_envelope(record, config, split_manifest)
+    persisted = serialize_generation_record(record, provenance)
+    assert persisted["provenance"] == asdict(provenance)
+    assert persisted["prompt_token_count"] == 1
+    assert persisted["completion_token_count"] == 1
+
+    with pytest.raises(ValueError, match="parent"):
+        build_provenance_envelope(replace(record, parent_hashes=()), config, split_manifest)
+    with pytest.raises(ValueError, match="config hash"):
+        build_provenance_envelope(
+            replace(record, decoding={**record.decoding, "config_hash": "wrong"}),
+            config,
+            split_manifest,
+        )

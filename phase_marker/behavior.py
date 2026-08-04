@@ -15,6 +15,7 @@ from phase_marker.prompts import MarkerSet, render_perturbation, render_prompt
 from phase_marker.schema import ArtifactManifest, GenerationRecord
 from phase_marker.scoring import score_generation
 from phase_marker.splits import DatasetExample
+from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
 
 
 PRIMARY_ARMS = ("semantic", "glyph", "dot", "random")
@@ -26,6 +27,9 @@ SAMPLED_CONTRASTS = (
     ("glyph", "dot"),
 )
 PERTURBATIONS = ("delete", "cluster", "displace", "permute", "dot_replace", "unseen_replace")
+FAKE_RUN_KIND = "fake_smoke"
+PRODUCTION_RUN_KIND = "production"
+FAKE_TOKENIZER_REVISION = "fake-byte-tokenizer"
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,17 @@ class GenerationOutput:
             raise ValueError("generation outputs require a generation ID")
 
 
+@dataclass(frozen=True)
+class ProvenanceEnvelope:
+    run_kind: str
+    config_hash: str
+    tokenizer_revision: str
+    split_artifact_id: str
+    split_parent_hashes: tuple[str, ...]
+    checkpoint: str
+    parent_hashes: tuple[str, ...]
+
+
 class GenerationBackend(Protocol):
     """Backend contract: return one unique output in exactly request order."""
 
@@ -102,22 +117,24 @@ class VLLMGenerationBackend:
         _validate_requests(requests)
         if not requests:
             return ()
-        decoding = _vllm_sampling_parameters(requests)
+        for request in requests:
+            _validate_production_request(request)
         if self._llm is None:
             from vllm import LLM  # Imported only when the production backend is used.
 
             self._llm = LLM(model=self._model, **self._llm_kwargs)
         from vllm import SamplingParams
 
-        results = self._llm.generate(
-            prompt_token_ids=[list(request.prompt_token_ids) for request in requests],
-            sampling_params=SamplingParams(**decoding),
-            use_tqdm=False,
-        )
-        if len(results) != len(requests):
-            raise ValueError("vLLM returned a missing output")
         outputs: list[GenerationOutput] = []
-        for request, result in zip(requests, results):
+        for request in requests:
+            results = self._llm.generate(
+                prompt_token_ids=[list(request.prompt_token_ids)],
+                sampling_params=SamplingParams(**_vllm_sampling_parameters((request,))),
+                use_tqdm=False,
+            )
+            if len(results) != 1:
+                raise ValueError("vLLM returned a missing output")
+            result = results[0]
             candidate = result.outputs[0]
             outputs.append(
                 GenerationOutput(
@@ -213,12 +230,36 @@ def build_generation_requests(
     *,
     checkpoint: str = "unconfigured://checkpoint",
     tokenize: Callable[[str], Sequence[int]] | None = None,
+    tokenizer_revision: str | None = None,
+    split_manifest: ArtifactManifest | None = None,
+    fake: bool = False,
 ) -> tuple[GenerationRequest, ...]:
     """Expand each sampled prompt into five independently persisted requests."""
-    if not checkpoint:
-        raise ValueError("checkpoint must be nonempty")
+    if fake:
+        if not checkpoint.startswith("fake://"):
+            raise ValueError("fake request construction requires a fake:// checkpoint")
+        if tokenize is not None or tokenizer_revision is not None or split_manifest is not None:
+            raise ValueError("fake request construction uses only the fake byte tokenizer")
+        encoder = _fake_tokenize
+        run_kind = FAKE_RUN_KIND
+        request_tokenizer_revision = FAKE_TOKENIZER_REVISION
+        config_hash = sha256_json(asdict(config))
+        split_artifact_id = "fake-smoke-split"
+        split_parent_hashes: tuple[str, ...] = ()
+    else:
+        _validate_production_construction(
+            config, checkpoint, tokenize, tokenizer_revision, split_manifest
+        )
+        assert tokenize is not None
+        assert tokenizer_revision is not None
+        assert split_manifest is not None
+        encoder = tokenize
+        run_kind = PRODUCTION_RUN_KIND
+        request_tokenizer_revision = tokenizer_revision
+        config_hash = sha256_json(asdict(config))
+        split_artifact_id = split_manifest.artifact_id
+        split_parent_hashes = tuple(split_manifest.parent_hashes)
     marker_set = MarkerSet(*config.phase_markers)
-    encoder = tokenize or _fake_tokenize
     completion_count = 5 if cell.kind == "sampled" else 1
     requests: list[GenerationRequest] = []
     for example in examples:
@@ -229,14 +270,20 @@ def build_generation_requests(
         )
         for completion_index in range(completion_count):
             decoding: dict[str, object] = {
-                "seed": config.pilot_seed,
+                "seed": config.pilot_seed + completion_index,
                 "checkpoint": checkpoint,
+                "run_kind": run_kind,
+                "config_hash": config_hash,
+                "tokenizer_revision": request_tokenizer_revision,
+                "split_artifact_id": split_artifact_id,
+                "split_parent_hashes": split_parent_hashes,
                 "max_tokens": 64,
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "n": 1,
-                "fake_answer": example.answer,
             }
+            if fake:
+                decoding["fake_answer"] = example.answer
             if cell.kind == "sampled":
                 decoding.update(
                     {
@@ -265,12 +312,57 @@ def build_generation_requests(
     return tuple(requests)
 
 
-def serialize_generation_record(record: GenerationRecord) -> dict[str, object]:
+def serialize_generation_record(
+    record: GenerationRecord, provenance: ProvenanceEnvelope
+) -> dict[str, object]:
     """Add explicit token counts without changing the immutable raw record schema."""
     row = asdict(record)
     row["prompt_token_count"] = len(record.prompt_token_ids)
     row["completion_token_count"] = len(record.completion_token_ids)
+    row["provenance"] = asdict(provenance)
     return row
+
+
+def build_provenance_envelope(
+    record: GenerationRecord, config: ExperimentConfig, split_manifest: ArtifactManifest
+) -> ProvenanceEnvelope:
+    """Validate additive run lineage before a raw record is persisted."""
+    run_kind = record.decoding.get("run_kind")
+    if run_kind not in {FAKE_RUN_KIND, PRODUCTION_RUN_KIND}:
+        raise ValueError("record provenance requires an explicit run kind")
+    config_hash = record.decoding.get("config_hash")
+    tokenizer_revision = record.decoding.get("tokenizer_revision")
+    split_artifact_id = record.decoding.get("split_artifact_id")
+    split_parent_hashes = tuple(record.decoding.get("split_parent_hashes", ()))
+    if not all(isinstance(value, str) and value for value in (config_hash, tokenizer_revision, split_artifact_id)):
+        raise ValueError("record provenance requires config, tokenizer, and split identifiers")
+    if run_kind == PRODUCTION_RUN_KIND:
+        expected_config_hash = sha256_json(asdict(config))
+        if config_hash != expected_config_hash or split_manifest.config_hash != expected_config_hash:
+            raise ValueError("production provenance config hash mismatch")
+        if tokenizer_revision != QWEN25_7B_TOKENIZER_REVISION:
+            raise ValueError("production provenance tokenizer revision mismatch")
+        if split_artifact_id != split_manifest.artifact_id:
+            raise ValueError("production provenance split artifact mismatch")
+        if not split_manifest.parent_hashes or split_parent_hashes != tuple(split_manifest.parent_hashes):
+            raise ValueError("production provenance split parents mismatch")
+        expected_parents = (split_manifest.artifact_id, *split_manifest.parent_hashes)
+        if record.parent_hashes != expected_parents:
+            raise ValueError("production provenance parent hashes mismatch")
+        if not _is_production_checkpoint(record.checkpoint):
+            raise ValueError("production provenance checkpoint is not real")
+    else:
+        if tokenizer_revision != FAKE_TOKENIZER_REVISION or not record.checkpoint.startswith("fake://"):
+            raise ValueError("fake provenance must use explicit smoke lineage")
+    return ProvenanceEnvelope(
+        run_kind=str(run_kind),
+        config_hash=str(config_hash),
+        tokenizer_revision=str(tokenizer_revision),
+        split_artifact_id=str(split_artifact_id),
+        split_parent_hashes=split_parent_hashes,
+        checkpoint=record.checkpoint,
+        parent_hashes=tuple(record.parent_hashes),
+    )
 
 
 def _validate_requests(requests: Sequence[GenerationRequest]) -> None:
@@ -291,19 +383,66 @@ def _validate_outputs(
 
 
 def _vllm_sampling_parameters(requests: Sequence[GenerationRequest]) -> dict[str, object]:
-    """Remove per-record lineage before requiring one common vLLM batch setting."""
+    """Extract one request's sampling settings for its independent vLLM stream."""
     _validate_requests(requests)
-    ignored = {"checkpoint", "fake_answer", "completion_index"}
+    if len(requests) != 1:
+        raise ValueError("vLLM sampling parameters require one independent request")
+    ignored = {
+        "checkpoint",
+        "fake_answer",
+        "completion_index",
+        "run_kind",
+        "config_hash",
+        "tokenizer_revision",
+        "split_artifact_id",
+        "split_parent_hashes",
+    }
     parameters = {
         key: value for key, value in requests[0].decoding.items() if key not in ignored
     }
-    for request in requests[1:]:
-        candidate = {
-            key: value for key, value in request.decoding.items() if key not in ignored
-        }
-        if candidate != parameters:
-            raise ValueError("a vLLM batch requires identical decoding settings")
     return parameters
+
+
+def _validate_production_construction(
+    config: ExperimentConfig,
+    checkpoint: str,
+    tokenize: Callable[[str], Sequence[int]] | None,
+    tokenizer_revision: str | None,
+    split_manifest: ArtifactManifest | None,
+) -> None:
+    if not _is_production_checkpoint(checkpoint):
+        raise ValueError("production request construction requires a real checkpoint")
+    if tokenize is None:
+        raise ValueError("production request construction requires a pinned tokenizer encoder")
+    if tokenizer_revision != QWEN25_7B_TOKENIZER_REVISION:
+        raise ValueError("production request construction requires the pinned tokenizer revision")
+    if split_manifest is None or not split_manifest.artifact_id or not split_manifest.parent_hashes:
+        raise ValueError("production request construction requires split artifact and parents")
+    expected_config_hash = sha256_json(asdict(config))
+    if split_manifest.config_hash != expected_config_hash:
+        raise ValueError("production request construction requires matching split config hash")
+
+
+def _validate_production_request(request: GenerationRequest) -> None:
+    if request.decoding.get("run_kind") != PRODUCTION_RUN_KIND:
+        raise ValueError("vLLM accepts production requests only")
+    if not _is_production_checkpoint(request.decoding.get("checkpoint")):
+        raise ValueError("vLLM request checkpoint must be real")
+    if request.decoding.get("tokenizer_revision") != QWEN25_7B_TOKENIZER_REVISION:
+        raise ValueError("vLLM request tokenizer revision is not pinned")
+    if not isinstance(request.decoding.get("config_hash"), str):
+        raise ValueError("vLLM request lacks config hash")
+    if not isinstance(request.decoding.get("split_artifact_id"), str):
+        raise ValueError("vLLM request lacks split artifact ID")
+    parents = request.decoding.get("split_parent_hashes")
+    if not isinstance(parents, tuple) or not parents:
+        raise ValueError("vLLM request lacks split parents")
+
+
+def _is_production_checkpoint(checkpoint: object) -> bool:
+    return isinstance(checkpoint, str) and bool(checkpoint) and not checkpoint.startswith(
+        ("fake://", "unconfigured://")
+    )
 
 
 def _expand_examples(
@@ -381,7 +520,7 @@ def _dry_run(arguments: argparse.Namespace) -> int:
     rows: list[dict[str, object]] = []
     for cell in build_behavior_matrix(config, split_manifest):
         requests = build_generation_requests(
-            cell, examples, config, checkpoint=f"fake://{cell.training_arm}"
+            cell, examples, config, checkpoint=f"fake://{cell.training_arm}", fake=True
         )
         records = records_from_outputs(
             cell,
@@ -391,7 +530,9 @@ def _dry_run(arguments: argparse.Namespace) -> int:
             (split_manifest.artifact_id,),
         )
         for record in records:
-            row = serialize_generation_record(record)
+            row = serialize_generation_record(
+                record, build_provenance_envelope(record, config, split_manifest)
+            )
             row["score"] = asdict(score_generation(record))
             rows.append(row)
     write_jsonl_atomic(arguments.output, rows)
