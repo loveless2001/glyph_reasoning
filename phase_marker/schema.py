@@ -73,12 +73,15 @@ class InterventionRecord:
     recipient_id: str
     donor_id: str
     method: str
+    control_name: str
     layers: tuple[int, ...]
     positions: tuple[int, ...]
     baseline_target_logprob: float
     intervened_target_logprob: float
     baseline_target_rank: int
     intervened_target_rank: int
+    baseline_donor_target_rank: int | None
+    intervened_donor_target_rank: int | None
     baseline_correct: bool
     intervened_correct: bool
     parent_hashes: tuple[str, ...]
