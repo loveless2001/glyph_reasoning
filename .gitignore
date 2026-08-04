@@ -163,4 +163,8 @@ experiments/*.png
 *.png
 .runpod*
 /checkpoints
-*.json
+
+# Phase-marker: keep compact manifests/summaries; ignore only large payloads.
+artifacts/phase-marker/checkpoints/
+artifacts/phase-marker/activations/**/*.pt
+artifacts/phase-marker/raw-generations/**/*.pt
