@@ -1,0 +1,6 @@
+model_id = "Qwen/Qwen2.5-7B-Instruct"
+pilot_seed = 42
+confirmatory_seeds = [101, 202, 303]
+phase_markers = ["🜞", "🜆", "🜂", "🜃"]
+final_delimiter = "Final answer:"
+arms = ["semantic", "glyph", "dot", "random", "direct", "filler"]
