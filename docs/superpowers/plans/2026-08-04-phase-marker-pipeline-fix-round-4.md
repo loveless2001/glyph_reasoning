@@ -59,3 +59,18 @@
 - [x] Update docs/report with exactly five round-4 findings.
 - [x] Run every requested focused/integration/full/static/nonmutation check.
 - [x] Stage authorized files and commit separately.
+
+### Task 6: Fifth-review provenance and per-stage authorization hardening
+
+**Files:** Modify `phase_marker/behavior.py`, `phase_marker/pipeline.py`,
+`README.md`, their focused tests, and the Task 12 report.
+
+- [x] Add RED tests for self-consistent huge token IDs, cross-stage approval,
+  exact parent/output mismatch, and explicit unverified-origin state.
+- [x] Independently replay exact tokenization with an injected deterministic
+  tokenizer in tests and the pinned local-only Qwen tokenizer in production.
+- [x] Replace bundle-wide mechanism approval with exact one-stage approval and
+  bind its two outputs plus a digest of all checked stage inputs.
+- [x] Require `origin_verification=execution_receipt_or_rerun_required` in the
+  artifact ID and every consumer; document the Task 13 external-evidence gate.
+- [x] Run focused/full offline/static/dry-run verification and commit separately.

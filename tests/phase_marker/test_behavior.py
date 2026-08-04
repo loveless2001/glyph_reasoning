@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from phase_marker.behavior import (
+    FAKE_TOKENIZER_REVISION,
     _vllm_sampling_parameters,
     _validate_production_request,
     build_provenance_envelope,
@@ -31,6 +32,20 @@ from phase_marker.schema import ArtifactManifest, GenerationRecord
 from phase_marker.scoring import score_generation
 from phase_marker.splits import DatasetExample
 from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
+
+
+class _DeterministicTokenizer:
+    def encode(self, text: str, *, add_special_tokens: bool) -> tuple[int, ...]:
+        assert add_special_tokens is False
+        return tuple(ord(character) for character in text)
+
+    def decode(
+        self, token_ids: tuple[int, ...], *, skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> str:
+        assert skip_special_tokens is False
+        assert clean_up_tokenization_spaces is False
+        return "".join(chr(token_id) for token_id in token_ids)
 
 
 @pytest.fixture
@@ -501,6 +516,7 @@ def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing
     assert manifest["schema_version"] == 1
     assert manifest["selected_on"] == "validation"
     assert manifest["evidence_scope"] == "plumbing_only"
+    assert manifest["origin_verification"] == "execution_receipt_or_rerun_required"
     assert [row["step"] for row in manifest["candidates"]] == [200, 100]
     assert manifest["selected_step"] == 100
 
@@ -517,7 +533,37 @@ def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing
     (output / "manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="scorer replay"):
         _load_checkpoint_selections(
-            (output / "manifest.json",), config, "pilot", (42,), allow_test=True
+            (output / "manifest.json",), config, "pilot", (42,), allow_test=True,
+            tokenizer=_DeterministicTokenizer(),
+        )
+
+    evidence_rows[0]["scorer_outputs"]["correct"] = False
+    evidence_rows[0]["gold_token_ids"] = [
+        10**100 + index for index, _ in enumerate(evidence_rows[0]["gold_token_pieces"])
+    ]
+    evidence_path.write_text(
+        "".join(canonical_json(row) + "\n" for row in evidence_rows), encoding="utf-8"
+    )
+    manifest["evidence_hash"] = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    manifest["artifact_id"] = sha256_json(
+        {key: value for key, value in manifest.items() if key != "artifact_id"}
+    )
+    (output / "manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="tokenizer replay"):
+        _load_checkpoint_selections(
+            (output / "manifest.json",), config, "pilot", (42,), allow_test=True,
+            tokenizer=_DeterministicTokenizer(),
+        )
+
+    manifest["origin_verification"] = "origin_verified"
+    manifest["artifact_id"] = sha256_json(
+        {key: value for key, value in manifest.items() if key != "artifact_id"}
+    )
+    (output / "manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="origin verification"):
+        _load_checkpoint_selections(
+            (output / "manifest.json",), config, "pilot", (42,), allow_test=True,
+            tokenizer=_DeterministicTokenizer(),
         )
 
 
@@ -614,16 +660,18 @@ def test_run_cli_tiny_fixture_emits_versioned_plumbing_manifest(
                 DatasetExample(**example), "Final answer: 0", arm, 42, selected_path,
             ))),
             "gold_continuation": f"\n{config.final_delimiter} {example['answer']}",
-            "gold_token_ids": [0],
-            "gold_token_pieces": [f"\n{config.final_delimiter} {example['answer']}"],
-            "gold_token_logprobs": [0.0], "gold_answer_logprob_contribution": 0.0,
-            "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
-            "tokenizer_snapshot_hash": QWEN25_7B_TOKENIZER_REVISION,
+            "gold_token_ids": [ord(value) for value in f"\n{config.final_delimiter} {example['answer']}"],
+            "gold_token_pieces": list(f"\n{config.final_delimiter} {example['answer']}"),
+            "gold_token_logprobs": [0.0] * len(f"\n{config.final_delimiter} {example['answer']}"),
+            "gold_answer_logprob_contribution": 0.0,
+            "tokenizer_revision": FAKE_TOKENIZER_REVISION,
+            "tokenizer_snapshot_hash": FAKE_TOKENIZER_REVISION,
         }) + "\n", encoding="utf-8")
         payload = {
             "schema_version": 1,
             "kind": "phase_marker_checkpoint_selection",
             "evidence_scope": "plumbing_only",
+            "origin_verification": "execution_receipt_or_rerun_required",
             "backend": "tiny-fixture",
             "model_id": config.model_id,
             "model_revision": QWEN25_7B_TOKENIZER_REVISION,

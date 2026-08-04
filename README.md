@@ -100,7 +100,10 @@ For example, the excluded pilot training gate is:
 ```
 
 That command only validates manifest hashes, lineage, counts, exclusions, and
-completion evidence, then prints the six exact GPU commands as data. It never
+completion evidence, then prints the six exact GPU commands as data. Selection
+gates may load the pinned Qwen tokenizer from the local cache with
+`local_files_only=True` solely to retokenize evidence; they never load model
+weights, execute commands, use the network, or write artifacts. The command never
 launches them. A train, behavior, capture, or intervention gate fails closed
 unless every approval field above is present and the estimates remain within
 the declared duration and spend caps. Counts must exactly match the requested
@@ -121,8 +124,15 @@ atomically publishes a bundle containing `manifest.json` and `evidence.jsonl`.
 Every evidence row binds the canonical example/gold answer, raw greedy
 completion, replayable scorer input/output, ordered gold-continuation token
 IDs, incrementally decoded pieces, and each teacher-forced token logprob under
-the pinned tokenizer snapshot. Consumers rerun scoring and token accounting
-before recomputing candidate aggregates and the winner. Production selection and behavior accept
+the pinned tokenizer snapshot. Consumers independently retokenize every exact
+gold continuation, reproduce every incremental decoded piece, rerun scoring and
+token accounting, and only then recompute candidate aggregates and the winner.
+Every selection manifest carries
+`origin_verification=execution_receipt_or_rerun_required`; its content hashes
+certify internal replay and lineage, not that raw completions originated from a
+model. Task 13 must bind production execution receipts/scheduler logs or a
+deterministic rerun before confirmatory publication. Until then the pipeline
+never labels selection output as origin-verified. Production selection and behavior accept
 only the canonical sibling `validation.jsonl` and `test.jsonl` files from a
 fully recomputed split envelope. The selected PEFT adapter must name the frozen
 Qwen base model and revision;
@@ -146,11 +156,21 @@ schema-v1 selection, batch/pair, checkpoint, and parent manifests; the
 `evidence_scope=plumbing_only`, which production gates reject.
 
 Capture and intervention cannot reuse the experiment approval above. They
-require a separate schema-v1 mechanism approval with exactly one capture and
-one intervention job, separate GPU-hour estimates, two commands/four outputs,
-hardware, duration/spend bounds, and the bound selection/activation parent
-hashes. Supplying only the mechanism-excluded experiment approval emits no
-mechanism command.
+require separate, stage-specific schema-v1 mechanism approvals requested at
+different times. Each approval names exactly one `capture` or `intervene`
+stage, one job, one command, two exact output paths, one digest over all checked
+stage inputs, and that stage's hardware, GPU-hour, duration, and spend bounds.
+A capture approval binds the checked selection, synthetic, behavior,
+checkpoint, and tokenized-input lineage and emits only the capture command. An
+intervention approval may be requested only after the actual activation
+artifact exists; it binds that activation plus the checked selection,
+checkpoint, and aligned-pair lineage and emits only the intervention command.
+The CLI fields are `--mechanism-stage`, `--mechanism-job-count 1`,
+`--mechanism-command-count 1`, `--mechanism-expected-outputs <manifest>
+<payload>`, `--mechanism-parent-hash`, `--mechanism-gpu-hours`, and the
+hardware/duration/spend fields. Cross-stage approvals or mismatched parents or
+outputs fail closed. Supplying only the mechanism-excluded experiment approval
+emits no mechanism command.
 
 Compact Markdown, TOML, JSON, and JSONL manifests/summaries remain eligible for
 version control. Large phase-marker checkpoints and activation/raw-generation

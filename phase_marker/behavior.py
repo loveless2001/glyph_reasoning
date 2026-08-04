@@ -91,6 +91,54 @@ class GenerationBackend(Protocol):
     def generate(self, requests: Sequence[GenerationRequest]) -> Sequence[GenerationOutput]: ...
 
 
+class EvidenceTokenizer(Protocol):
+    """Minimal tokenizer surface required to replay persisted token evidence."""
+
+    def encode(self, text: str, *, add_special_tokens: bool) -> Sequence[int]: ...
+
+    def decode(
+        self,
+        token_ids: Sequence[int],
+        *,
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> str: ...
+
+
+class _CodepointEvidenceTokenizer:
+    """Faithful deterministic tokenizer for explicitly plumbing-only evidence."""
+
+    def encode(self, text: str, *, add_special_tokens: bool) -> tuple[int, ...]:
+        if add_special_tokens:
+            raise ValueError("plumbing tokenizer does not add special tokens")
+        return tuple(ord(character) for character in text)
+
+    def decode(
+        self,
+        token_ids: Sequence[int],
+        *,
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> str:
+        if skip_special_tokens or clean_up_tokenization_spaces:
+            raise ValueError("plumbing tokenizer requires exact decoding")
+        try:
+            return "".join(chr(token_id) for token_id in token_ids)
+        except (TypeError, ValueError) as error:
+            raise ValueError("plumbing token ID is not a Unicode code point") from error
+
+
+def _load_pinned_evidence_tokenizer(model_id: str) -> EvidenceTokenizer:
+    """Load only the pinned local tokenizer snapshot; never fetch or load weights."""
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(
+        model_id,
+        revision=QWEN25_7B_TOKENIZER_REVISION,
+        local_files_only=True,
+    )
+
+
 class FakeGenerationBackend:
     """Deterministic non-model backend used only for dry runs and tests."""
 
@@ -808,6 +856,7 @@ _CHECKPOINT_SELECTION_FIELDS = frozenset(
         "seed",
         "selected_on",
         "evidence_scope",
+        "origin_verification",
         "backend",
         "model_id",
         "model_revision",
@@ -926,10 +975,17 @@ def _run_selection(arguments: argparse.Namespace) -> int:
                 score_generation(_selection_generation(example, raw, arguments.arm, arguments.seed, str(checkpoint)))
                 for example, raw in zip(examples, raw_completions, strict=True)
             ]
-            token_rows = tuple(
-                ((0,), (f"\n{config.final_delimiter} {example.answer}",), (0.0,))
-                for example in examples
-            )
+            fixture_tokenizer = _CodepointEvidenceTokenizer()
+            token_rows_list = []
+            for example in examples:
+                continuation = f"\n{config.final_delimiter} {example.answer}"
+                token_ids = tuple(fixture_tokenizer.encode(
+                    continuation, add_special_tokens=False
+                ))
+                token_rows_list.append((
+                    token_ids, tuple(continuation), (0.0,) * len(token_ids)
+                ))
+            token_rows = tuple(token_rows_list)
         else:
             assert tokenizer is not None
             requests = build_generation_requests(
@@ -996,8 +1052,16 @@ def _run_selection(arguments: argparse.Namespace) -> int:
                 "gold_token_ids": list(token_ids), "gold_token_pieces": list(token_pieces),
                 "gold_token_logprobs": list(token_logprobs),
                 "gold_answer_logprob_contribution": sum(token_logprobs),
-                "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
-                "tokenizer_snapshot_hash": QWEN25_7B_TOKENIZER_REVISION,
+                "tokenizer_revision": (
+                    FAKE_TOKENIZER_REVISION
+                    if arguments.backend == "tiny-fixture"
+                    else QWEN25_7B_TOKENIZER_REVISION
+                ),
+                "tokenizer_snapshot_hash": (
+                    FAKE_TOKENIZER_REVISION
+                    if arguments.backend == "tiny-fixture"
+                    else QWEN25_7B_TOKENIZER_REVISION
+                ),
             })
         metrics.append({
             "path": str(checkpoint), "checkpoint_hash": checkpoint_hash, "step": step,
@@ -1008,6 +1072,7 @@ def _run_selection(arguments: argparse.Namespace) -> int:
     manifest: dict[str, object] = {
         "schema_version": 1, "kind": "phase_marker_checkpoint_selection",
         "evidence_scope": "plumbing_only" if arguments.backend == "tiny-fixture" else "experiment",
+        "origin_verification": "execution_receipt_or_rerun_required",
         "backend": arguments.backend, "model_id": config.model_id,
         "model_revision": QWEN25_7B_TOKENIZER_REVISION,
         "config_hash": config_hash, "run_kind": arguments.kind,
@@ -1231,10 +1296,15 @@ def _load_checkpoint_selections(
     seeds: tuple[int, ...],
     *,
     allow_test: bool,
+    tokenizer: EvidenceTokenizer | None = None,
 ) -> dict[tuple[int, str], dict[str, object]]:
     expected = {(seed, arm) for seed in seeds for arm in config.arms}
     result: dict[tuple[int, str], dict[str, object]] = {}
     config_hash = sha256_json(asdict(config))
+    evidence_tokenizer = tokenizer
+    expected_tokenizer_revision = (
+        FAKE_TOKENIZER_REVISION if allow_test else QWEN25_7B_TOKENIZER_REVISION
+    )
     for path in paths:
         payload = dict(_load_json_object(path, "checkpoint selection manifest"))
         if set(payload) != _CHECKPOINT_SELECTION_FIELDS:
@@ -1250,6 +1320,8 @@ def _load_checkpoint_selections(
             or payload["model_revision"] != QWEN25_7B_TOKENIZER_REVISION
         ):
             raise ValueError(f"checkpoint selection provenance mismatch: {path}")
+        if payload["origin_verification"] != "execution_receipt_or_rerun_required":
+            raise ValueError(f"checkpoint selection origin verification mismatch: {path}")
         expected_scope = "plumbing_only" if allow_test else "experiment"
         expected_backend = "tiny-fixture" if allow_test else "vllm"
         if payload["evidence_scope"] != expected_scope or payload["backend"] != expected_backend:
@@ -1331,8 +1403,8 @@ def _load_checkpoint_selections(
                 if (
                     row.get("dataset") != example.source
                     or row.get("gold_answer") != example.answer
-                    or row.get("tokenizer_revision") != QWEN25_7B_TOKENIZER_REVISION
-                    or row.get("tokenizer_snapshot_hash") != QWEN25_7B_TOKENIZER_REVISION
+                    or row.get("tokenizer_revision") != expected_tokenizer_revision
+                    or row.get("tokenizer_snapshot_hash") != expected_tokenizer_revision
                     or row.get("scorer_inputs") != {"source": example.source, "gold_answer": example.answer}
                     or not isinstance(row.get("raw_greedy_completion"), str)
                 ):
@@ -1354,6 +1426,7 @@ def _load_checkpoint_selections(
                 token_ids = row.get("gold_token_ids")
                 pieces = row.get("gold_token_pieces")
                 logprobs = row.get("gold_token_logprobs")
+                continuation = row.get("gold_continuation")
                 if (
                     not isinstance(token_ids, list) or not token_ids
                     or any(not isinstance(value, int) or isinstance(value, bool) for value in token_ids)
@@ -1362,11 +1435,41 @@ def _load_checkpoint_selections(
                     or len(token_ids) != len(pieces) or len(token_ids) != len(logprobs)
                     or any(not isinstance(value, (int, float)) or isinstance(value, bool)
                            or not math.isfinite(value) or value > 0 for value in logprobs)
-                    or "".join(pieces) != row.get("gold_continuation")
-                    or row.get("gold_continuation") != f"\n{config.final_delimiter} {example.answer}"
+                    or "".join(pieces) != continuation
+                    or continuation != f"\n{config.final_delimiter} {example.answer}"
                     or row.get("gold_answer_logprob_contribution") != sum(logprobs)
                 ):
                     raise ValueError(f"checkpoint selection token evidence mismatch: {path}")
+                assert isinstance(continuation, str)
+                if evidence_tokenizer is None:
+                    evidence_tokenizer = (
+                        _CodepointEvidenceTokenizer()
+                        if allow_test else _load_pinned_evidence_tokenizer(config.model_id)
+                    )
+                try:
+                    replayed_ids = tuple(evidence_tokenizer.encode(
+                        continuation, add_special_tokens=False
+                    ))
+                    replayed_pieces: list[str] = []
+                    previous = ""
+                    for width in range(1, len(replayed_ids) + 1):
+                        decoded = evidence_tokenizer.decode(
+                            replayed_ids[:width],
+                            skip_special_tokens=False,
+                            clean_up_tokenization_spaces=False,
+                        )
+                        replayed_pieces.append(decoded[len(previous):])
+                        previous = decoded
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"checkpoint selection tokenizer replay mismatch: {path}"
+                    ) from error
+                if (
+                    replayed_ids != tuple(token_ids)
+                    or tuple(replayed_pieces) != tuple(pieces)
+                    or previous != continuation
+                ):
+                    raise ValueError(f"checkpoint selection tokenizer replay mismatch: {path}")
                 strict.append(replayed.correct)
                 contributions.append(float(sum(logprobs)))
             if (

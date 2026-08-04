@@ -32,6 +32,20 @@ from phase_marker.splits import question_hash
 CONFIG_PATH = Path("configs/phase-marker-qwen25-7b.toml")
 
 
+class _DeterministicTokenizer:
+    def encode(self, text: str, *, add_special_tokens: bool) -> tuple[int, ...]:
+        assert add_special_tokens is False
+        return tuple(ord(character) for character in text)
+
+    def decode(
+        self, token_ids: tuple[int, ...], *, skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> str:
+        assert skip_special_tokens is False
+        assert clean_up_tokenization_spaces is False
+        return "".join(chr(token_id) for token_id in token_ids)
+
+
 @pytest.fixture
 def config() -> ExperimentConfig:
     return ExperimentConfig.load(CONFIG_PATH)
@@ -279,9 +293,13 @@ def _write_checkpoint_selections(root: Path, config: ExperimentConfig) -> None:
                     "Final answer: definitely_not_the_gold_answer", arm, seed, str(checkpoint_path),
                 ))),
                 "gold_continuation": f"\n{config.final_delimiter} {row['answer']}",
-                "gold_token_ids": [0],
-                "gold_token_pieces": [f"\n{config.final_delimiter} {row['answer']}"],
-                "gold_token_logprobs": [-1.0],
+                "gold_token_ids": [
+                    ord(value) for value in f"\n{config.final_delimiter} {row['answer']}"
+                ],
+                "gold_token_pieces": list(f"\n{config.final_delimiter} {row['answer']}"),
+                "gold_token_logprobs": [-1.0] + [0.0] * (
+                    len(f"\n{config.final_delimiter} {row['answer']}") - 1
+                ),
                 "gold_answer_logprob_contribution": -1.0,
                 "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
                 "tokenizer_snapshot_hash": QWEN25_7B_TOKENIZER_REVISION,
@@ -289,6 +307,7 @@ def _write_checkpoint_selections(root: Path, config: ExperimentConfig) -> None:
             payload = {
                 "schema_version": 1, "kind": "phase_marker_checkpoint_selection",
                 "evidence_scope": "experiment", "backend": "vllm",
+                "origin_verification": "execution_receipt_or_rerun_required",
                 "model_id": config.model_id, "model_revision": QWEN25_7B_TOKENIZER_REVISION,
                 "config_hash": sha256_json(asdict(config)), "run_kind": "confirmatory",
                 "arm": arm, "seed": seed, "selected_on": "validation",
@@ -547,11 +566,15 @@ def test_each_successful_stage_constructs_only_its_requested_commands(
         manual_audit_rows=300, statistics_jobs=1, mechanism_jobs_excluded=True,
     )
     mechanism_approval = MechanismApprovalMetadata(
-        schema_version=1, hardware="1x H100", capture_jobs=1, intervention_jobs=1,
-        capture_gpu_hours=1, intervention_gpu_hours=1, max_duration_hours=3,
+        schema_version=1, stage=stage if stage in {"capture", "intervene"} else "capture",
+        hardware="1x H100", job_count=1, gpu_hours=1, max_duration_hours=3,
         estimated_spend_usd=8, spend_cap_usd=10,
-        selection_parent_hash=artifact, activation_parent_hash=artifact,
-        command_count=2, expected_output_count=4,
+        parent_hash=sha256_json((sha256_json(asdict(config)), artifact)), command_count=1,
+        expected_outputs=pipeline_module._mechanism_expected_outputs(stage, tmp_path)
+        if stage in {"capture", "intervene"} else (
+            str(tmp_path / "activations" / "manifest.json"),
+            str(tmp_path / "activations" / "selected-states.pt"),
+        ),
     )
 
     result = pipeline_module._run_gate(
@@ -585,6 +608,108 @@ def test_general_approval_cannot_authorize_mechanism_command(
 
     assert result.passed is False
     assert "separate mechanism approval" in result.reason
+    assert result.next_commands == ()
+
+
+@pytest.mark.parametrize(("requested_stage", "approved_stage"), (
+    ("capture", "intervene"), ("intervene", "capture"),
+))
+def test_mechanism_approval_cannot_cross_authorize_stages(
+    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch,
+    requested_stage: str, approved_stage: str,
+) -> None:
+    artifact = "a" * 64
+    monkeypatch.setattr(pipeline_module, "_validate_behavior_manifest", lambda *_, **__: artifact)
+    monkeypatch.setattr(pipeline_module, "_validate_synthetic_manifest", lambda *_: artifact)
+    monkeypatch.setattr(pipeline_module, "_validate_capture_inputs", lambda *_: (artifact,))
+    monkeypatch.setattr(pipeline_module, "_validate_activation_manifest", lambda *_: artifact)
+    monkeypatch.setattr(pipeline_module, "_validate_intervention_inputs", lambda *_: (artifact,))
+    approval = MechanismApprovalMetadata(
+        schema_version=1, stage=approved_stage, hardware="1x H100", job_count=1,
+        command_count=1, expected_outputs=pipeline_module._mechanism_expected_outputs(
+            approved_stage, tmp_path
+        ), parent_hash=sha256_json((sha256_json(asdict(config)), artifact)), gpu_hours=1,
+        max_duration_hours=2, estimated_spend_usd=4, spend_cap_usd=5,
+    )
+
+    result = pipeline_module._run_gate(
+        requested_stage, config, tmp_path, kind="pilot", seeds=(42,),
+        config_path=CONFIG_PATH, approval=None, mechanism_approval=approval,
+    )
+
+    assert result.passed is False
+    assert "stage mismatch" in result.reason
+    assert result.next_commands == ()
+
+
+@pytest.mark.parametrize("mismatch", ("parent", "outputs"))
+def test_mechanism_approval_binds_exact_parent_digest_and_outputs(
+    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    artifact = "a" * 64
+    monkeypatch.setattr(pipeline_module, "_validate_behavior_manifest", lambda *_, **__: artifact)
+    monkeypatch.setattr(pipeline_module, "_validate_synthetic_manifest", lambda *_: artifact)
+    monkeypatch.setattr(pipeline_module, "_validate_capture_inputs", lambda *_: (artifact,))
+    outputs = pipeline_module._mechanism_expected_outputs("capture", tmp_path)
+    approval = MechanismApprovalMetadata(
+        schema_version=1, stage="capture", hardware="1x H100", job_count=1,
+        command_count=1,
+        expected_outputs=(outputs[0], str(tmp_path / "wrong.pt")) if mismatch == "outputs" else outputs,
+        parent_hash=("b" * 64 if mismatch == "parent" else
+                     sha256_json((sha256_json(asdict(config)), artifact))),
+        gpu_hours=1, max_duration_hours=2, estimated_spend_usd=4, spend_cap_usd=5,
+    )
+
+    result = pipeline_module._run_gate(
+        "capture", config, tmp_path, kind="pilot", seeds=(42,),
+        config_path=CONFIG_PATH, approval=None, mechanism_approval=approval,
+    )
+
+    assert result.passed is False
+    assert mismatch in result.reason
+    assert result.next_commands == ()
+
+
+def test_mechanism_cli_parses_one_exact_stage_approval(tmp_path: Path) -> None:
+    outputs = pipeline_module._mechanism_expected_outputs("capture", tmp_path)
+    arguments = pipeline_module._parser().parse_args([
+        "gate", "--stage", "capture", "--kind", "pilot", "--seeds", "42",
+        "--config", str(CONFIG_PATH), "--artifact-root", str(tmp_path),
+        "--mechanism-schema-version", "1", "--mechanism-stage", "capture",
+        "--mechanism-hardware", "1x H100", "--mechanism-job-count", "1",
+        "--mechanism-command-count", "1", "--mechanism-expected-outputs", *outputs,
+        "--mechanism-parent-hash", "a" * 64, "--mechanism-gpu-hours", "1",
+        "--mechanism-max-duration-hours", "2",
+        "--mechanism-estimated-spend-usd", "4", "--mechanism-spend-cap-usd", "5",
+    ])
+
+    approval = pipeline_module._mechanism_approval_from_arguments(arguments)
+
+    assert approval is not None
+    assert approval.stage == "capture"
+    assert approval.expected_outputs == outputs
+    assert approval.job_count == approval.command_count == 1
+
+
+def test_intervention_approval_emits_nothing_before_activation_exists(
+    tmp_path: Path, config: ExperimentConfig,
+) -> None:
+    approval = MechanismApprovalMetadata(
+        schema_version=1, stage="intervene", hardware="1x H100", job_count=1,
+        command_count=1,
+        expected_outputs=pipeline_module._mechanism_expected_outputs("intervene", tmp_path),
+        parent_hash="a" * 64, gpu_hours=1, max_duration_hours=2,
+        estimated_spend_usd=4, spend_cap_usd=5,
+    )
+
+    result = pipeline_module._run_gate(
+        "intervene", config, tmp_path, kind="pilot", seeds=(42,),
+        config_path=CONFIG_PATH, approval=None, mechanism_approval=approval,
+    )
+
+    assert result.passed is False
+    assert "activation manifest" in result.reason
     assert result.next_commands == ()
 
 
@@ -835,8 +960,12 @@ def test_behavior_gate_requires_complete_validation_selection_matrix(
 
 
 def test_behavior_gate_rejects_omitted_declared_checkpoint_candidate(
-    tmp_path: Path, config: ExperimentConfig
+    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "phase_marker.behavior._load_pinned_evidence_tokenizer",
+        lambda *_: _DeterministicTokenizer(),
+    )
     _write_split(tmp_path, config)
     _write_materializations(tmp_path, config)
     _write_training_runs(tmp_path, config)

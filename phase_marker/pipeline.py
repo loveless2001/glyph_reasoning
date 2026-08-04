@@ -1,8 +1,10 @@
 """Read-only stage gates and approval-bound phase-marker command manifests.
 
-This module never launches a subprocess, loads a tokenizer/model, creates an
-artifact directory, or writes a command manifest.  It validates immutable
-artifacts and prints/returns commands as data for an operator to review.
+This module never launches a subprocess, loads model weights, creates an
+artifact directory, or writes a command manifest.  Selection-evidence gates may
+load only the pinned tokenizer snapshot with ``local_files_only=True`` to replay
+token IDs and incremental decoding.  It validates immutable artifacts and
+prints/returns commands as data for an operator to review.
 """
 
 from __future__ import annotations
@@ -147,37 +149,35 @@ class ApprovalMetadata:
 @dataclass(frozen=True)
 class MechanismApprovalMetadata:
     schema_version: int
+    stage: str
     hardware: str
-    capture_jobs: int
-    intervention_jobs: int
-    capture_gpu_hours: float
-    intervention_gpu_hours: float
+    job_count: int
+    command_count: int
+    expected_outputs: tuple[str, ...]
+    parent_hash: str
+    gpu_hours: float
     max_duration_hours: float
     estimated_spend_usd: float
     spend_cap_usd: float
-    selection_parent_hash: str
-    activation_parent_hash: str
-    command_count: int
-    expected_output_count: int
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or not self.hardware.strip():
+        object.__setattr__(self, "expected_outputs", tuple(self.expected_outputs))
+        if self.schema_version != 1 or self.stage not in {"capture", "intervene"}:
+            raise ValueError("mechanism approval schema/stage mismatch")
+        if not self.hardware.strip():
             raise ValueError("mechanism approval schema/hardware mismatch")
-        if (self.capture_jobs, self.intervention_jobs, self.command_count,
-                self.expected_output_count) != (1, 1, 2, 4):
+        if (self.job_count, self.command_count, len(self.expected_outputs)) != (1, 1, 2):
             raise ValueError("mechanism approval job/command/output counts mismatch")
-        hours = self.capture_gpu_hours + self.intervention_gpu_hours
         if any(not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0
-               for value in (self.capture_gpu_hours, self.intervention_gpu_hours,
-                              self.max_duration_hours, self.estimated_spend_usd,
+               for value in (self.gpu_hours, self.max_duration_hours, self.estimated_spend_usd,
                               self.spend_cap_usd)):
             raise ValueError("mechanism approval estimates must be positive")
-        if hours > self.max_duration_hours or self.estimated_spend_usd > self.spend_cap_usd:
+        if self.gpu_hours > self.max_duration_hours or self.estimated_spend_usd > self.spend_cap_usd:
             raise ValueError("mechanism approval exceeds duration or spend cap")
-        if not all(_is_sha256(value) for value in (
-            self.selection_parent_hash, self.activation_parent_hash
-        )):
-            raise ValueError("mechanism approval parent hashes must be sha256")
+        if not _is_sha256(self.parent_hash):
+            raise ValueError("mechanism approval parent hash must be sha256")
+        if any(not isinstance(path, str) or not path for path in self.expected_outputs):
+            raise ValueError("mechanism approval expected outputs must be exact paths")
 
 
 class GateFailure(ValueError):
@@ -433,12 +433,13 @@ def _run_gate(
             return GateResult(stage, False, str(error), tuple(dict.fromkeys(checked)), ())
     if stage in {"capture", "intervene"}:
         assert mechanism_approval is not None
-        required_parent = (
-            mechanism_approval.selection_parent_hash
-            if stage == "capture" else mechanism_approval.activation_parent_hash
-        )
-        if required_parent not in checked:
-            return GateResult(stage, False, "mechanism approval parent hash mismatch", tuple(dict.fromkeys(checked)), ())
+        checked_unique = tuple(dict.fromkeys(checked))
+        if mechanism_approval.stage != stage:
+            return GateResult(stage, False, "mechanism approval stage mismatch", checked_unique, ())
+        if mechanism_approval.parent_hash != sha256_json(checked_unique):
+            return GateResult(stage, False, "mechanism approval parent hash mismatch", checked_unique, ())
+        if mechanism_approval.expected_outputs != _mechanism_expected_outputs(stage, artifact_root):
+            return GateResult(stage, False, "mechanism approval outputs mismatch", checked_unique, ())
     commands = _commands_for_stage(
         stage,
         config,
@@ -1429,6 +1430,17 @@ def _commands_for_stage(
     raise GateFailure(f"unknown stage {stage!r}")
 
 
+def _mechanism_expected_outputs(stage: str, artifact_root: Path) -> tuple[str, str]:
+    """Return the exact two-file output contract for one approved mechanism stage."""
+    if stage == "capture":
+        root = artifact_root / "activations"
+        return (str(root / "manifest.json"), str(root / "selected-states.pt"))
+    if stage == "intervene":
+        root = artifact_root / "interventions"
+        return (str(root / "manifest.json"), str(root / "records.jsonl"))
+    raise ValueError(f"mechanism outputs are undefined for stage {stage!r}")
+
+
 def _read_required_object(path: Path, label: str) -> Mapping[str, Any]:
     if not path.is_file():
         raise GateFailure(f"missing {label}: {path}")
@@ -1632,17 +1644,15 @@ def _add_approval_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mechanism-jobs-excluded", action="store_true", default=None)
     parser.add_argument("--mechanism-schema-version", type=int)
     parser.add_argument("--mechanism-hardware")
-    parser.add_argument("--capture-jobs", type=int)
-    parser.add_argument("--intervention-jobs", type=int)
-    parser.add_argument("--capture-gpu-hours", type=float)
-    parser.add_argument("--intervention-gpu-hours", type=float)
+    parser.add_argument("--mechanism-stage", choices=("capture", "intervene"))
+    parser.add_argument("--mechanism-job-count", type=int)
+    parser.add_argument("--mechanism-gpu-hours", type=float)
     parser.add_argument("--mechanism-max-duration-hours", type=float)
     parser.add_argument("--mechanism-estimated-spend-usd", type=float)
     parser.add_argument("--mechanism-spend-cap-usd", type=float)
-    parser.add_argument("--mechanism-selection-parent-hash")
-    parser.add_argument("--mechanism-activation-parent-hash")
+    parser.add_argument("--mechanism-parent-hash")
     parser.add_argument("--mechanism-command-count", type=int)
-    parser.add_argument("--mechanism-expected-output-count", type=int)
+    parser.add_argument("--mechanism-expected-outputs", nargs=2)
 
 
 def _approval_from_arguments(arguments: argparse.Namespace) -> ApprovalMetadata | None:
@@ -1676,12 +1686,11 @@ def _mechanism_approval_from_arguments(
     arguments: argparse.Namespace,
 ) -> MechanismApprovalMetadata | None:
     names = (
-        "mechanism_schema_version", "mechanism_hardware", "capture_jobs",
-        "intervention_jobs", "capture_gpu_hours", "intervention_gpu_hours",
+        "mechanism_schema_version", "mechanism_stage", "mechanism_hardware",
+        "mechanism_job_count", "mechanism_gpu_hours",
         "mechanism_max_duration_hours", "mechanism_estimated_spend_usd",
-        "mechanism_spend_cap_usd", "mechanism_selection_parent_hash",
-        "mechanism_activation_parent_hash", "mechanism_command_count",
-        "mechanism_expected_output_count",
+        "mechanism_spend_cap_usd", "mechanism_parent_hash",
+        "mechanism_command_count", "mechanism_expected_outputs",
     )
     values = tuple(getattr(arguments, name, None) for name in names)
     if all(value is None for value in values):
@@ -1690,17 +1699,16 @@ def _mechanism_approval_from_arguments(
         return None
     return MechanismApprovalMetadata(
         schema_version=arguments.mechanism_schema_version,
+        stage=arguments.mechanism_stage,
         hardware=arguments.mechanism_hardware,
-        capture_jobs=arguments.capture_jobs, intervention_jobs=arguments.intervention_jobs,
-        capture_gpu_hours=arguments.capture_gpu_hours,
-        intervention_gpu_hours=arguments.intervention_gpu_hours,
+        job_count=arguments.mechanism_job_count,
+        command_count=arguments.mechanism_command_count,
+        expected_outputs=tuple(arguments.mechanism_expected_outputs),
+        parent_hash=arguments.mechanism_parent_hash,
+        gpu_hours=arguments.mechanism_gpu_hours,
         max_duration_hours=arguments.mechanism_max_duration_hours,
         estimated_spend_usd=arguments.mechanism_estimated_spend_usd,
         spend_cap_usd=arguments.mechanism_spend_cap_usd,
-        selection_parent_hash=arguments.mechanism_selection_parent_hash,
-        activation_parent_hash=arguments.mechanism_activation_parent_hash,
-        command_count=arguments.mechanism_command_count,
-        expected_output_count=arguments.mechanism_expected_output_count,
     )
 
 
