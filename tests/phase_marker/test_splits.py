@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 import json
 import sys
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from phase_marker.config import ExperimentConfig
+from phase_marker.io import sha256_json
 from phase_marker.schema import CanonicalTrace, PhaseSpan
 from phase_marker.splits import (
     DatasetCacheMiss,
@@ -21,6 +23,7 @@ from phase_marker.splits import (
     parse_trace_pool,
     question_hash,
     write_split_bundle,
+    _dataset_specs,
     _validation_rows,
 )
 
@@ -209,6 +212,61 @@ def test_validation_selection_relabels_copies_without_mutating_train_candidates(
         )
         for row in candidates
     ) == original_records
+
+
+def test_write_bundle_serializes_and_hashes_relabelled_validation_rows(tmp_path):
+    candidates = tuple(
+        example("gsm8k", f"artifact candidate {index}", str(index))
+        for index in range(300)
+    )
+    selected = _validation_rows(candidates, set(), "gsm8k")
+    bundle = SplitBundle(validation=(selected[0],))
+    output_root = tmp_path / "splits"
+    frozen_specs = _dataset_specs(
+        gsm8k_revision="a" * 40,
+        svamp_revision="a" * 40,
+        math_revision="a" * 40,
+    )
+    lineage = {
+        "traces": {"sha256": "a" * 64, "path": "data/sft_final.jsonl"},
+        "unified": {"sha256": "b" * 64, "path": "data/unified_dataset.jsonl"},
+    }
+    accounting = {"input_rows": 0, "parsed": 0, "parse_exclusions": 0}
+
+    write_split_bundle(
+        output_root,
+        TEST_CONFIG,
+        bundle,
+        dataset_specs=frozen_specs,
+        input_lineage=lineage,
+        source_pool_accounting=accounting,
+        parse_exclusion_provenance=(),
+    )
+
+    validation_rows = [
+        json.loads(line)
+        for line in (output_root / "validation.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
+    artifact_payload = {
+        "config": asdict(TEST_CONFIG),
+        "train": [],
+        "validation": validation_rows,
+        "test": [],
+        "exclusions": [],
+        "datasets": list(frozen_specs),
+        "input_lineage": lineage,
+        "source_pool_accounting": accounting,
+        "parse_exclusion_provenance": [],
+    }
+    train_labeled_payload = {
+        **artifact_payload,
+        "validation": [{**row, "split": "train"} for row in validation_rows],
+    }
+
+    assert [row["split"] for row in validation_rows] == ["validation"]
+    assert manifest["artifact_id"] == sha256_json(artifact_payload)
+    assert manifest["artifact_id"] != sha256_json(train_labeled_payload)
 
 
 def test_build_records_unmatched_and_ambiguous_source_recovery(fake_loader):
