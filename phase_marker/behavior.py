@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import tempfile
 from typing import Any, Protocol
@@ -128,13 +129,45 @@ class _CodepointEvidenceTokenizer:
             raise ValueError("plumbing token ID is not a Unicode code point") from error
 
 
-def _load_pinned_evidence_tokenizer(model_id: str) -> EvidenceTokenizer:
-    """Load only the pinned local tokenizer snapshot; never fetch or load weights."""
+def _pinned_tokenizer_snapshot_path(model_id: str) -> Path:
+    """Resolve the exact pinned Hub cache snapshot without contacting the Hub."""
+    if model_id != REQUIRED_MODEL_ID:
+        raise ValueError("tokenizer evidence requires the frozen base model")
+    cache = os.environ.get("HF_HUB_CACHE")
+    if cache is None:
+        cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if cache is None:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        cache = HF_HUB_CACHE
+    return (
+        Path(cache).expanduser()
+        / "models--Qwen--Qwen2.5-7B-Instruct"
+        / "snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+
+
+def _load_pinned_local_tokenizer(model_id: str) -> EvidenceTokenizer:
+    """Load the validated pinned filesystem snapshot with no repo-ID fallback."""
+    snapshot = _pinned_tokenizer_snapshot_path(model_id)
+    if not snapshot.is_dir():
+        raise FileNotFoundError(f"missing pinned tokenizer snapshot directory: {snapshot}")
+    tokenizer_config = snapshot / "tokenizer_config.json"
+    standalone_assets = tuple(
+        snapshot / name for name in ("tokenizer.json", "tokenizer.model", "spiece.model")
+    )
+    split_assets = (snapshot / "vocab.json", snapshot / "merges.txt")
+    if (
+        not tokenizer_config.is_file()
+        or not (any(path.is_file() for path in standalone_assets)
+                or all(path.is_file() for path in split_assets))
+    ):
+        raise FileNotFoundError(f"pinned tokenizer snapshot lacks config/assets: {snapshot}")
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
-        model_id,
-        revision=QWEN25_7B_TOKENIZER_REVISION,
+        str(snapshot),
         local_files_only=True,
     )
 
@@ -1472,7 +1505,7 @@ def _load_checkpoint_selections(
     if evidence_tokenizer is None:
         evidence_tokenizer = (
             _CodepointEvidenceTokenizer()
-            if allow_test else _load_pinned_evidence_tokenizer(config.model_id)
+            if allow_test else _load_pinned_local_tokenizer(config.model_id)
         )
     for path, continuation, token_ids, pieces in token_replays:
         try:

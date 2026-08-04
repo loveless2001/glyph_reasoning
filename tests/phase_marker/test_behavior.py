@@ -9,6 +9,8 @@ import pytest
 
 from phase_marker.behavior import (
     FAKE_TOKENIZER_REVISION,
+    _load_pinned_local_tokenizer,
+    _pinned_tokenizer_snapshot_path,
     _vllm_sampling_parameters,
     _validate_production_request,
     build_provenance_envelope,
@@ -46,6 +48,67 @@ class _DeterministicTokenizer:
         assert skip_special_tokens is False
         assert clean_up_tokenization_spaces is False
         return "".join(chr(token_id) for token_id in token_ids)
+
+
+def test_pinned_tokenizer_loader_uses_exact_filesystem_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = (
+        tmp_path / "models--Qwen--Qwen2.5-7B-Instruct" / "snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer_config.json").write_text("{}\n", encoding="utf-8")
+    (snapshot / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+    calls: list[tuple[object, dict[str, object]]] = []
+    sentinel = object()
+    transformers = ModuleType("transformers")
+    transformers.AutoTokenizer = SimpleNamespace(  # type: ignore[attr-defined]
+        from_pretrained=lambda source, **kwargs: (
+            calls.append((source, kwargs)), sentinel
+        )[1]
+    )
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(tmp_path / "ignored"))
+
+    loaded = _load_pinned_local_tokenizer("Qwen/Qwen2.5-7B-Instruct")
+
+    assert loaded is sentinel
+    assert calls == [(str(snapshot), {"local_files_only": True})]
+
+
+def test_pinned_tokenizer_loader_fails_before_transformers_when_snapshot_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transformers = ModuleType("transformers")
+    transformers.AutoTokenizer = SimpleNamespace(  # type: ignore[attr-defined]
+        from_pretrained=lambda *_args, **_kwargs: pytest.fail("transformers loader was called")
+    )
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+
+    with pytest.raises(FileNotFoundError, match="pinned tokenizer snapshot"):
+        _load_pinned_local_tokenizer("Qwen/Qwen2.5-7B-Instruct")
+
+
+def test_pinned_tokenizer_real_offline_probe_if_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _pinned_tokenizer_snapshot_path("Qwen/Qwen2.5-7B-Instruct")
+    if not snapshot.is_dir():
+        pytest.skip("pinned Qwen tokenizer snapshot is not cached")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+
+    tokenizer = _load_pinned_local_tokenizer("Qwen/Qwen2.5-7B-Instruct")
+    continuation = "\nFinal answer: 2"
+    token_ids = tokenizer.encode(continuation, add_special_tokens=False)
+
+    assert token_ids
+    assert tokenizer.decode(
+        token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+    ) == continuation
 
 
 @pytest.fixture

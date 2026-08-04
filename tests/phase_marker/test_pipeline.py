@@ -983,7 +983,7 @@ def test_behavior_gate_requires_complete_validation_selection_matrix(
     tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "phase_marker.behavior._load_pinned_evidence_tokenizer",
+        "phase_marker.behavior._load_pinned_local_tokenizer",
         lambda *_: pytest.fail("tokenizer loader was called for incomplete matrix"),
     )
     _write_split(tmp_path, config)
@@ -1005,7 +1005,7 @@ def test_behavior_gate_rejects_structural_selection_bundle_before_tokenizer_load
     malformation: str,
 ) -> None:
     monkeypatch.setattr(
-        "phase_marker.behavior._load_pinned_evidence_tokenizer",
+        "phase_marker.behavior._load_pinned_local_tokenizer",
         lambda *_: pytest.fail("tokenizer loader was called for structural failure"),
     )
     _write_split(tmp_path, config)
@@ -1036,7 +1036,7 @@ def test_behavior_gate_rejects_omitted_declared_checkpoint_candidate(
     tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "phase_marker.behavior._load_pinned_evidence_tokenizer",
+        "phase_marker.behavior._load_pinned_local_tokenizer",
         lambda *_: _DeterministicTokenizer(),
     )
     _write_split(tmp_path, config)
