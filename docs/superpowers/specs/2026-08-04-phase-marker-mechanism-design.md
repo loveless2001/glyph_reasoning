@@ -64,12 +64,14 @@ causal interventions.
 
 ### Splits
 
-- Retain the existing 3,850 filtered training traces as the source training
-  examples.
+- Use the existing 3,850 filtered traces as the source pool. Exclude every
+  SVAMP trace from revised training because the available SVAMP benchmark has
+  one 1,000-example split and 525 of its questions occur in the current SFT
+  data. Retain matched GSM8K-train and MATH-train traces.
 - Create a validation split used exclusively for checkpoint selection and
   implementation checks.
-- Use frozen official test splits from GSM8K, SVAMP, and MATH for confirmatory
-  evaluation.
+- Use the frozen official GSM8K and MATH test splits plus the full 1,000-example
+  SVAMP benchmark, which is held out wholesale, for confirmatory evaluation.
 - Normalize questions and require zero question-hash overlap across training,
   validation, and test data.
 - Freeze test manifests before training. Test outcomes may not influence prompt,
@@ -83,11 +85,15 @@ Parse every retained teacher trace into a canonical representation containing:
 - question and final answer;
 - ordered phase spans;
 - phase-boundary locations; and
+- a final-answer span; and
 - exact semantic content within each phase.
 
 All marker-only training arms must be deterministic renderings of this canonical
 representation. After removing or substituting marker spans, semantic content
-must be byte-identical across arms.
+must be byte-identical across arms. Existing traces contain four reasoning-phase
+glyphs plus `🝞` before the final answer. Treat `🝞` as an answer delimiter, not
+as a fifth phase marker, and render the same literal `Final answer:` delimiter in
+every arm.
 
 ## Training Matrix
 
