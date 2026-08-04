@@ -265,6 +265,41 @@ def test_cli_requires_the_bundled_config_and_canonical_artifact_root(
         ])
 
 
+def test_cli_rejects_nested_byte_identical_pseudo_root(
+    repo_fixture: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    lock = repo_fixture / "requirements-modal-phase-marker.txt"
+    lock.write_text("example==1\n", encoding="utf-8")
+    nested_root = repo_fixture / "copy"
+    nested_config = nested_root / CONFIG_PATH
+    nested_config.parent.mkdir(parents=True)
+    shutil.copyfile(repo_fixture / CONFIG_PATH, nested_config)
+    shutil.copytree(
+        repo_fixture / "artifacts/phase-marker",
+        nested_root / "artifacts/phase-marker",
+    )
+    common = ["--repo-root", str(repo_fixture), "--dependency-lock", lock.name]
+
+    with pytest.raises(ValueError, match="--repo-root approved configuration"):
+        modal_plan.main([
+            "plan", *common, "--config", "copy/configs/phase-marker-qwen25-7b.toml",
+            "--artifact-root", "copy/artifacts/phase-marker",
+        ])
+
+    config_alias = repo_fixture / "configs/canonical-cli-link.toml"
+    config_alias.symlink_to(repo_fixture / CONFIG_PATH)
+    artifact_alias = repo_fixture / "artifacts/canonical-cli-link"
+    artifact_alias.symlink_to(
+        repo_fixture / "artifacts/phase-marker", target_is_directory=True
+    )
+    modal_plan.main([
+        "run-id", *common,
+        "--config", "configs/../configs/canonical-cli-link.toml",
+        "--artifact-root", "artifacts/../artifacts/canonical-cli-link",
+    ])
+    assert capsys.readouterr().out.startswith("pilot-s42-cfg-")
+
+
 def test_cli_prints_plan_or_only_run_id_without_side_effects(
     repo_fixture: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:

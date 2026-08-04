@@ -389,6 +389,18 @@ def _resolve_beneath_repo(repo_root: Path, value: str) -> Path:
     return resolved
 
 
+def _require_cli_pilot_paths(
+    repo_root: Path, config_path: Path, artifact_root: Path
+) -> tuple[Path, Path]:
+    approved_config = (repo_root / "configs/phase-marker-qwen25-7b.toml").resolve()
+    if config_path != approved_config:
+        raise ValueError("config path must be the --repo-root approved configuration")
+    approved_artifact_root = (repo_root / "artifacts/phase-marker").resolve()
+    if artifact_root != approved_artifact_root:
+        raise ValueError("artifact root must be the --repo-root approved artifact root")
+    return approved_config, approved_artifact_root
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Print an immutable pilot plan or its canonical run ID, entirely offline."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -403,6 +415,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     repo_root = Path(arguments.repo_root).resolve()
     config_path = _resolve_beneath_repo(repo_root, arguments.config)
     artifact_root = _resolve_beneath_repo(repo_root, arguments.artifact_root)
+    config_path, artifact_root = _require_cli_pilot_paths(
+        repo_root, config_path, artifact_root
+    )
     dependency_lock = _resolve_beneath_repo(repo_root, arguments.dependency_lock)
     plan = build_pilot_plan(
         config_path,
