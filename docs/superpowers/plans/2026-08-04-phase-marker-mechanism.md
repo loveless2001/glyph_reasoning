@@ -809,7 +809,7 @@ Expected: FAIL because synthetic generation is missing.
 
 - [ ] **Step 3: Implement four task families and aligned workspace regions**
 
-Generate modular chains, affine chains, two-source numeric composition, and exact string transformation/composition. Each has four explicit intermediate values. For total workspace lengths 4, 16, and 64, create four equal regions. The first token in each region follows the condition (`glyph`, `dot`, `repeated_glyph`, `permuted_glyph`, `random_symbol`); remaining positions use the shared tokenizer-matched neutral filler. `no_slot` has no regions.
+Generate modular chains, affine chains, two-source numeric composition, and exact string transformation/composition. Each has four explicit intermediate values. For actual tokenizer workspace lengths 12, 16, and 64, create four equal regions of widths 3, 4, and 16. Each measured marker sequence begins its region (`glyph`, `dot`, `repeated_glyph`, `permuted_glyph`, `random_symbol`); reject a marker that exceeds the measured region width. Remaining token positions use the shared tokenizer-matched neutral filler. `no_slot` has no regions. Token IDs and region offsets always describe the complete rendered tokenizer output, never logical slots.
 
 - [ ] **Step 4: Run tests and materialize a reproducible smoke suite**
 

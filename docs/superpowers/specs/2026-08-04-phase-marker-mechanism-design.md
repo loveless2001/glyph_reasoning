@@ -186,13 +186,16 @@ Construct aligned deterministic tasks with known intermediate values. Include:
 - deterministic string transformation and composition with exact-string
   scoring.
 
-Each task template has four intermediate states and four aligned slot regions.
-At total workspace lengths of 4, 16, and 64 tokens, divide the workspace evenly
-across the four regions. The first position in each region is respectively an
-ordered glyph, a dot delimiter, one repeated glyph, a permuted glyph, or a
-tokenizer-matched random symbol; remaining positions use a shared neutral
-filler token. The no-slot condition omits all four regions. This preserves the
-phase layout while varying total computational workspace.
+Each task template has four intermediate states and four aligned token regions.
+At actual rendered-token workspace lengths of 12, 16, and 64 tokens, divide
+the workspace evenly across the four regions (widths 3, 4, and 16). The first
+token sequence in each region is respectively an ordered glyph, a spaced-dot
+delimiter, one repeated glyph, a permuted glyph, or a tokenizer-matched random
+symbol; the sequence must fit within the measured region width. Remaining
+token positions use a shared neutral filler token. The no-slot condition omits
+all four regions. Token IDs and region offsets describe the complete rendered
+tokenizer output rather than logical slots. This preserves the phase layout
+while varying total computational workspace.
 
 Synthetic tasks must have separately generated training, validation, and test
 instances with no parameter tuple reused across splits. Their purpose is
