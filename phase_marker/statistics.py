@@ -644,6 +644,8 @@ def _remove_confirmatory_outputs(paths: Mapping[str, Path]) -> None:
 def _confirmatory_protocol_error(
     results: Sequence[ContrastResult],
 ) -> str | None:
+    if not results:
+        return "non-synthetic confirmatory outputs require a nonempty declared contrast set"
     for result in results:
         if result.interval.draws != CONFIRMATORY_BOOTSTRAP_DRAWS:
             return (

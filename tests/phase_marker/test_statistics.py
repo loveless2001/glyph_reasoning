@@ -395,6 +395,32 @@ def test_non_synthetic_outputs_require_three_confirmatory_adapter_seeds(tmp_path
     assert not (tmp_path / "contrast-table.md").exists()
 
 
+def test_non_synthetic_outputs_reject_empty_contrasts_and_remove_stale_artifacts(
+    tmp_path,
+):
+    stale_names = (
+        "contrast-table.md",
+        "contrast-table.tex",
+        "summary.json",
+        "model-diagnostics.json",
+    )
+    for name in stale_names:
+        (tmp_path / name).write_text("stale confirmatory output\n", encoding="utf-8")
+    auto = _audit_records()
+
+    with pytest.raises(ValueError, match="nonempty declared contrast set"):
+        write_confirmatory_outputs(
+            tmp_path,
+            (),
+            ModelSummary("formula", {}, True, {"optimizer_success": True}),
+            auto,
+            _manual_labels(auto),
+        )
+
+    assert (tmp_path / "audit-status.json").exists()
+    assert all(not (tmp_path / name).exists() for name in stale_names)
+
+
 def _score(
     source: str,
     question_hash: str,
