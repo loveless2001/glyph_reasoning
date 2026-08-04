@@ -400,8 +400,11 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
         "seed": "42",
     }
     assert [(volume.name, volume.create_if_missing) for volume in fake.volumes] == [
-        (name, True) for name in imported_adapter.VOLUME_NAMES
+        *((name, True) for name in imported_adapter.VOLUME_NAMES),
+        (imported_adapter.VOLUME_NAMES[2], False),
     ]
+    assert imported_adapter.inspection_runs_volume is fake.volumes[-1]
+    assert imported_adapter.inspection_runs_volume is not imported_adapter.runs_volume
 
     assert len(fake.images) == 1
     assert imported_adapter.cpu_image is imported_adapter.gpu_image
@@ -450,6 +453,9 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
         if call[0] == "function" and set(call[1]["volumes"]) == {"/mnt/runs"}
     )
     assert "gpu" not in status_options
+    assert status_options["volumes"]["/mnt/runs"].volume is (
+        imported_adapter.inspection_runs_volume
+    )
 
     cache_options = next(
         call[1] for call in fake.declaration_calls
@@ -500,6 +506,39 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
     assert "plan" not in [
         call[1] for call in fake.declaration_calls if call[0] == "local_entrypoint_decorated"
     ]
+
+
+def test_status_and_download_entrypoints_use_no_create_inspection_handle(
+    imported_adapter: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Would fail if read-only inspection reused a volume-creating handle."""
+    run_id = "pilot-s42-cfg-11111111-split-22222222-src-333333333333"
+    seen: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        imported_adapter,
+        "status_local",
+        lambda volume, *, run_id: seen.append(("status", volume))
+        or {"run_id": run_id, "valid": True},
+    )
+    monkeypatch.setattr(
+        imported_adapter,
+        "download_evidence_local",
+        lambda volume, *, run_id, destination: seen.append(("download", volume))
+        or (destination / "stage-a-summary.json",),
+    )
+
+    imported_adapter.status(run_id)
+    imported_adapter.download_evidence(run_id, str(tmp_path / "evidence"))
+
+    assert seen == [
+        ("status", imported_adapter.inspection_runs_volume),
+        ("download", imported_adapter.inspection_runs_volume),
+    ]
+    assert imported_adapter.fake_modal.rpc_calls == []
+    assert len(capsys.readouterr().out.splitlines()) == 2
 
 
 def test_stage_a_job_resources_and_mount_permissions_are_exact(
@@ -1544,21 +1583,90 @@ def _canonical_stage_a_files(
             canonical_json(manifest) + "\n"
         ).encode("utf-8")
     else:
-        manifest = canonical_json(
-            {
-                "schema_version": 1,
-                "kind": "phase_marker_checkpoint_selection",
-                "run_kind": "pilot",
-                "arm": job.arm,
-                "seed": 42,
-                "config_hash": plan.config_hash,
-                "model_revision": plan.model_revision,
-                "completed": True,
-            }
-        ).encode("utf-8") + b"\n"
+        training_files, _training_receipt = _canonical_stage_a_files(
+            plan, job, "train"
+        )
+        training_manifest = next(
+            content
+            for path, content in training_files.items()
+            if path.endswith("run-manifest.json")
+        )
+        evidence = b"{}\n"
+        materialization_id = dict(
+            zip(
+                (candidate.arm for candidate in plan.jobs),
+                plan.materialization_artifact_ids,
+                strict=True,
+            )
+        )[job.arm]
+        training_manifest_hash = hashlib.sha256(training_manifest).hexdigest()
+        checkpoint_hash = hashlib.sha256(
+            f"checkpoint:{job.arm}".encode("utf-8")
+        ).hexdigest()
+        selection_root = (
+            f"artifacts/phase-marker/checkpoint-selections/pilot/seed-42/{job.arm}"
+        )
+        training_root = (
+            f"artifacts/phase-marker/checkpoints/pilot/seed-42/{job.arm}"
+        )
+        split_path = Path(plan.local_repo_root) / "artifacts/phase-marker/splits/manifest.json"
+        validation_path = (
+            Path(plan.local_repo_root) / "artifacts/phase-marker/splits/validation.jsonl"
+        )
+        manifest_payload: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "phase_marker_checkpoint_selection",
+            "config_hash": plan.config_hash,
+            "run_kind": "pilot",
+            "arm": job.arm,
+            "seed": 42,
+            "selected_on": "validation",
+            "evidence_scope": "experiment",
+            "origin_verification": "execution_receipt_or_rerun_required",
+            "backend": "vllm",
+            "model_id": "Qwen/Qwen2.5-7B-Instruct",
+            "model_revision": plan.model_revision,
+            "criterion": {
+                "primary": "maximize_strict_validation_exact_answer_accuracy",
+                "tie_break_1": "higher_mean_gold_answer_logprob",
+                "tie_break_2": "earliest_checkpoint_step",
+            },
+            "split_artifact_id": plan.split_artifact_id,
+            "split_manifest_hash": hashlib.sha256(split_path.read_bytes()).hexdigest(),
+            "validation_examples_file": "artifacts/phase-marker/splits/validation.jsonl",
+            "validation_examples_hash": hashlib.sha256(
+                validation_path.read_bytes()
+            ).hexdigest(),
+            "training_manifest_file": f"{training_root}/run-manifest.json",
+            "training_manifest_hash": training_manifest_hash,
+            "materialization_artifact_id": materialization_id,
+            "candidates": [{
+                "path": f"{training_root}/checkpoint-1",
+                "checkpoint_hash": checkpoint_hash,
+                "step": 1,
+                "strict_accuracy": 1.0,
+                "mean_gold_answer_logprob": -0.1,
+                "row_count": 1,
+            }],
+            "evidence_file": f"{selection_root}/evidence.jsonl",
+            "evidence_hash": hashlib.sha256(evidence).hexdigest(),
+            "selected_path": f"{training_root}/checkpoint-1",
+            "selected_checkpoint_hash": checkpoint_hash,
+            "selected_step": 1,
+            "parent_hashes": [
+                plan.split_artifact_id,
+                materialization_id,
+                training_manifest_hash,
+            ],
+            "completed": True,
+        }
+        manifest_payload["artifact_id"] = modal_artifacts.sha256_json(
+            manifest_payload
+        )
+        manifest = (canonical_json(manifest_payload) + "\n").encode("utf-8")
         producer_files = {
             "manifest.json": manifest,
-            "evidence.jsonl": b"{}\n",
+            "evidence.jsonl": evidence,
         }
     command = job.training_command if stage == "train" else job.selection_command
     paths = tuple(sorted(producer_files))
@@ -2314,6 +2422,222 @@ def test_status_rejects_self_consistent_wrong_model_revision(
 
     assert result["training"][plan.jobs[0].arm] == "invalid"
     assert result["valid"] is False
+
+
+def _replace_canonical_output_and_rebind_receipt(
+    files: dict[str, bytes],
+    receipt: dict[str, object],
+    *,
+    output_path: str,
+    content: bytes,
+) -> None:
+    files[output_path] = content
+    output_name = output_path.rsplit("/", maxsplit=1)[-1]
+    output_index = receipt["expected_outputs"].index(output_name)
+    receipt["output_hashes"][output_index] = hashlib.sha256(content).hexdigest()
+    unsigned = dict(receipt)
+    unsigned.pop("artifact_id")
+    receipt["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+    receipt_path = next(
+        path
+        for path in files
+        if path.endswith(f"/receipts/canonical/{receipt['stage']}/{receipt['arm']}.json")
+    )
+    files[receipt_path] = (canonical_json(receipt) + "\n").encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ("model-cache", "full-split", "selection-parent", "selection-schema"),
+)
+def test_status_rejects_self_consistent_wrong_complete_lineage(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    fault: str,
+) -> None:
+    """Would fail if self-hashed evidence could sever full Stage A lineage."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, training, selection = _complete_status_volume(plan)
+    arm = plan.jobs[0].arm
+    if fault == "model-cache":
+        receipt = training[arm]
+        receipt["model_cache_artifact_id"] = "d" * 64
+        unsigned = dict(receipt)
+        unsigned.pop("artifact_id")
+        receipt["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+        volume.files[
+            f"/runs/{plan.run_id}/receipts/canonical/train/{arm}.json"
+        ] = (canonical_json(receipt) + "\n").encode("utf-8")
+    elif fault == "full-split":
+        receipt = training[arm]
+        manifest_path = next(
+            path
+            for path in volume.files
+            if path.endswith(f"/checkpoints/pilot/seed-42/{arm}/run-manifest.json")
+        )
+        manifest = json.loads(volume.files[manifest_path])
+        manifest["data_parent_hashes"] = [plan.split_artifact_id[:8] + "d" * 56]
+        _replace_canonical_output_and_rebind_receipt(
+            volume.files,
+            receipt,
+            output_path=manifest_path,
+            content=(canonical_json(manifest) + "\n").encode("utf-8"),
+        )
+    else:
+        receipt = selection[arm]
+        manifest_path = next(
+            path
+            for path in volume.files
+            if path.endswith(
+                f"/checkpoint-selections/pilot/seed-42/{arm}/manifest.json"
+            )
+        )
+        manifest = json.loads(volume.files[manifest_path])
+        if fault == "selection-parent":
+            wrong_parent = "d" * 64
+            manifest["training_manifest_hash"] = wrong_parent
+            manifest["parent_hashes"][2] = wrong_parent
+        else:
+            manifest["unapproved_extra"] = "self-hashed"
+        manifest.pop("artifact_id")
+        manifest["artifact_id"] = modal_artifacts.sha256_json(manifest)
+        _replace_canonical_output_and_rebind_receipt(
+            volume.files,
+            receipt,
+            output_path=manifest_path,
+            content=(canonical_json(manifest) + "\n").encode("utf-8"),
+        )
+
+    result = imported_adapter.status_local(volume, run_id=plan.run_id)
+
+    expected_stage = "selection" if fault.startswith("selection") else "training"
+    assert result[expected_stage][arm] == "invalid"
+    assert result["valid"] is False
+
+
+def _failed_attempt_payload(
+    plan: modal_plan.PilotPlan, job: modal_plan.PilotJob,
+) -> dict[str, object]:
+    receipt = _stage_a_receipt(plan, job, "train")
+    receipt.update(
+        exit_status=1,
+        validated=False,
+        promoted=False,
+        failure_reason="RuntimeError: failed attempt",
+    )
+    unsigned = dict(receipt)
+    unsigned.pop("artifact_id")
+    receipt["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+    return receipt
+
+
+@pytest.mark.parametrize(
+    "fault", ("malformed", "hash", "filename", "command", "shared-identity")
+)
+def test_status_reports_every_invalid_attempt_receipt(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    fault: str,
+) -> None:
+    """Would fail if malformed or unapproved attempts disappeared as pending."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    receipt = _failed_attempt_payload(plan, plan.jobs[0])
+    filename = f"{receipt['attempt_id']}.json"
+    content: bytes
+    if fault == "malformed":
+        content = b"not json"
+    else:
+        if fault == "hash":
+            receipt["failure_reason"] = "changed without rehash"
+        elif fault == "filename":
+            filename = "different-attempt.json"
+        elif fault == "command":
+            receipt["command"] = "./.venv/bin/python -m phase_marker.training train --arm random"
+            receipt["command_hash"] = hashlib.sha256(
+                str(receipt["command"]).encode("utf-8")
+            ).hexdigest()
+        elif fault == "shared-identity":
+            receipt["model_cache_artifact_id"] = "d" * 64
+        if fault not in {"hash", "filename"}:
+            unsigned = dict(receipt)
+            unsigned.pop("artifact_id")
+            receipt["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+        content = (canonical_json(receipt) + "\n").encode("utf-8")
+    files, _canonical = _canonical_stage_a_files(plan, plan.jobs[1], "train")
+    files[f"/runs/{plan.run_id}/receipts/attempts/{filename}"] = content
+
+    result = imported_adapter.status_local(StageARunsClient(files, []), run_id=plan.run_id)
+
+    assert result["valid"] is False
+    assert any("attempt" in error for error in result["errors"])
+
+
+class MutatingDownloadVolume(StageARunsClient):
+    def __init__(self, files: dict[str, bytes], target: str) -> None:
+        super().__init__(files, [])
+        self.target = target
+        self.target_reads = 0
+
+    def read_file(self, path: str) -> list[bytes]:
+        content = super().read_file(path)
+        if path == self.target:
+            self.target_reads += 1
+            if self.target_reads > 1:
+                return [content[0] + b"mutated-after-status"]
+        return content
+
+
+def test_download_rereads_every_advertised_producer_byte_after_status(
+    imported_adapter: ModuleType, pilot_repo: Path, tmp_path: Path,
+) -> None:
+    """Would fail if excluded weights could mutate between status and download."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    target = next(
+        path for path in volume.files if path.endswith("adapter_model.safetensors")
+    )
+    mutating = MutatingDownloadVolume(volume.files, target)
+    destination = tmp_path / "evidence"
+
+    with pytest.raises(ValueError, match="producer bytes|changed during download"):
+        imported_adapter.download_evidence_local(
+            mutating, run_id=plan.run_id, destination=destination,
+        )
+
+    assert mutating.target_reads >= 2
+    assert not destination.exists()
+
+
+def test_download_rejects_self_hashed_smoke_receipt_with_extra_schema(
+    imported_adapter: ModuleType, pilot_repo: Path, tmp_path: Path,
+) -> None:
+    """Would fail if arbitrary self-hashed JSON were accepted as a smoke receipt."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, training, _selection = _complete_status_volume(plan)
+    smoke: dict[str, object] = {
+        "schema_version": 1,
+        "stage": "smoke",
+        "hardware": "CPU",
+        "run_id": plan.run_id,
+        "source_hash": plan.source_hash,
+        "dependency_lock_hash": plan.dependency_lock_hash,
+        "bundle_id": plan.bundle_id,
+        "model_revision": plan.model_revision,
+        "model_cache_artifact_id": training[plan.jobs[0].arm]["model_cache_artifact_id"],
+        "imports": [],
+        "validated": True,
+        "failure_reason": None,
+        "arbitrary": "must not export",
+    }
+    smoke["artifact_id"] = modal_artifacts.sha256_json(smoke)
+    volume.files[
+        f"/runs/{plan.run_id}/receipts/smoke/{smoke['artifact_id']}.json"
+    ] = (canonical_json(smoke) + "\n").encode("utf-8")
+
+    with pytest.raises(ValueError, match="smoke receipt"):
+        imported_adapter.download_evidence_local(
+            volume, run_id=plan.run_id, destination=tmp_path / "evidence",
+        )
 
 
 def _add_downloadable_logs(

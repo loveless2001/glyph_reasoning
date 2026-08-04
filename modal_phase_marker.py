@@ -71,6 +71,34 @@ _PILOT_ARMS = ("semantic", "glyph", "dot", "random", "direct", "filler")
 _RUN_ID_PATTERN = re.compile(
     r"pilot-s42-cfg-[0-9a-f]{8}-split-[0-9a-f]{8}-src-[0-9a-f]{12}"
 )
+_TRAINING_MANIFEST_FIELDS = frozenset({
+    "kind", "arm", "seed", "model_id", "model_revision", "tokenizer_revision",
+    "config_hash", "dataset_path", "dataset_hash", "data_artifact_id",
+    "parent_hashes", "data_parent_hashes", "arguments", "environment",
+    "checkpoints", "saved_artifacts", "output_hash",
+})
+_SELECTION_MANIFEST_FIELDS = frozenset({
+    "schema_version", "kind", "config_hash", "run_kind", "arm", "seed",
+    "selected_on", "evidence_scope", "origin_verification", "backend",
+    "model_id", "model_revision", "criterion", "split_artifact_id",
+    "split_manifest_hash", "validation_examples_file",
+    "validation_examples_hash", "training_manifest_file",
+    "training_manifest_hash", "materialization_artifact_id", "candidates",
+    "evidence_file", "evidence_hash", "selected_path",
+    "selected_checkpoint_hash", "selected_step", "parent_hashes", "completed",
+    "artifact_id",
+})
+_SELECTION_CRITERION = {
+    "primary": "maximize_strict_validation_exact_answer_accuracy",
+    "tie_break_1": "higher_mean_gold_answer_logprob",
+    "tie_break_2": "earliest_checkpoint_step",
+}
+_SMOKE_RECEIPT_FIELDS = frozenset({
+    "schema_version", "stage", "hardware", "run_id", "source_hash",
+    "dependency_lock_hash", "bundle_id", "model_revision",
+    "model_cache_artifact_id", "imports", "validated", "failure_reason",
+    "artifact_id",
+})
 CODE_ROOT = Path("/opt/glyph_reasoning")
 INPUT_MOUNT_ROOT = Path("/mnt/inputs")
 MODEL_MOUNT_ROOT = Path("/mnt/model")
@@ -130,6 +158,9 @@ app = modal.App(
 inputs_volume = modal.Volume.from_name(VOLUME_NAMES[0], create_if_missing=True)
 model_volume = modal.Volume.from_name(VOLUME_NAMES[1], create_if_missing=True)
 runs_volume = modal.Volume.from_name(VOLUME_NAMES[2], create_if_missing=True)
+inspection_runs_volume = modal.Volume.from_name(
+    VOLUME_NAMES[2], create_if_missing=False
+)
 
 GPU_VOLUMES = {
     "/inputs": inputs_volume.read_only(),
@@ -729,7 +760,7 @@ def gpu_resources() -> dict[str, object]:
     image=cpu_image,
     timeout=300,
     max_containers=MAX_GPU_CONTAINERS,
-    volumes={"/mnt/runs": runs_volume.read_only()},
+    volumes={"/mnt/runs": inspection_runs_volume.read_only()},
 )
 def status_resources() -> dict[str, object]:
     """Return resource status without mutating application metadata."""
@@ -848,7 +879,9 @@ def status_local(volume: VolumeClient, *, run_id: str) -> dict[str, object]:
         raise ValueError(f"unknown run ID: {run_id}")
 
     paths = _normalized_listed_paths(entries, run_root)
-    failed = _failed_attempt_matrix(volume, run_id=run_id, paths=paths)
+    failed, attempt_identities, attempt_errors = _inspect_attempt_receipts(
+        volume, run_id=run_id, paths=paths
+    )
     states = {
         "train": {
             arm: ("failed" if ("train", arm) in failed else "pending")
@@ -860,8 +893,9 @@ def status_local(volume: VolumeClient, *, run_id: str) -> dict[str, object]:
         },
     }
     receipt_ids: dict[str, dict[str, str]] = {"train": {}, "selection": {}}
-    identities: list[tuple[str, str, tuple[str, ...]]] = []
-    errors: list[str] = []
+    shared_identities: list[tuple[str, str, tuple[str, ...]]] = []
+    lineage_identities: list[tuple[str, str, tuple[str, ...]]] = []
+    errors: list[str] = list(attempt_errors)
     for stage in ("train", "selection"):
         for arm in _PILOT_ARMS:
             receipt_path = _volume_canonical_receipt_path(run_id, stage, arm)
@@ -875,7 +909,8 @@ def status_local(volume: VolumeClient, *, run_id: str) -> dict[str, object]:
                 errors.append(f"{stage}/{arm}: incomplete canonical evidence")
                 continue
             try:
-                validated, identity = _validate_status_canonical_output(
+                validated, shared_identity, lineage_identity = (
+                    _validate_status_canonical_output(
                     volume=volume,
                     run_id=run_id,
                     stage=stage,
@@ -883,6 +918,7 @@ def status_local(volume: VolumeClient, *, run_id: str) -> dict[str, object]:
                     receipt_bytes=receipt,
                     producer_path=producer_path,
                     entries=producer_entries,
+                    )
                 )
             except (OSError, TypeError, ValueError) as error:
                 states[stage][arm] = "invalid"
@@ -890,14 +926,26 @@ def status_local(volume: VolumeClient, *, run_id: str) -> dict[str, object]:
                 continue
             states[stage][arm] = "complete"
             receipt_ids[stage][arm] = str(validated["artifact_id"])
-            identities.append((stage, arm, identity))
+            shared_identities.append((stage, arm, shared_identity))
+            lineage_identities.append((stage, arm, lineage_identity))
 
-    identity_values = {identity for _stage, _arm, identity in identities}
-    if len(identity_values) > 1:
+    shared_values = {identity for _stage, _arm, identity in shared_identities}
+    lineage_values = {identity for _stage, _arm, identity in lineage_identities}
+    if len(shared_values) > 1 or len(lineage_values) > 1:
         errors.append("canonical outputs disagree on pilot identity")
-        for stage, arm, _identity in identities:
+        for stage, arm, _identity in shared_identities:
             states[stage][arm] = "invalid"
             receipt_ids[stage].pop(arm, None)
+    canonical_shared = next(iter(shared_values)) if len(shared_values) == 1 else None
+    attempt_values = set(attempt_identities)
+    if (
+        len(attempt_values) > 1
+        or (
+            canonical_shared is not None
+            and any(identity != canonical_shared for identity in attempt_values)
+        )
+    ):
+        errors.append("attempt receipts disagree with the canonical pilot identity")
     for arm in _PILOT_ARMS:
         if (
             states["selection"][arm] == "complete"
@@ -975,6 +1023,9 @@ def download_evidence_local(
         relative = _evidence_relative_path(run_id, remote_path)
         assert relative is not None
         contents[relative] = content
+    _revalidate_download_snapshot(
+        volume, run_id=run_id, selected_paths=selected, contents=contents
+    )
     _validate_downloaded_advertised_hashes(contents)
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1001,14 +1052,14 @@ def download_evidence_local(
 @app.local_entrypoint()
 def status(run_id: str) -> None:
     """Print validated read-only status for one canonical run."""
-    print(canonical_json(status_local(runs_volume, run_id=run_id)))
+    print(canonical_json(status_local(inspection_runs_volume, run_id=run_id)))
 
 
 @app.local_entrypoint(name="download-evidence")
 def download_evidence(run_id: str, destination: str) -> None:
     """Explicitly write one compact validated evidence bundle locally."""
     paths = download_evidence_local(
-        runs_volume, run_id=run_id, destination=Path(destination)
+        inspection_runs_volume, run_id=run_id, destination=Path(destination)
     )
     print(canonical_json({
         "run_id": run_id,
@@ -1324,33 +1375,96 @@ def _decode_json_object(content: bytes, label: str) -> dict[str, object]:
     return payload
 
 
-def _failed_attempt_matrix(
+def _inspect_attempt_receipts(
     volume: VolumeClient, *, run_id: str, paths: set[str],
-) -> set[tuple[str, str]]:
+) -> tuple[set[tuple[str, str]], tuple[tuple[str, ...], ...], tuple[str, ...]]:
     prefix = f"/runs/{run_id}/receipts/attempts/"
     failed: set[tuple[str, str]] = set()
+    identities: list[tuple[str, ...]] = []
+    errors: list[str] = []
     for path in sorted(path for path in paths if path.startswith(prefix)):
         relative = path[len(prefix):]
         if not relative or "/" in relative or not relative.endswith(".json"):
+            errors.append(f"attempt receipt path is invalid: {path}")
             continue
         content = _read_volume_file_optional(volume, path)
         if content is None:
+            errors.append(f"attempt receipt disappeared: {path}")
             continue
         try:
             receipt = load_attempt_receipt_payload(
                 _decode_json_object(content, "attempt receipt")
             )
-        except (TypeError, ValueError):
+            _validate_attempt_receipt_job_identity(
+                receipt, run_id=run_id, filename=relative
+            )
+        except (TypeError, ValueError) as error:
+            errors.append(f"attempt receipt {path}: {error}")
             continue
+        identities.append(_receipt_shared_identity(receipt))
         if (
-            receipt.run_id == run_id
-            and receipt.stage in {"train", "selection"}
-            and receipt.arm in _PILOT_ARMS
-            and receipt.validated is False
+            receipt.validated is False
             and receipt.promoted is False
         ):
             failed.add((receipt.stage, receipt.arm))
-    return failed
+    return failed, tuple(identities), tuple(errors)
+
+
+def _validate_attempt_receipt_job_identity(
+    receipt: object, *, run_id: str, filename: str,
+) -> None:
+    attempt_id = getattr(receipt, "attempt_id", None)
+    if filename != f"{attempt_id}.json":
+        raise ValueError("attempt receipt filename does not match its attempt ID")
+    _validate_receipt_job_identity(receipt, run_id=run_id)
+
+
+def _validate_receipt_job_identity(receipt: object, *, run_id: str) -> None:
+    stage = getattr(receipt, "stage", None)
+    arm = getattr(receipt, "arm", None)
+    if (
+        getattr(receipt, "run_id", None) != run_id
+        or stage not in {"train", "selection"}
+        or arm not in _PILOT_ARMS
+        or getattr(receipt, "seed", None) != 42
+        or getattr(receipt, "requested_gpu", None) != "H100"
+        or getattr(receipt, "timeout_seconds", None) != 14_400
+    ):
+        raise ValueError("attempt receipt identity is not an approved pilot job")
+    expected_command = _status_expected_command(str(stage), str(arm))
+    if (
+        getattr(receipt, "command", None) != expected_command
+        or getattr(receipt, "command_hash", None)
+        != _sha256_bytes(expected_command.encode("utf-8"))
+    ):
+        raise ValueError("attempt receipt command is not the approved exact job")
+    validated = getattr(receipt, "validated", None)
+    promoted = getattr(receipt, "promoted", None)
+    exit_status = getattr(receipt, "exit_status", None)
+    failure_reason = getattr(receipt, "failure_reason", None)
+    if validated is True:
+        if promoted is not True or exit_status != 0 or failure_reason is not None:
+            raise ValueError("successful attempt receipt state is invalid")
+    elif (
+        validated is not False
+        or promoted is not False
+        or exit_status == 0
+        or not isinstance(failure_reason, str)
+        or not failure_reason
+    ):
+        raise ValueError("failed attempt receipt state is invalid")
+
+
+def _receipt_shared_identity(receipt: object) -> tuple[str, ...]:
+    values = (
+        getattr(receipt, "bundle_id", None),
+        getattr(receipt, "source_hash", None),
+        getattr(receipt, "dependency_lock_hash", None),
+        getattr(receipt, "model_cache_artifact_id", None),
+    )
+    if not all(_is_sha256(value) for value in values):
+        raise ValueError("attempt receipt shared identity is invalid")
+    return tuple(str(value) for value in values)
 
 
 def _validate_status_canonical_output(
@@ -1362,7 +1476,7 @@ def _validate_status_canonical_output(
     receipt_bytes: bytes,
     producer_path: str,
     entries: tuple[object, ...],
-) -> tuple[dict[str, object], tuple[str, ...]]:
+) -> tuple[dict[str, object], tuple[str, ...], tuple[str, ...]]:
     receipt = load_attempt_receipt_payload(
         _decode_json_object(receipt_bytes, "canonical receipt")
     )
@@ -1407,7 +1521,8 @@ def _validate_status_canonical_output(
     if actual != advertised:
         raise ValueError("canonical producer bytes do not match their receipt")
     manifest_name = "run-manifest.json" if stage == "train" else "manifest.json"
-    manifest = _decode_json_object(producer_files[manifest_name], "producer manifest")
+    manifest_bytes = producer_files[manifest_name]
+    manifest = _decode_json_object(manifest_bytes, "producer manifest")
     config_hash = manifest.get("config_hash")
     model_revision = manifest.get("model_revision")
     if (
@@ -1420,8 +1535,10 @@ def _validate_status_canonical_output(
         or not run_id.endswith(f"-src-{receipt.source_hash[:12]}")
     ):
         raise ValueError("canonical producer content identity is invalid")
-    split_id: object = None
+    split_id: object
     if stage == "train":
+        if set(manifest) != _TRAINING_MANIFEST_FIELDS:
+            raise ValueError("training producer manifest schema is invalid")
         parents = manifest.get("data_parent_hashes")
         split_id = (
             parents[0] if isinstance(parents, list) and len(parents) == 1 else None
@@ -1435,27 +1552,78 @@ def _validate_status_canonical_output(
             or manifest.get("dataset_path")
             != f"artifacts/phase-marker/training-data/{arm}.jsonl"
             or not _is_sha256(manifest.get("data_artifact_id"))
+            or manifest.get("parent_hashes") != [manifest.get("data_artifact_id")]
             or not _is_sha256(split_id)
             or f"-split-{str(split_id)[:8]}-" not in run_id
         ):
             raise ValueError("training producer manifest semantic identity is invalid")
-    elif (
-        manifest.get("kind") != "phase_marker_checkpoint_selection"
-        or manifest.get("run_kind") != "pilot"
-        or manifest.get("arm") != arm
-        or manifest.get("seed") != 42
-        or manifest.get("completed") is not True
-    ):
-        raise ValueError("selection producer manifest semantic identity is invalid")
+    else:
+        training_path = _volume_producer_path(run_id, "train", arm)
+        training_manifest_bytes = _read_volume_file_optional(
+            volume, f"{training_path}/run-manifest.json"
+        )
+        if training_manifest_bytes is None:
+            raise ValueError("selection lacks its canonical training manifest")
+        training_manifest = _decode_json_object(
+            training_manifest_bytes, "canonical training manifest"
+        )
+        training_parents = training_manifest.get("data_parent_hashes")
+        split_id = (
+            training_parents[0]
+            if isinstance(training_parents, list) and len(training_parents) == 1
+            else None
+        )
+        materialization_id = training_manifest.get("data_artifact_id")
+        training_manifest_hash = _sha256_bytes(training_manifest_bytes)
+        unsigned_manifest = dict(manifest)
+        selection_artifact_id = unsigned_manifest.pop("artifact_id", None)
+        if (
+            set(manifest) != _SELECTION_MANIFEST_FIELDS
+            or selection_artifact_id != sha256_json(unsigned_manifest)
+            or manifest.get("schema_version") != 1
+            or manifest.get("kind") != "phase_marker_checkpoint_selection"
+            or manifest.get("run_kind") != "pilot"
+            or manifest.get("arm") != arm
+            or manifest.get("seed") != 42
+            or manifest.get("selected_on") != "validation"
+            or manifest.get("evidence_scope") != "experiment"
+            or manifest.get("origin_verification")
+            != "execution_receipt_or_rerun_required"
+            or manifest.get("backend") != "vllm"
+            or manifest.get("model_id") != "Qwen/Qwen2.5-7B-Instruct"
+            or manifest.get("criterion") != _SELECTION_CRITERION
+            or manifest.get("split_artifact_id") != split_id
+            or manifest.get("training_manifest_hash") != training_manifest_hash
+            or manifest.get("materialization_artifact_id") != materialization_id
+            or manifest.get("parent_hashes")
+            != [split_id, materialization_id, training_manifest_hash]
+            or manifest.get("training_manifest_file")
+            != f"artifacts/phase-marker/checkpoints/pilot/seed-42/{arm}/run-manifest.json"
+            or manifest.get("validation_examples_file")
+            != "artifacts/phase-marker/splits/validation.jsonl"
+            or manifest.get("evidence_file")
+            != (
+                "artifacts/phase-marker/checkpoint-selections/pilot/"
+                f"seed-42/{arm}/evidence.jsonl"
+            )
+            or manifest.get("evidence_hash")
+            != _sha256_bytes(producer_files["evidence.jsonl"])
+            or not _is_sha256(manifest.get("split_manifest_hash"))
+            or not _is_sha256(manifest.get("validation_examples_hash"))
+            or not _is_sha256(manifest.get("selected_checkpoint_hash"))
+            or not isinstance(manifest.get("candidates"), list)
+            or not manifest.get("candidates")
+            or manifest.get("completed") is not True
+        ):
+            raise ValueError("selection producer manifest semantic identity is invalid")
+    shared_identity = _receipt_shared_identity(receipt)
+    lineage_identity = (
+        str(config_hash), str(model_revision), str(split_id)
+    )
     return (
         _decode_json_object(receipt_bytes, "canonical receipt"),
-        (
-            str(config_hash),
-            str(model_revision),
-            receipt.bundle_id,
-            receipt.source_hash,
-            receipt.dependency_lock_hash,
-        ),
+        shared_identity,
+        lineage_identity,
     )
 
 
@@ -1526,6 +1694,63 @@ def _validate_status_summary(
     return summary
 
 
+def _revalidate_download_snapshot(
+    volume: VolumeClient,
+    *,
+    run_id: str,
+    selected_paths: tuple[str, ...],
+    contents: Mapping[str, bytes],
+) -> None:
+    """Re-read the full receipt-advertised producer set before local publication."""
+    receipt_ids: dict[str, list[str]] = {"train": [], "selection": []}
+    shared: set[tuple[str, ...]] = set()
+    lineage: set[tuple[str, ...]] = set()
+    for stage in ("train", "selection"):
+        for arm in _PILOT_ARMS:
+            receipt_path = _volume_canonical_receipt_path(run_id, stage, arm)
+            relative_receipt = receipt_path.removeprefix(f"/runs/{run_id}/")
+            receipt_bytes = _read_volume_file_optional(volume, receipt_path)
+            if receipt_bytes is None or receipt_bytes != contents.get(relative_receipt):
+                raise ValueError("canonical receipt changed during download")
+            producer_path = _volume_producer_path(run_id, stage, arm)
+            entries = _list_volume_files_optional(volume, producer_path)
+            if not entries:
+                raise ValueError("canonical producer changed during download")
+            validated, shared_identity, lineage_identity = (
+                _validate_status_canonical_output(
+                    volume=volume,
+                    run_id=run_id,
+                    stage=stage,
+                    arm=arm,
+                    receipt_bytes=receipt_bytes,
+                    producer_path=producer_path,
+                    entries=entries,
+                )
+            )
+            receipt_ids[stage].append(str(validated["artifact_id"]))
+            shared.add(shared_identity)
+            lineage.add(lineage_identity)
+    if len(shared) != 1 or len(lineage) != 1:
+        raise ValueError("canonical pilot identity changed during download")
+    summary_path = f"/runs/{run_id}/stage-a-summary.json"
+    summary = _read_volume_file_optional(volume, summary_path)
+    if summary is None or summary != contents.get("stage-a-summary.json"):
+        raise ValueError("Stage A summary changed during download")
+    _validate_status_summary(
+        summary,
+        run_id=run_id,
+        training_ids=receipt_ids["train"],
+        selection_ids=receipt_ids["selection"],
+    )
+    for remote_path in selected_paths:
+        relative = _evidence_relative_path(run_id, remote_path)
+        if relative is None:
+            raise ValueError("download selection changed during validation")
+        current = _read_volume_file_optional(volume, remote_path)
+        if current is None or current != contents.get(relative):
+            raise ValueError(f"evidence changed during download: {remote_path}")
+
+
 def _evidence_relative_path(run_id: str, remote_path: str) -> str | None:
     prefix = f"/runs/{run_id}/"
     if not remote_path.startswith(prefix):
@@ -1594,24 +1819,70 @@ def _validate_downloaded_advertised_hashes(contents: Mapping[str, bytes]) -> Non
     if advertised_summary != sha256_json(unsigned_summary):
         raise ValueError("downloaded Stage A summary hash mismatch")
     run_id = summary_payload.get("run_id")
+    if not isinstance(run_id, str):
+        raise ValueError("downloaded Stage A summary run identity is invalid")
+    canonical_receipts: dict[tuple[str, str], object] = {}
+    canonical_shared: set[tuple[str, ...]] = set()
+    for stage in ("train", "selection"):
+        for arm in _PILOT_ARMS:
+            receipt_path = f"receipts/canonical/{stage}/{arm}.json"
+            receipt_content = contents.get(receipt_path)
+            if receipt_content is None:
+                raise ValueError(f"downloaded evidence lacks {receipt_path}")
+            receipt = load_attempt_receipt_payload(
+                _decode_json_object(receipt_content, "downloaded canonical receipt")
+            )
+            _validate_receipt_job_identity(receipt, run_id=run_id)
+            if getattr(receipt, "stage", None) != stage or getattr(receipt, "arm", None) != arm:
+                raise ValueError("downloaded canonical receipt path identity mismatch")
+            canonical_receipts[(stage, arm)] = receipt
+            canonical_shared.add(_receipt_shared_identity(receipt))
+    if len(canonical_shared) != 1:
+        raise ValueError("downloaded canonical receipts disagree on pilot identity")
+    approved_shared = next(iter(canonical_shared))
     attempt_receipts: dict[str, object] = {}
     for path, content in contents.items():
         if path.startswith("receipts/attempts/"):
             receipt = load_attempt_receipt_payload(
                 _decode_json_object(content, "downloaded attempt receipt")
             )
-            filename = PurePosixPath(path).stem
-            if receipt.run_id != run_id or filename != receipt.attempt_id:
-                raise ValueError("downloaded attempt receipt identity mismatch")
+            _validate_attempt_receipt_job_identity(
+                receipt,
+                run_id=run_id,
+                filename=PurePosixPath(path).name,
+            )
+            if _receipt_shared_identity(receipt) != approved_shared:
+                raise ValueError("downloaded attempt receipt pilot identity mismatch")
             attempt_receipts[receipt.attempt_id] = receipt
         elif path.startswith("receipts/smoke/"):
             smoke = _decode_json_object(content, "downloaded smoke receipt")
             unsigned = dict(smoke)
             artifact_id = unsigned.pop("artifact_id", None)
+            imports = smoke.get("imports")
             if (
-                smoke.get("schema_version") != 1
+                set(smoke) != _SMOKE_RECEIPT_FIELDS
+                or smoke.get("schema_version") != 1
                 or smoke.get("stage") != "smoke"
+                or smoke.get("hardware") != "CPU"
                 or smoke.get("run_id") != run_id
+                or smoke.get("source_hash") != approved_shared[1]
+                or smoke.get("dependency_lock_hash") != approved_shared[2]
+                or smoke.get("bundle_id") != approved_shared[0]
+                or smoke.get("model_revision") != QWEN25_7B_TOKENIZER_REVISION
+                or smoke.get("model_cache_artifact_id") != approved_shared[3]
+                or not isinstance(imports, list)
+                or any(
+                    not isinstance(item, Mapping)
+                    or set(item) != {"module", "version"}
+                    or not isinstance(item.get("module"), str)
+                    or (
+                        item.get("version") is not None
+                        and not isinstance(item.get("version"), str)
+                    )
+                    for item in imports
+                )
+                or smoke.get("validated") is not True
+                or smoke.get("failure_reason") is not None
                 or PurePosixPath(path).stem != artifact_id
                 or artifact_id != sha256_json(unsigned)
             ):
@@ -1625,13 +1896,7 @@ def _validate_downloaded_advertised_hashes(contents: Mapping[str, bytes]) -> Non
                 raise ValueError("downloaded log lacks its bound attempt receipt")
     for stage in ("train", "selection"):
         for arm in _PILOT_ARMS:
-            receipt_path = f"receipts/canonical/{stage}/{arm}.json"
-            receipt_content = contents.get(receipt_path)
-            if receipt_content is None:
-                raise ValueError(f"downloaded evidence lacks {receipt_path}")
-            receipt = load_attempt_receipt_payload(
-                _decode_json_object(receipt_content, "downloaded canonical receipt")
-            )
+            receipt = canonical_receipts[(stage, arm)]
             producer_kind = (
                 "checkpoints" if stage == "train" else "checkpoint-selections"
             )
