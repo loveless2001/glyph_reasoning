@@ -8,10 +8,9 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import tempfile
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from phase_marker.config import ExperimentConfig, REQUIRED_MODEL_ID
 from phase_marker.io import canonical_json, read_jsonl, sha256_json, write_jsonl_atomic
@@ -19,7 +18,11 @@ from phase_marker.prompts import MarkerSet, render_perturbation, render_prompt
 from phase_marker.schema import ArtifactManifest, GenerationRecord
 from phase_marker.scoring import score_generation
 from phase_marker.splits import DatasetExample
-from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
+from phase_marker.token_audit import (
+    QWEN25_7B_TOKENIZER_REVISION,
+    _load_cached_tokenizer,
+    _pinned_tokenizer_snapshot_path,
+)
 
 
 PRIMARY_ARMS = ("semantic", "glyph", "dot", "random")
@@ -129,47 +132,9 @@ class _CodepointEvidenceTokenizer:
             raise ValueError("plumbing token ID is not a Unicode code point") from error
 
 
-def _pinned_tokenizer_snapshot_path(model_id: str) -> Path:
-    """Resolve the exact pinned Hub cache snapshot without contacting the Hub."""
-    if model_id != REQUIRED_MODEL_ID:
-        raise ValueError("tokenizer evidence requires the frozen base model")
-    cache = os.environ.get("HF_HUB_CACHE")
-    if cache is None:
-        cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
-    if cache is None:
-        from huggingface_hub.constants import HF_HUB_CACHE
-
-        cache = HF_HUB_CACHE
-    return (
-        Path(cache).expanduser()
-        / "models--Qwen--Qwen2.5-7B-Instruct"
-        / "snapshots"
-        / QWEN25_7B_TOKENIZER_REVISION
-    )
-
-
 def _load_pinned_local_tokenizer(model_id: str) -> EvidenceTokenizer:
     """Load the validated pinned filesystem snapshot with no repo-ID fallback."""
-    snapshot = _pinned_tokenizer_snapshot_path(model_id)
-    if not snapshot.is_dir():
-        raise FileNotFoundError(f"missing pinned tokenizer snapshot directory: {snapshot}")
-    tokenizer_config = snapshot / "tokenizer_config.json"
-    standalone_assets = tuple(
-        snapshot / name for name in ("tokenizer.json", "tokenizer.model", "spiece.model")
-    )
-    split_assets = (snapshot / "vocab.json", snapshot / "merges.txt")
-    if (
-        not tokenizer_config.is_file()
-        or not (any(path.is_file() for path in standalone_assets)
-                or all(path.is_file() for path in split_assets))
-    ):
-        raise FileNotFoundError(f"pinned tokenizer snapshot lacks config/assets: {snapshot}")
-    from transformers import AutoTokenizer
-
-    return AutoTokenizer.from_pretrained(
-        str(snapshot),
-        local_files_only=True,
-    )
+    return cast(EvidenceTokenizer, _load_cached_tokenizer(model_id))
 
 
 class FakeGenerationBackend:
@@ -991,11 +956,7 @@ def _run_selection(arguments: argparse.Namespace) -> int:
 
     tokenizer: object | None = None
     if arguments.backend == "vllm":
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            config.model_id, revision=QWEN25_7B_TOKENIZER_REVISION, local_files_only=True
-        )
+        tokenizer = _load_pinned_local_tokenizer(config.model_id)
     metrics: list[dict[str, object]] = []
     evidence_rows: list[dict[str, object]] = []
     prompt_condition = arguments.arm if arguments.arm in {"glyph", "dot"} else "neutral"
@@ -1214,13 +1175,7 @@ def _run_behavior(arguments: argparse.Namespace) -> int:
                     raise FileNotFoundError(
                         f"selected production checkpoint is missing: {checkpoint}"
                     )
-                from transformers import AutoTokenizer
-
-                tokenizer = AutoTokenizer.from_pretrained(
-                    config.model_id,
-                    revision=QWEN25_7B_TOKENIZER_REVISION,
-                    local_files_only=True,
-                )
+                tokenizer = _load_pinned_local_tokenizer(config.model_id)
                 requests = build_generation_requests(
                     cell,
                     examples,

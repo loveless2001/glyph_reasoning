@@ -50,6 +50,70 @@ class _DeterministicTokenizer:
         return "".join(chr(token_id) for token_id in token_ids)
 
 
+def _write_qwen_tokenizer_snapshot(snapshot: Path) -> None:
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "tokenizer_class": "Qwen2Tokenizer",
+                "chat_template": "{{ messages }}",
+                "model_max_length": 131072,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "version": "1.0",
+                "added_tokens": [],
+                "normalizer": {"type": "NFC"},
+                "pre_tokenizer": {"type": "ByteLevel"},
+                "post_processor": {"type": "ByteLevel"},
+                "decoder": {"type": "ByteLevel"},
+                "model": {
+                    "type": "BPE",
+                    "vocab": {"t": 0, "o": 1, "to": 2},
+                    "merges": ["t o"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class _ExactTokenizerLoadReached(RuntimeError):
+    pass
+
+
+def _install_exact_tokenizer_load_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    cache = tmp_path / "hub-cache"
+    snapshot = (
+        cache
+        / "models--Qwen--Qwen2.5-7B-Instruct"
+        / "snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+    _write_qwen_tokenizer_snapshot(snapshot)
+
+    def from_pretrained(source: object, **kwargs: object) -> object:
+        if source != str(snapshot) or kwargs != {"local_files_only": True}:
+            raise AssertionError(
+                f"expected exact offline snapshot load, got {source!r} {kwargs!r}"
+            )
+        raise _ExactTokenizerLoadReached
+
+    transformers = ModuleType("transformers")
+    transformers.AutoTokenizer = SimpleNamespace(  # type: ignore[attr-defined]
+        from_pretrained=from_pretrained
+    )
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+    return snapshot
+
+
 def test_pinned_tokenizer_loader_uses_exact_filesystem_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -57,9 +121,7 @@ def test_pinned_tokenizer_loader_uses_exact_filesystem_snapshot(
         tmp_path / "models--Qwen--Qwen2.5-7B-Instruct" / "snapshots"
         / QWEN25_7B_TOKENIZER_REVISION
     )
-    snapshot.mkdir(parents=True)
-    (snapshot / "tokenizer_config.json").write_text("{}\n", encoding="utf-8")
-    (snapshot / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+    _write_qwen_tokenizer_snapshot(snapshot)
     calls: list[tuple[object, dict[str, object]]] = []
     sentinel = object()
     transformers = ModuleType("transformers")
@@ -510,9 +572,9 @@ def test_validation_checkpoint_selection_uses_frozen_lexicographic_criterion():
     assert selected["path"] == "checkpoint-250"
 
 
-def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing_manifest(
+def _write_selection_cli_inputs(
     tmp_path: Path, config: ExperimentConfig
-) -> None:
+) -> tuple[Path, Path, Path, Path, Path]:
     config_path = Path("configs/phase-marker-qwen25-7b.toml")
     config_hash = sha256_json(asdict(config))
     split_path = tmp_path / "split.json"
@@ -565,6 +627,15 @@ def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing
     training_path = run_root / "run-manifest.json"
     training_path.write_text(canonical_json(training) + "\n", encoding="utf-8")
     output = tmp_path / "selection"
+    return config_path, split_path, examples, training_path, output
+
+
+def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing_manifest(
+    tmp_path: Path, config: ExperimentConfig
+) -> None:
+    config_path, split_path, examples, training_path, output = (
+        _write_selection_cli_inputs(tmp_path, config)
+    )
 
     assert behavior_main(
         (
@@ -630,6 +701,48 @@ def test_select_cli_evaluates_declared_validation_checkpoints_and_emits_plumbing
             (output / "manifest.json",), replay_config, "pilot", (42,), allow_test=True,
             tokenizer=_DeterministicTokenizer(),
         )
+
+
+def test_select_cli_loads_tokenizer_from_exact_snapshot_before_vllm(
+    tmp_path: Path,
+    config: ExperimentConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, split_path, examples, training_path, output = (
+        _write_selection_cli_inputs(tmp_path, config)
+    )
+    monkeypatch.setattr(
+        "phase_marker.behavior._validate_canonical_split_examples",
+        lambda *_args, **_kwargs: None,
+    )
+    _install_exact_tokenizer_load_boundary(tmp_path, monkeypatch)
+
+    with pytest.raises(_ExactTokenizerLoadReached):
+        behavior_main(
+            (
+                "select",
+                "--config",
+                str(config_path),
+                "--kind",
+                "pilot",
+                "--seed",
+                "42",
+                "--arm",
+                "glyph",
+                "--split-manifest",
+                str(split_path),
+                "--validation-examples",
+                str(examples),
+                "--training-manifest",
+                str(training_path),
+                "--backend",
+                "vllm",
+                "--output",
+                str(output),
+            )
+        )
+
+    assert not output.exists()
 
 
 def test_provenance_envelope_rejects_empty_or_mismatched_production_lineage(
@@ -849,6 +962,92 @@ def test_run_cli_tiny_fixture_emits_versioned_plumbing_manifest(
             "--output-root", str(rejected_output),
         ])
     assert not rejected_output.exists()
+
+
+def test_run_cli_loads_tokenizer_from_exact_snapshot_before_vllm(
+    tmp_path: Path,
+    config: ExperimentConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = Path("configs/phase-marker-qwen25-7b.toml")
+    split_path = tmp_path / "split-manifest.json"
+    split_path.write_text(
+        canonical_json(
+            {
+                "artifact_id": "a" * 64,
+                "config_hash": sha256_json(asdict(config)),
+                "source_counts": {"test": {"gsm8k": 1}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    examples_path = tmp_path / "test.jsonl"
+    examples_path.write_text(
+        canonical_json(
+            {
+                "source": "gsm8k",
+                "split": "test",
+                "example_id": "test-1",
+                "question": "What is 1 + 1?",
+                "answer": "2",
+                "question_hash": "b" * 64,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / "checkpoint-100"
+    checkpoint.mkdir()
+    selection = {
+        "selected_path": str(checkpoint),
+        "artifact_id": "c" * 64,
+    }
+    monkeypatch.setattr(
+        "phase_marker.behavior._validate_canonical_split_examples",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "phase_marker.behavior._load_checkpoint_selections",
+        lambda *_args, **_kwargs: {(42, "glyph"): selection},
+    )
+    monkeypatch.setattr(
+        "phase_marker.behavior._validate_production_behavior_inputs",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "phase_marker.behavior.build_behavior_matrix",
+        lambda *_args, **_kwargs: (
+            EvaluationCell("primary", "glyph", "neutral", None, "greedy"),
+        ),
+    )
+    _install_exact_tokenizer_load_boundary(tmp_path, monkeypatch)
+    output = tmp_path / "behavior-output"
+
+    with pytest.raises(_ExactTokenizerLoadReached):
+        behavior_main(
+            (
+                "run",
+                "--config",
+                str(config_path),
+                "--kind",
+                "pilot",
+                "--seeds",
+                "42",
+                "--split-manifest",
+                str(split_path),
+                "--examples",
+                str(examples_path),
+                "--checkpoint-manifests",
+                str(tmp_path / "selection.json"),
+                "--backend",
+                "vllm",
+                "--output-root",
+                str(output),
+            )
+        )
+
+    assert not output.exists()
 
 
 def test_run_cli_rejects_test_backend_without_explicit_flag(tmp_path: Path) -> None:
