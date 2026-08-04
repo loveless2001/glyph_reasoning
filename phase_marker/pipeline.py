@@ -1354,7 +1354,7 @@ def _commands_for_stage(
     if stage == "tokenize":
         return (shlex.join((
             "./.venv/bin/python", "-m", "phase_marker.token_audit", "materialize",
-            "--config", str(config_path), "--limit", "2455", "--output-root",
+            "--config", str(config_path), "--output-root",
             str(artifact_root / "training-data"),
         )),)
     if stage == "behavior":

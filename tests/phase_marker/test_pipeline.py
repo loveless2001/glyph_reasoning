@@ -534,6 +534,33 @@ def test_command_manifest_rejects_approval_workload_undercount(
         build_command_manifest(config, tmp_path, kind="pilot", seeds=(42,), approval=approval)
 
 
+def test_tokenize_command_consumes_the_entire_validated_frozen_train_split(
+    tmp_path: Path, config: ExperimentConfig
+) -> None:
+    command = pipeline_module._commands_for_stage(
+        "tokenize",
+        config,
+        tmp_path,
+        kind="pilot",
+        seeds=(42,),
+        config_path=CONFIG_PATH,
+        approval=None,
+    )[0]
+    arguments = shlex.split(command)
+
+    assert arguments[:4] == [
+        "./.venv/bin/python",
+        "-m",
+        "phase_marker.token_audit",
+        "materialize",
+    ]
+    assert "--limit" not in arguments
+    assert arguments[-2:] == [
+        "--output-root",
+        str(tmp_path / "training-data"),
+    ]
+
+
 @pytest.mark.parametrize("stage", pipeline_module.STAGES)
 def test_each_successful_stage_constructs_only_its_requested_commands(
     tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch, stage: str

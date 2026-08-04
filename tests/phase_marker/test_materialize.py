@@ -6,12 +6,15 @@ from pathlib import Path
 
 import pytest
 
+import phase_marker.token_audit as token_audit_module
 from phase_marker.config import ExperimentConfig
 from phase_marker.schema import CanonicalTrace, PhaseSpan
+from phase_marker.splits import question_hash
 from phase_marker.token_audit import (
     QWEN25_7B_TOKENIZER_REVISION,
     SplitLineageUnavailable,
     _load_frozen_training_traces,
+    main,
     materialize_training_arms,
 )
 
@@ -52,6 +55,33 @@ def traces() -> list[CanonicalTrace]:
             phases=phases,  # type: ignore[arg-type]
         ),
     ]
+
+
+def _write_published_train_split(
+    tmp_path: Path, traces: list[CanonicalTrace]
+) -> None:
+    recovered_sources = {"trace-1": "gsm8k", "trace-2": "math"}
+    split_root = tmp_path / "splits"
+    split_root.mkdir()
+    rows = [
+        {
+            "source": recovered_sources[trace.trace_id],
+            "split": "train",
+            "example_id": trace.trace_id,
+            "question": trace.question,
+            "answer": trace.answer,
+            "question_hash": question_hash(
+                recovered_sources[trace.trace_id], trace.question
+            ),
+        }
+        for trace in traces
+    ]
+    (split_root / "train.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    (split_root / "manifest.json").write_text(
+        json.dumps({"artifact_id": "f" * 64}) + "\n", encoding="utf-8"
+    )
 
 
 @pytest.fixture
@@ -154,16 +184,14 @@ def test_frozen_trace_loader_preserves_frozen_order_and_identity(
     split_root.mkdir()
     rows = [
         {
-            "example_id": "example-2",
-            "trace_id": "trace-2",
+            "example_id": "trace-2",
             "source": "math",
             "question": "What is 4 + 4?",
             "answer": "8",
             "split": "train",
         },
         {
-            "example_id": "example-1",
-            "trace_id": "trace-1",
+            "example_id": "trace-1",
             "source": "gsm8k",
             "question": "What is 2 + 3?",
             "answer": "5",
@@ -180,19 +208,106 @@ def test_frozen_trace_loader_preserves_frozen_order_and_identity(
     assert [trace.trace_id for trace in selected] == ["trace-2", "trace-1"]
 
 
+def test_frozen_trace_loader_uses_published_example_identity_and_recovered_source(
+    tmp_path: Path, traces: list[CanonicalTrace], monkeypatch: pytest.MonkeyPatch
+):
+    canonical = [
+        replace(traces[1], source="legacy"),
+        replace(traces[0], source="legacy"),
+    ]
+    _write_published_train_split(tmp_path, canonical)
+    monkeypatch.setattr(
+        token_audit_module,
+        "parse_trace_pool",
+        lambda _: (tuple(canonical), (), {}),
+    )
+
+    selected = _load_frozen_training_traces(tmp_path / "training-data")
+
+    assert [trace.trace_id for trace in selected] == ["trace-2", "trace-1"]
+    assert [trace.source for trace in selected] == ["legacy", "legacy"]
+
+
+def test_materialize_cli_without_limit_consumes_every_frozen_train_row(
+    tmp_path: Path,
+    config: ExperimentConfig,
+    traces: list[CanonicalTrace],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    canonical = [replace(trace, source="legacy") for trace in traces]
+    _write_published_train_split(tmp_path, canonical)
+    monkeypatch.setattr(
+        token_audit_module,
+        "parse_trace_pool",
+        lambda _: (tuple(canonical), (), {}),
+    )
+    monkeypatch.setattr(
+        token_audit_module,
+        "_load_cached_tokenizer",
+        lambda _: FaithfulFakeTokenizer(),
+    )
+    output_root = tmp_path / "training-data"
+
+    main(
+        [
+            "materialize",
+            "--config",
+            "configs/phase-marker-qwen25-7b.toml",
+            "--output-root",
+            str(output_root),
+        ]
+    )
+
+    for arm in config.arms:
+        manifest = json.loads(
+            (output_root / f"{arm}.manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["row_count"] == 2
+        assert manifest["parent_hashes"] == ["f" * 64]
+        assert manifest["metadata"]["parent_split_hash"] == "f" * 64
+
+
+def test_materialize_cli_rejects_limit_larger_than_frozen_train(
+    tmp_path: Path, traces: list[CanonicalTrace], monkeypatch: pytest.MonkeyPatch
+):
+    canonical = [replace(trace, source="legacy") for trace in traces]
+    _write_published_train_split(tmp_path, canonical)
+    monkeypatch.setattr(
+        token_audit_module,
+        "parse_trace_pool",
+        lambda _: (tuple(canonical), (), {}),
+    )
+
+    with pytest.raises(
+        SystemExit,
+        match=r"frozen training split provides 2 canonical traces, need --limit 3",
+    ):
+        main(
+            [
+                "materialize",
+                "--config",
+                "configs/phase-marker-qwen25-7b.toml",
+                "--limit",
+                "3",
+                "--output-root",
+                str(tmp_path / "training-data"),
+            ]
+        )
+
+    assert not (tmp_path / "training-data").exists()
+
+
 @pytest.mark.parametrize(
     "row",
     [
         {
-            "example_id": "example-1",
             "source": "gsm8k",
             "question": "What is 2 + 3?",
             "answer": "5",
             "split": "train",
         },
         {
-            "example_id": "example-1",
-            "trace_id": "trace-1",
+            "example_id": "trace-1",
             "source": "gsm8k",
             "question": "What is 2 + 3?",
             "answer": "wrong",
@@ -221,8 +336,7 @@ def test_frozen_trace_loader_rejects_duplicate_stable_ids(
     split_root = tmp_path / "splits"
     split_root.mkdir()
     row = {
-        "example_id": "example-1",
-        "trace_id": "trace-1",
+        "example_id": "trace-1",
         "source": "gsm8k",
         "question": "What is 2 + 3?",
         "answer": "5",

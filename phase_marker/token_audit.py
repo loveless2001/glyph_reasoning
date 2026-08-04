@@ -345,27 +345,24 @@ def _load_frozen_training_traces(output_root: Path) -> tuple[CanonicalTrace, ...
         raise ValueError("canonical trace pool has duplicate trace ids")
     selected: list[CanonicalTrace] = []
     seen_example_ids: set[str] = set()
-    seen_trace_ids: set[str] = set()
     for line_number, row in enumerate(read_jsonl(train_path), start=1):
         prefix = f"frozen train row {line_number}"
         if row.get("split") != "train":
             raise ValueError(f"{prefix} must have split='train'")
-        example_id = _frozen_row_text(row, "example_id", prefix)
-        trace_id = _frozen_row_text(row, "trace_id", prefix)
-        source = _frozen_row_text(row, "source", prefix)
+        trace_id = _frozen_row_text(row, "example_id", prefix)
+        # Recovered dataset source is integrity-bound by the parent split manifest;
+        # canonical traces retain their original legacy source label.
+        _frozen_row_text(row, "source", prefix)
         question = _frozen_row_text(row, "question", prefix)
         answer = _frozen_row_text(row, "answer", prefix)
-        if example_id in seen_example_ids:
-            raise ValueError(f"{prefix} has duplicate example_id {example_id!r}")
-        if trace_id in seen_trace_ids:
-            raise ValueError(f"{prefix} has duplicate trace_id {trace_id!r}")
+        if trace_id in seen_example_ids:
+            raise ValueError(f"{prefix} has duplicate example_id {trace_id!r}")
         trace = traces_by_id.get(trace_id)
         if trace is None:
-            raise ValueError(f"{prefix} references missing trace_id {trace_id!r}")
-        if (trace.source, trace.question, trace.answer) != (source, question, answer):
-            raise ValueError(f"{prefix} does not match source/question/answer for {trace_id!r}")
-        seen_example_ids.add(example_id)
-        seen_trace_ids.add(trace_id)
+            raise ValueError(f"{prefix} references missing canonical trace {trace_id!r}")
+        if (trace.question, trace.answer) != (question, answer):
+            raise ValueError(f"{prefix} does not match question/answer for {trace_id!r}")
+        seen_example_ids.add(trace_id)
         selected.append(trace)
     return tuple(selected)
 
@@ -382,18 +379,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     materialize = commands.add_parser("materialize")
     materialize.add_argument("--config", type=Path, required=True)
-    materialize.add_argument("--limit", type=int, required=True)
+    materialize.add_argument("--limit", type=int)
     materialize.add_argument("--output-root", type=Path, required=True)
     arguments = parser.parse_args(argv)
     if arguments.command == "materialize":
-        if arguments.limit < 1:
+        if arguments.limit is not None and arguments.limit < 1:
             raise SystemExit("--limit must be positive")
         config = ExperimentConfig.load(arguments.config)
-        traces = _load_frozen_training_traces(arguments.output_root)[: arguments.limit]
-        if len(traces) != arguments.limit:
+        traces = _load_frozen_training_traces(arguments.output_root)
+        if arguments.limit is not None and arguments.limit > len(traces):
             raise SystemExit(
                 f"frozen training split provides {len(traces)} canonical traces, need --limit {arguments.limit}"
             )
+        if arguments.limit is not None:
+            traces = traces[: arguments.limit]
         tokenizer = _load_cached_tokenizer(config.model_id)
         manifests = materialize_training_arms(config, traces, tokenizer, arguments.output_root)
         print(canonical_json({arm: manifest.artifact_id for arm, manifest in manifests.items()}))
