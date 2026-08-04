@@ -321,6 +321,12 @@ def run_stage_a_local(
     _require_complete_receipt_matrix(training_receipts, plan, "training")
 
     runs_client.reload()
+    training_receipts = _revalidate_completed_stage_outputs(
+        plan,
+        stage="train",
+        runs_client=runs_client,
+        expected=training_receipts,
+    )
     existing_selection = _revalidate_resume_selections(
         plan, resume=resume, runs_client=runs_client, existing=existing.selection
     )
@@ -348,9 +354,15 @@ def run_stage_a_local(
             )
     _require_complete_receipt_matrix(selection_receipts, plan, "selection")
 
+    runs_client.reload()
+    selection_receipts = _revalidate_completed_stage_outputs(
+        plan,
+        stage="selection",
+        runs_client=runs_client,
+        expected=selection_receipts,
+    )
     ordered_training = tuple(training_receipts[job.arm] for job in plan.jobs)
     ordered_selection = tuple(selection_receipts[job.arm] for job in plan.jobs)
-    runs_client.reload()
     summary = finalizer_function.remote(
         plan_payload, (*ordered_training, *ordered_selection)
     )
@@ -526,6 +538,46 @@ def _revalidate_resume_selections(
         if current["artifact_id"] != existing[job.arm]["artifact_id"]:
             raise ValueError(
                 f"canonical output changed during resume for selection/{job.arm}"
+            )
+        revalidated[job.arm] = current
+    return revalidated
+
+
+def _revalidate_completed_stage_outputs(
+    plan: PilotPlan,
+    *,
+    stage: str,
+    runs_client: VolumeClient,
+    expected: Mapping[str, Mapping[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Read every completed arm from the reloaded volume and bind its receipt."""
+    if stage not in {"train", "selection"}:
+        raise ValueError("completed Stage A stage is invalid")
+    _require_complete_receipt_matrix(expected, plan, stage)
+    plan_payload = pilot_plan_payload(plan)
+    revalidated: dict[str, dict[str, object]] = {}
+    for job in plan.jobs:
+        receipt_path = _volume_canonical_receipt_path(plan.run_id, stage, job.arm)
+        producer_path = _volume_producer_path(plan.run_id, stage, job.arm)
+        receipt = _read_volume_file_optional(runs_client, receipt_path)
+        entries = _list_volume_files_optional(runs_client, producer_path)
+        if receipt is None or not entries:
+            raise ValueError(
+                f"canonical output is missing after {stage} reload for {job.arm}"
+            )
+        current = _validate_volume_canonical_output(
+            plan_payload=plan_payload,
+            job=job,
+            stage=stage,
+            receipt_bytes=receipt,
+            entries=entries,
+            producer_path=producer_path,
+            runs_client=runs_client,
+            local_input_root=Path(plan.local_repo_root),
+        )
+        if current["artifact_id"] != expected[job.arm]["artifact_id"]:
+            raise ValueError(
+                f"canonical receipt artifact does not match {stage} return for {job.arm}"
             )
         revalidated[job.arm] = current
     return revalidated

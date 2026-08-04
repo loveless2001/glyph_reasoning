@@ -1545,20 +1545,42 @@ def test_execute_jobs_use_exact_commands_offline_env_and_promote_only_producers(
     input_root = tmp_path / "inputs"
     model_root = tmp_path / "model-cache"
     run_root = tmp_path / "runs"
+    ephemeral_root = tmp_path / "ephemeral"
+    ephemeral_root.mkdir()
     bundle = _stage_job_inputs(repo_fixture, input_root)
     snapshot, cache_manifest = _stage_job_model(qwen_snapshot, model_root)
     plan = _job_execution_plan(repo_fixture, bundle)
     job = plan.jobs[1]
     commands: list[tuple[list[str], dict[str, object]]] = []
     validated: list[tuple[str, str]] = []
+    workspaces: list[Path] = []
+    selection_parent_checks: list[tuple[bool, bool]] = []
+    device_paths: list[Path] = []
 
     def fake_subprocess(argv: list[str], **kwargs: object) -> SimpleNamespace:
         if argv[0] == "nvidia-smi":
             assert kwargs["timeout"] == 10
-            return SimpleNamespace(returncode=0, stdout="NVIDIA H100 80GB HBM3\n")
+            return SimpleNamespace(returncode=0, stdout="NVIDIA H200\n")
         commands.append((list(argv), dict(kwargs)))
         workspace = Path(str(kwargs["cwd"]))
+        workspaces.append(workspace)
+        (workspace / "unpublished-scratch.bin").write_bytes(b"scratch")
         output_flag = "--output-dir" if "phase_marker.training" in argv else "--output"
+        if output_flag == "--output":
+            training_parent = (
+                workspace
+                / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+            )
+            selection_parent_checks.append(
+                (
+                    training_parent.is_symlink(),
+                    all(
+                        path.stat().st_mode & 0o222 == 0
+                        for path in training_parent.rglob("*")
+                        if path.is_file()
+                    ),
+                )
+            )
         output = workspace / argv[argv.index(output_flag) + 1]
         output.mkdir(parents=True)
         if output_flag == "--output-dir":
@@ -1576,6 +1598,13 @@ def test_execute_jobs_use_exact_commands_offline_env_and_promote_only_producers(
         validated.append((stage, producer.name))
 
     monkeypatch.setattr(subprocess, "run", fake_subprocess)
+
+    def fake_filesystem_device(path: Path) -> int:
+        resolved = Path(path).resolve()
+        device_paths.append(resolved)
+        return 1 if resolved.is_relative_to(ephemeral_root) else 2
+
+    monkeypatch.setattr(modal_artifacts, "_filesystem_device", fake_filesystem_device)
     volume = CommitVolume()
     common = {
         "plan_payload": modal_plan.pilot_plan_payload(plan),
@@ -1585,6 +1614,7 @@ def test_execute_jobs_use_exact_commands_offline_env_and_promote_only_producers(
         "model_root": model_root,
         "run_root": run_root,
         "volume": volume,
+        "ephemeral_root": ephemeral_root,
         "environ": {"CUDA_VISIBLE_DEVICES": "0", "PATH": "/usr/bin"},
         "producer_validator": validate,
         "bf16_probe": lambda: True,
@@ -1604,11 +1634,31 @@ def test_execute_jobs_use_exact_commands_offline_env_and_promote_only_producers(
         assert env["TRANSFORMERS_OFFLINE"] == "1"
         assert env["HF_HUB_CACHE"] == str(snapshot.parents[2])
     assert validated == [("train", "glyph"), ("selection", "glyph")]
+    assert all(workspace.is_relative_to(ephemeral_root) for workspace in workspaces)
+    assert all(not workspace.is_relative_to(run_root) for workspace in workspaces)
+    assert selection_parent_checks == [(False, True)]
+    assert all(not path.is_relative_to(ephemeral_root) for path in device_paths)
     assert training["command"] == job.training_command
     assert selection["command"] == job.selection_command
     assert training["model_cache_artifact_id"] == cache_manifest.artifact_id
     assert selection["model_cache_artifact_id"] == cache_manifest.artifact_id
+    assert training["requested_gpu"] == "H100"
+    assert training["observed_gpu"] == "NVIDIA H200"
+    assert selection["requested_gpu"] == "H100"
+    assert selection["observed_gpu"] == "NVIDIA H200"
     assert training["promoted"] is True and selection["promoted"] is True
+    assert modal_artifacts.validate_job_receipt_payload(
+        receipt_payload=training,
+        plan_payload=modal_plan.pilot_plan_payload(plan),
+        job_payload=asdict(job),
+        stage="train",
+    )["artifact_id"] == training["artifact_id"]
+    assert modal_artifacts.validate_job_receipt_payload(
+        receipt_payload=selection,
+        plan_payload=modal_plan.pilot_plan_payload(plan),
+        job_payload=asdict(job),
+        stage="selection",
+    )["artifact_id"] == selection["artifact_id"]
     assert volume.commit_count == 2
 
     run = run_root / "runs" / plan.run_id
@@ -1621,6 +1671,10 @@ def test_execute_jobs_use_exact_commands_offline_env_and_promote_only_producers(
     assert not any(path.name.endswith(".log") for path in checkpoint.rglob("*"))
     assert not any("receipt" in path.name for path in selected.rglob("*"))
     assert len(list((run / "attempts").glob("*/logs/*.log"))) == 2
+    assert not list((run / "attempts").glob("*/workspace"))
+    assert not list((run / "attempts").rglob("unpublished-scratch.bin"))
+    assert not list((run / "attempts").rglob("bundle-manifest.json"))
+    assert not list((run / "attempts").rglob("adapter_model.safetensors"))
     assert len(list((run / "receipts/attempts").glob("*.json"))) == 2
     assert (run / "receipts/canonical/train/glyph.json").is_file()
     assert (run / "receipts/canonical/selection/glyph.json").is_file()
@@ -1637,6 +1691,8 @@ def test_job_validation_failure_persists_unpromoted_receipt_and_reraises(
     input_root = tmp_path / "inputs"
     model_root = tmp_path / "model-cache"
     run_root = tmp_path / "runs"
+    ephemeral_root = tmp_path / "ephemeral"
+    ephemeral_root.mkdir()
     bundle = _stage_job_inputs(repo_fixture, input_root)
     _stage_job_model(qwen_snapshot, model_root)
     plan = _job_execution_plan(repo_fixture, bundle)
@@ -1666,6 +1722,7 @@ def test_job_validation_failure_persists_unpromoted_receipt_and_reraises(
             model_root=model_root,
             run_root=run_root,
             volume=volume,
+            ephemeral_root=ephemeral_root,
             environ={"CUDA_VISIBLE_DEVICES": "0"},
             producer_validator=lambda *_: (_ for _ in ()).throw(
                 RuntimeError("producer rejected dot")
@@ -1682,6 +1739,8 @@ def test_job_validation_failure_persists_unpromoted_receipt_and_reraises(
     assert receipt["promoted"] is False
     assert "RuntimeError: producer rejected dot" in receipt["failure_reason"]
     assert len(list((run / "attempts").glob("*/logs/train.log"))) == 1
+    assert not list((run / "attempts").glob("*/workspace"))
+    assert not list((run / "attempts").rglob("adapter_model.safetensors"))
     assert not (run / "artifacts/phase-marker/checkpoints/pilot/seed-42/dot").exists()
     assert not (run / "receipts/canonical/train/dot.json").exists()
     assert volume.commit_count == 1
@@ -1698,6 +1757,8 @@ def test_job_subprocess_failure_without_outputs_still_persists_failed_receipt(
     input_root = tmp_path / "inputs"
     model_root = tmp_path / "model-cache"
     run_root = tmp_path / "runs"
+    ephemeral_root = tmp_path / "ephemeral"
+    ephemeral_root.mkdir()
     bundle = _stage_job_inputs(repo_fixture, input_root)
     _stage_job_model(qwen_snapshot, model_root)
     plan = _job_execution_plan(repo_fixture, bundle)
@@ -1721,6 +1782,7 @@ def test_job_subprocess_failure_without_outputs_still_persists_failed_receipt(
             model_root=model_root,
             run_root=run_root,
             volume=volume,
+            ephemeral_root=ephemeral_root,
             environ={"CUDA_VISIBLE_DEVICES": "0"},
             bf16_probe=lambda: True,
         )
@@ -1787,6 +1849,54 @@ def test_job_bf16_preflight_failure_still_persists_failed_receipt(
     assert volume.commit_count == 1
 
 
+def test_job_rejects_nonapproved_gpu_before_model_command_and_persists_failure(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a singular non-Hopper GPU could cross the model boundary."""
+    code_root = Path(__file__).resolve().parents[2]
+    input_root = tmp_path / "inputs"
+    model_root = tmp_path / "model-cache"
+    run_root = tmp_path / "runs"
+    bundle = _stage_job_inputs(repo_fixture, input_root)
+    _stage_job_model(qwen_snapshot, model_root)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[4]
+    commands: list[list[str]] = []
+
+    def fake_subprocess(argv: list[str], **_: object) -> SimpleNamespace:
+        commands.append(argv)
+        return SimpleNamespace(returncode=0, stdout="NVIDIA A100-SXM4-80GB\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess)
+    volume = CommitVolume()
+    with pytest.raises(RuntimeError, match="H100 or H200"):
+        modal_artifacts.execute_pilot_job(
+            stage="train",
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            job_payload=asdict(job),
+            code_root=code_root,
+            input_root=input_root,
+            model_root=model_root,
+            run_root=run_root,
+            volume=volume,
+            environ={"CUDA_VISIBLE_DEVICES": "0"},
+            bf16_probe=lambda: pytest.fail("BF16 probe ran on rejected GPU"),
+        )
+
+    run = run_root / "runs" / plan.run_id
+    failed = list((run / "receipts/attempts").glob("*.json"))
+    assert len(failed) == 1
+    receipt = json.loads(failed[0].read_text(encoding="utf-8"))
+    assert receipt["requested_gpu"] == "H100"
+    assert receipt["observed_gpu"] == "NVIDIA A100-SXM4-80GB"
+    assert receipt["validated"] is False and receipt["promoted"] is False
+    assert commands == [["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]]
+    assert volume.commit_count == 1
+
+
 def test_selection_workspace_failure_still_persists_failed_receipt(
     repo_fixture: Path,
     qwen_snapshot: Path,
@@ -1845,6 +1955,8 @@ def test_job_publication_commit_failure_rolls_back_canonical_and_records_failure
     input_root = tmp_path / "inputs"
     model_root = tmp_path / "model-cache"
     run_root = tmp_path / "runs"
+    ephemeral_root = tmp_path / "ephemeral"
+    ephemeral_root.mkdir()
     bundle = _stage_job_inputs(repo_fixture, input_root)
     _stage_job_model(qwen_snapshot, model_root)
     plan = _job_execution_plan(repo_fixture, bundle)
@@ -1873,6 +1985,7 @@ def test_job_publication_commit_failure_rolls_back_canonical_and_records_failure
             model_root=model_root,
             run_root=run_root,
             volume=volume,
+            ephemeral_root=ephemeral_root,
             environ={"CUDA_VISIBLE_DEVICES": "0"},
             producer_validator=lambda *_: None,
             bf16_probe=lambda: True,
@@ -1891,6 +2004,8 @@ def test_job_publication_commit_failure_rolls_back_canonical_and_records_failure
     attempt = next((run / "attempts").iterdir())
     assert (attempt / "failed-publication/producer").is_dir()
     assert (attempt / "failed-publication/success-receipt.json").is_file()
+    assert not (attempt / "workspace").exists()
+    assert not list(attempt.rglob("bundle-manifest.json"))
     assert volume.commit_count == 2
 
 

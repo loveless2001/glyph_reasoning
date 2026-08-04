@@ -52,6 +52,7 @@ _SHA256_CHARS = frozenset("0123456789abcdef")
 _PILOT_KIND = "pilot"
 _PILOT_SEED = 42
 _WORKSPACE_METADATA = "workspace-metadata.json"
+_DEFAULT_EPHEMERAL_JOB_ROOT = Path("/tmp/phase-marker-pilot")
 _MODEL_CACHE_REQUIRED_FILES = (
     "config.json",
     "generation_config.json",
@@ -270,11 +271,17 @@ def prepare_ephemeral_workspace(
         training = Path(canonical_training_root).resolve()
         if not training.is_dir():
             raise ValueError("canonical training root is missing")
+        training_records = _source_output_records(training)
+        if not training_records:
+            raise ValueError("canonical training root is empty")
         target = (
             workspace / _ARTIFACT_ROOT / "checkpoints" / _PILOT_KIND
             / f"seed-{_PILOT_SEED}" / arm
         )
-        _symlink_exact_path(training, target, directory=True)
+        shutil.copytree(training, target, copy_function=shutil.copy2)
+        if _source_output_records(target) != training_records:
+            raise ValueError("ephemeral training parent copy does not match canonical bytes")
+        _make_tree_read_only(target)
     _write_workspace_metadata(workspace, attempt_id, stage, arm)
     return workspace
 
@@ -285,16 +292,31 @@ def run_exact_command(
     workspace: Path,
     log_path: Path,
     env: Mapping[str, str],
+    durable_attempt_root: Path | None = None,
 ) -> int:
     """Run only a frozen pilot command from its isolated workspace, without a shell."""
     argv = _approved_command_argv(command)
     root = Path(workspace).resolve()
     if not root.is_dir():
         raise ValueError("workspace is missing")
-    attempt_root = _validate_workspace_metadata(root, argv)
+    workspace_attempt = _validate_workspace_metadata(root, argv)
+    attempt_root = (
+        workspace_attempt
+        if durable_attempt_root is None
+        else Path(durable_attempt_root).resolve()
+    )
+    if (
+        attempt_root.name != workspace_attempt.name
+        or attempt_root.parent.name != "attempts"
+    ):
+        raise ValueError("durable attempt root does not match ephemeral workspace")
     log = Path(log_path).resolve()
     logs_root = (attempt_root / "logs").resolve()
-    if log == logs_root or not _is_within(log, logs_root):
+    if (
+        log == logs_root
+        or not _is_within(log, logs_root)
+        or _is_within(log, root)
+    ):
         raise ValueError("log path must remain outside the ephemeral workspace")
     if any(not isinstance(key, str) or not isinstance(value, str) for key, value in env.items()):
         raise ValueError("subprocess environment must contain string keys and values")
@@ -456,6 +478,7 @@ def execute_pilot_job(
     model_root: Path,
     run_root: Path,
     volume: VolumeClient,
+    ephemeral_root: Path = _DEFAULT_EPHEMERAL_JOB_ROOT,
     environ: Mapping[str, str] | None = None,
     producer_validator: Callable[..., None] | None = None,
     bf16_probe: Callable[[], bool] | None = None,
@@ -482,105 +505,140 @@ def execute_pilot_job(
     snapshot, cache_manifest = _validated_model_cache(model_root)
 
     attempt_id = create_attempt_id()
-    run = Path(run_root).resolve() / "runs" / str(plan_payload["run_id"])
+    run_mount = Path(run_root).resolve()
+    run = run_mount / "runs" / str(plan_payload["run_id"])
     training_root = run / _producer_relative_path("train", str(job["arm"]))
     attempt_root = run / "attempts" / attempt_id
     if attempt_root.exists():
         raise FileExistsError("fresh pilot attempt namespace already exists")
-    workspace = attempt_root / "workspace"
     command = str(job["training_command"] if stage == "train" else job["selection_command"])
     started = datetime.now(timezone.utc)
     started_clock = time.monotonic()
     log_path = attempt_root / "logs" / f"{stage}.log"
-    producer = workspace / _producer_relative_path(stage, str(job["arm"]))
     canonical = run / _producer_relative_path(stage, str(job["arm"]))
     command_env = dict(os.environ if environ is None else environ)
+    ephemeral = Path(ephemeral_root).resolve()
     observed_gpu: str | None = None
     exit_status = 1
     published = False
     attempt_receipt_path: Path | None = None
     canonical_receipt_path: Path | None = None
+    failed_records: tuple[tuple[str, str], ...] = ()
     try:
-        prepared = prepare_ephemeral_workspace(
-            code_root=code,
-            input_root=bundle_root,
-            run_root=run,
-            bundle=bundle,
-            stage=stage,
-            arm=str(job["arm"]),
-            attempt_id=attempt_id,
-            canonical_training_root=(
-                training_root if stage == "selection" else None
-            ),
-        )
-        if prepared.resolve() != workspace.resolve():
-            raise ValueError("pilot attempt workspace path is noncanonical")
-        _require_one_visible_cuda_device(command_env)
-        observed_gpu = _observe_gpu_name()
-        supports_bf16 = _torch_bf16_supported if bf16_probe is None else bf16_probe
-        if supports_bf16() is not True:
-            raise RuntimeError("pilot job requires BF16 support")
-        command_env.update(
-            {
-                "HF_HUB_OFFLINE": "1",
-                "TRANSFORMERS_OFFLINE": "1",
-                "HF_HUB_CACHE": str(snapshot.parents[2]),
-            }
-        )
-        exit_status = run_exact_command(
-            command, workspace=workspace, log_path=log_path, env=command_env
-        )
-        if exit_status != 0:
-            raise RuntimeError(
-                f"{stage} job for {job['arm']} exited with status {exit_status}"
-            )
-        validator = _validate_job_producer if producer_validator is None else producer_validator
-        if producer_validator is None:
-            with _offline_model_cache(snapshot.parents[2]):
-                validator(stage, producer, plan_payload, job)
-        else:
-            validator(stage, producer, plan_payload, job)
-        records = _source_output_records(producer)
-        if not records:
-            raise ValueError("pilot job producer output is empty")
-        receipt = _job_attempt_receipt(
-            stage=stage,
-            plan_payload=plan_payload,
-            job=job,
-            attempt_id=attempt_id,
-            command=command,
-            cache_artifact_id=cache_manifest.artifact_id,
-            observed_gpu=observed_gpu,
-            started=started,
-            elapsed_seconds=max(0.0, time.monotonic() - started_clock),
-            exit_status=0,
-            validated=True,
-            promoted=True,
-            records=records,
-            failure_reason=None,
-        )
-        promote_validated_output(producer, workspace.parent, canonical, receipt)
-        published = True
-        attempt_receipt_path = _write_attempt_receipt_in_namespace(run, receipt)
-        canonical_receipt_path = _link_canonical_receipt(
-            run, receipt, attempt_receipt_path
-        )
-        volume.commit()
-        return _receipt_payload(receipt, include_artifact_id=True)
+        if (
+            ephemeral == run_mount
+            or ephemeral.is_relative_to(run_mount)
+            or run_mount.is_relative_to(ephemeral)
+        ):
+            raise ValueError("ephemeral job root must be outside the run volume")
+        ephemeral.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=f"phase-marker-{stage}-{job['arm']}-", dir=ephemeral
+        ) as temporary:
+            local_attempts = Path(temporary)
+            workspace = local_attempts / "attempts" / attempt_id / "workspace"
+            producer = workspace / _producer_relative_path(stage, str(job["arm"]))
+            try:
+                prepared = prepare_ephemeral_workspace(
+                    code_root=code,
+                    input_root=bundle_root,
+                    run_root=local_attempts,
+                    bundle=bundle,
+                    stage=stage,
+                    arm=str(job["arm"]),
+                    attempt_id=attempt_id,
+                    canonical_training_root=(
+                        training_root if stage == "selection" else None
+                    ),
+                )
+                if prepared.resolve() != workspace.resolve():
+                    raise ValueError("pilot attempt workspace path is noncanonical")
+                _require_one_visible_cuda_device(command_env)
+                observed_gpu = _observe_gpu_name()
+                if not _is_approved_observed_gpu(observed_gpu):
+                    raise RuntimeError(
+                        "pilot job requires exactly one observed H100 or H200 GPU"
+                    )
+                supports_bf16 = (
+                    _torch_bf16_supported if bf16_probe is None else bf16_probe
+                )
+                if supports_bf16() is not True:
+                    raise RuntimeError("pilot job requires BF16 support")
+                command_env.update(
+                    {
+                        "HF_HUB_OFFLINE": "1",
+                        "TRANSFORMERS_OFFLINE": "1",
+                        "HF_HUB_CACHE": str(snapshot.parents[2]),
+                    }
+                )
+                exit_status = run_exact_command(
+                    command,
+                    workspace=workspace,
+                    log_path=log_path,
+                    env=command_env,
+                    durable_attempt_root=attempt_root,
+                )
+                if exit_status != 0:
+                    raise RuntimeError(
+                        f"{stage} job for {job['arm']} exited with status {exit_status}"
+                    )
+                validator = (
+                    _validate_job_producer
+                    if producer_validator is None
+                    else producer_validator
+                )
+                if producer_validator is None:
+                    with _offline_model_cache(snapshot.parents[2]):
+                        validator(stage, producer, plan_payload, job)
+                else:
+                    validator(stage, producer, plan_payload, job)
+                records = _source_output_records(producer)
+                if not records:
+                    raise ValueError("pilot job producer output is empty")
+                receipt = _job_attempt_receipt(
+                    stage=stage,
+                    plan_payload=plan_payload,
+                    job=job,
+                    attempt_id=attempt_id,
+                    command=command,
+                    cache_artifact_id=cache_manifest.artifact_id,
+                    observed_gpu=observed_gpu,
+                    started=started,
+                    elapsed_seconds=max(0.0, time.monotonic() - started_clock),
+                    exit_status=0,
+                    validated=True,
+                    promoted=True,
+                    records=records,
+                    failure_reason=None,
+                )
+                promote_validated_output(producer, attempt_root, canonical, receipt)
+                published = True
+                attempt_receipt_path = _write_attempt_receipt_in_namespace(run, receipt)
+                canonical_receipt_path = _link_canonical_receipt(
+                    run, receipt, attempt_receipt_path
+                )
+                volume.commit()
+                return _receipt_payload(receipt, include_artifact_id=True)
+            except Exception:
+                if producer.is_dir():
+                    try:
+                        failed_records = _source_output_records(producer)
+                    except Exception:
+                        failed_records = ()
+                raise
     except Exception as error:
         if isinstance(error, _JobPublicationRollbackError):
             _append_failure_log(log_path, error)
             raise
         try:
             _quarantine_failed_job_publication(
-                attempt_root=workspace.parent,
+                attempt_root=attempt_root,
                 canonical=canonical,
                 published=published,
                 attempt_receipt_path=attempt_receipt_path,
                 canonical_receipt_path=canonical_receipt_path,
             )
             _append_failure_log(log_path, error)
-            records = _source_output_records(producer) if producer.is_dir() else ()
             failed = _job_attempt_receipt(
                 stage=stage,
                 plan_payload=plan_payload,
@@ -594,7 +652,7 @@ def execute_pilot_job(
                 exit_status=exit_status,
                 validated=False,
                 promoted=False,
-                records=records,
+                records=failed_records,
                 failure_reason=f"{type(error).__name__}: {error}",
             )
             _write_attempt_receipt_in_namespace(run, failed)
@@ -721,9 +779,16 @@ def _observe_gpu_name() -> str:
         shell=False,
     )
     names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if len(names) != 1 or "H100" not in names[0]:
-        raise RuntimeError("pilot job requires exactly one observed H100 GPU")
+    if len(names) != 1:
+        raise RuntimeError("pilot job requires exactly one observed H100 or H200 GPU")
     return names[0]
+
+
+def _is_approved_observed_gpu(name: object) -> bool:
+    if not isinstance(name, str) or not name or "\n" in name or "\r" in name:
+        return False
+    tokens = name.upper().replace("-", " ").split()
+    return sum(token in {"H100", "H200"} for token in tokens) == 1
 
 
 def _require_one_visible_cuda_device(environ: Mapping[str, str]) -> None:
@@ -1003,7 +1068,7 @@ def validate_job_receipt_payload(
         or receipt.dependency_lock_hash != plan_payload["dependency_lock_hash"]
         or receipt.requested_gpu != "H100"
         or receipt.observed_gpu is None
-        or "H100" not in receipt.observed_gpu
+        or not _is_approved_observed_gpu(receipt.observed_gpu)
         or receipt.timeout_seconds != 14_400
         or receipt.exit_status != 0
         or receipt.validated is not True
@@ -1493,9 +1558,19 @@ def _validate_promotion_paths(
         raise ValueError("attempt destination does not match receipt identity")
     run_root = attempt_root.parent.parent
     producer = _producer_relative_path(receipt.stage, receipt.arm)
-    expected_source = (attempt_root / "workspace" / producer).resolve()
+    try:
+        source_workspace = source.parents[len(producer.parts) - 1]
+    except IndexError as error:
+        raise ValueError("promotion source does not match receipt identity") from error
+    source_attempt = source_workspace.parent
+    expected_source = (source_attempt / "workspace" / producer).resolve()
     expected_canonical = (run_root / producer).resolve()
-    if source != expected_source:
+    if (
+        source_workspace.name != "workspace"
+        or source_attempt.name != receipt.attempt_id
+        or source_attempt.parent.name != "attempts"
+        or source != expected_source
+    ):
         raise ValueError("promotion source does not match receipt identity")
     if canonical_root != expected_canonical:
         raise ValueError("canonical destination does not match receipt stage and arm")
@@ -1527,6 +1602,14 @@ def _source_output_records(root: Path) -> tuple[tuple[str, str], ...]:
         if path.is_file():
             records.append((path.relative_to(root).as_posix(), _file_sha256(path)))
     return tuple(records)
+
+
+def _make_tree_read_only(root: Path) -> None:
+    """Make an already-validated local copy immutable to the producer command."""
+    path = Path(root)
+    for candidate in sorted(path.rglob("*"), reverse=True):
+        candidate.chmod(0o555 if candidate.is_dir() else 0o444)
+    path.chmod(0o555)
 
 
 def _filesystem_device(path: Path) -> int:

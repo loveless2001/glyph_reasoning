@@ -1412,12 +1412,14 @@ class StageAMapFunction:
         events: list[tuple[object, ...]],
         *,
         before_first: Callable[[], None] | None = None,
+        after_result: Callable[[str], None] | None = None,
     ) -> None:
         self.stage = stage
         self.results = results
         self.events = events
         self.calls: list[dict[str, object]] = []
         self.before_first = before_first
+        self.after_result = after_result
 
     def map(self, payloads: object) -> object:
         items = list(payloads)
@@ -1435,6 +1437,8 @@ class StageAMapFunction:
                 result = self.results[arm]
                 if isinstance(result, Exception):
                     raise RuntimeError(f"{arm}: {result}") from result
+                if self.after_result is not None:
+                    self.after_result(arm)
                 yield result
 
         return results()
@@ -1609,6 +1613,72 @@ def _canonical_stage_a_files(
     return files, receipt_payload
 
 
+def _canonical_stage_a_publications(
+    plan: modal_plan.PilotPlan, stage: str,
+) -> tuple[dict[str, dict[str, bytes]], dict[str, dict[str, object]]]:
+    files_by_arm: dict[str, dict[str, bytes]] = {}
+    receipts: dict[str, dict[str, object]] = {}
+    for job in plan.jobs:
+        files, receipt = _canonical_stage_a_files(plan, job, stage)
+        files_by_arm[job.arm] = files
+        receipts[job.arm] = receipt
+    return files_by_arm, receipts
+
+
+def _publishing_stage_a_function(
+    plan: modal_plan.PilotPlan,
+    stage: str,
+    events: list[tuple[object, ...]],
+    runs: StageARunsClient,
+    *,
+    before_first: Callable[[], None] | None = None,
+) -> tuple[StageAMapFunction, dict[str, dict[str, object]]]:
+    publications, receipts = _canonical_stage_a_publications(plan, stage)
+    function = StageAMapFunction(
+        stage,
+        receipts,
+        events,
+        before_first=before_first,
+        after_result=lambda arm: runs.files.update(publications[arm]),
+    )
+    return function, receipts
+
+
+def _damage_stage_a_publication(
+    publications: dict[str, dict[str, bytes]],
+    receipts: dict[str, dict[str, object]],
+    *,
+    stage: str,
+    arm: str,
+    fault: str,
+) -> None:
+    receipt_suffix = f"/receipts/canonical/{stage}/{arm}.json"
+    receipt_path = next(
+        path for path in publications[arm] if path.endswith(receipt_suffix)
+    )
+    if fault == "missing":
+        publications[arm].pop(receipt_path)
+        return
+    if fault == "corrupt":
+        manifest_name = "run-manifest.json" if stage == "train" else "manifest.json"
+        manifest_path = next(
+            path for path in publications[arm] if path.endswith(f"/{manifest_name}")
+        )
+        publications[arm][manifest_path] = b'{"corrupt":true}\n'
+        return
+    if fault == "mismatched":
+        persisted = dict(receipts[arm])
+        persisted["attempt_id"] = f"post-reload-{stage}-{arm}"
+        unsigned = dict(persisted)
+        unsigned.pop("artifact_id")
+        persisted["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+        publications[arm][receipt_path] = (
+            canonical_json(persisted) + "\n"
+        ).encode("utf-8")
+        return
+    raise AssertionError(f"unsupported Stage A publication fault: {fault}")
+
+
 def _stage_a_summary(
     plan: modal_plan.PilotPlan,
     training: dict[str, dict[str, object]],
@@ -1635,23 +1705,22 @@ def test_stage_a_validates_all_training_before_selection_and_stops(
 ) -> None:
     """Would fail if selection overlapped training validation or behavior was invoked."""
     plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
-    training_results = {job.arm: _stage_a_receipt(plan, job, "train") for job in plan.jobs}
-    selection_results = {
-        job.arm: _stage_a_receipt(plan, job, "selection") for job in plan.jobs
-    }
     events: list[tuple[object, ...]] = []
-    training = StageAMapFunction("train", training_results, events)
-    selection = StageAMapFunction(
+    runs = StageARunsClient({}, events)
+    training, training_results = _publishing_stage_a_function(
+        plan, "train", events, runs
+    )
+    selection, selection_results = _publishing_stage_a_function(
+        plan,
         "selection",
-        selection_results,
         events,
+        runs,
         before_first=lambda: (
             events.count(("validated", "train")) == 6
             or pytest.fail("selection began before six training receipts were validated")
         ),
     )
     finalizer = StageAFinalizer(_stage_a_summary(plan, training_results, selection_results), events)
-    runs = EmptyStageARunsClient(events)
     real_validate = modal_artifacts.validate_job_receipt_payload
 
     def validate(*args: object, **kwargs: object) -> dict[str, object]:
@@ -1660,6 +1729,20 @@ def test_stage_a_validates_all_training_before_selection_and_stops(
         return result
 
     monkeypatch.setattr(imported_adapter, "validate_job_receipt_payload", validate)
+    monkeypatch.setattr(
+        imported_adapter, "validate_canonical_job_semantics", lambda **_: None
+    )
+    real_validate_canonical = imported_adapter._validate_volume_canonical_output
+
+    def validate_canonical(**kwargs: object) -> dict[str, object]:
+        result = real_validate_canonical(**kwargs)
+        job = kwargs["job"]
+        events.append(("canonical-validated", kwargs["stage"], job.arm))
+        return result
+
+    monkeypatch.setattr(
+        imported_adapter, "_validate_volume_canonical_output", validate_canonical
+    )
     monkeypatch.setattr(
         imported_adapter,
         "apply_approved_app_tags",
@@ -1687,6 +1770,74 @@ def test_stage_a_validates_all_training_before_selection_and_stops(
     assert events.index(("tags", plan.run_id)) < first_gpu
     assert sum(event[0] in {"train", "selection"} for event in events) == 12
     assert all(event[0] != "behavior" for event in events)
+    completed_validations = [
+        event for event in events if event[0] == "canonical-validated"
+    ]
+    assert completed_validations == [
+        *(("canonical-validated", "train", job.arm) for job in plan.jobs),
+        *(("canonical-validated", "selection", job.arm) for job in plan.jobs),
+    ]
+
+
+@pytest.mark.parametrize("completed_stage", ("train", "selection"))
+@pytest.mark.parametrize("fault", ("missing", "corrupt", "mismatched"))
+def test_stage_a_post_reload_canonical_failure_aborts_before_next_stage(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completed_stage: str,
+    fault: str,
+) -> None:
+    """Would fail if a remote return could substitute for canonical volume evidence."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    events: list[tuple[object, ...]] = []
+    runs = StageARunsClient({}, events)
+    training_files, training_results = _canonical_stage_a_publications(plan, "train")
+    selection_files, selection_results = _canonical_stage_a_publications(plan, "selection")
+    target = plan.jobs[-1].arm
+    if completed_stage == "train":
+        _damage_stage_a_publication(
+            training_files, training_results,
+            stage="train", arm=target, fault=fault,
+        )
+    else:
+        _damage_stage_a_publication(
+            selection_files, selection_results,
+            stage="selection", arm=target, fault=fault,
+        )
+    training = StageAMapFunction(
+        "train", training_results, events,
+        after_result=lambda arm: runs.files.update(training_files[arm]),
+    )
+    selection = StageAMapFunction(
+        "selection", selection_results, events,
+        after_result=lambda arm: runs.files.update(selection_files[arm]),
+    )
+    finalizer = StageAFinalizer(
+        _stage_a_summary(plan, training_results, selection_results), events
+    )
+    monkeypatch.setattr(
+        imported_adapter, "validate_canonical_job_semantics", lambda **_: None
+    )
+    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", lambda _: None)
+
+    with pytest.raises(ValueError, match="canonical|receipt|artifact|output"):
+        imported_adapter.run_stage_a_local(
+            plan,
+            approved_run_id=plan.run_id,
+            budget_acknowledged=True,
+            resume=False,
+            training_function=training,
+            selection_function=selection,
+            finalizer_function=finalizer,
+            runs_client=runs,
+        )
+
+    if completed_stage == "train":
+        assert selection.calls == []
+    else:
+        assert len(selection.calls) == 6
+    assert finalizer.calls == []
 
 
 def test_training_failure_prevents_every_selection(
@@ -1740,16 +1891,25 @@ def test_selection_failure_prevents_cpu_finalization(
 ) -> None:
     """Would fail if an incomplete selection matrix could publish a stop summary."""
     plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
-    training_results = {job.arm: _stage_a_receipt(plan, job, "train") for job in plan.jobs}
-    selection_results: dict[str, object] = {
-        job.arm: _stage_a_receipt(plan, job, "selection") for job in plan.jobs
-    }
-    selection_results["dot"] = RuntimeError("selection boom")
     events: list[tuple[object, ...]] = []
-    training = StageAMapFunction("train", training_results, events)
-    selection = StageAMapFunction("selection", selection_results, events)
+    runs = StageARunsClient({}, events)
+    training, _ = _publishing_stage_a_function(plan, "train", events, runs)
+    selection_files, complete_selection = _canonical_stage_a_publications(
+        plan, "selection"
+    )
+    selection_results: dict[str, object] = dict(complete_selection)
+    selection_results["dot"] = RuntimeError("selection boom")
+    selection = StageAMapFunction(
+        "selection",
+        selection_results,
+        events,
+        after_result=lambda arm: runs.files.update(selection_files[arm]),
+    )
     finalizer = StageAFinalizer({}, events)
     monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", lambda _: None)
+    monkeypatch.setattr(
+        imported_adapter, "validate_canonical_job_semantics", lambda **_: None
+    )
 
     with pytest.raises(RuntimeError, match="dot.*selection boom"):
         imported_adapter.run_stage_a_local(
@@ -1760,7 +1920,7 @@ def test_selection_failure_prevents_cpu_finalization(
             training_function=training,
             selection_function=selection,
             finalizer_function=finalizer,
-            runs_client=EmptyStageARunsClient(events),
+            runs_client=runs,
         )
     assert len(training.calls) == 6
     assert finalizer.calls == []
@@ -1805,25 +1965,30 @@ def test_explicit_resume_revalidates_existing_and_schedules_only_missing_arms(
     """Would fail if resume reused quarantine or overwrote already-canonical arms."""
     plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
     files: dict[str, bytes] = {}
-    existing_training: dict[str, dict[str, object]] = {}
     for job in plan.jobs[:2]:
-        arm_files, receipt = _canonical_stage_a_files(plan, job, "train")
+        arm_files, _ = _canonical_stage_a_files(plan, job, "train")
         files.update(arm_files)
-        existing_training[job.arm] = receipt
     failed_attempt = f"/runs/{plan.run_id}/attempts/failed-dot/receipt.json"
     files[failed_attempt] = b'{"validated":false,"promoted":false}\n'
     original_files = dict(files)
     events: list[tuple[object, ...]] = []
     runs = StageARunsClient(files, events)
-    training_results = {job.arm: _stage_a_receipt(plan, job, "train") for job in plan.jobs}
-    selection_results = {
-        job.arm: _stage_a_receipt(plan, job, "selection") for job in plan.jobs
-    }
-    combined_training = {**training_results, **existing_training}
-    training = StageAMapFunction("train", training_results, events)
-    selection = StageAMapFunction("selection", selection_results, events)
+    training_files, training_results = _canonical_stage_a_publications(plan, "train")
+    selection_files, selection_results = _canonical_stage_a_publications(plan, "selection")
+    training = StageAMapFunction(
+        "train",
+        training_results,
+        events,
+        after_result=lambda arm: runs.files.update(training_files[arm]),
+    )
+    selection = StageAMapFunction(
+        "selection",
+        selection_results,
+        events,
+        after_result=lambda arm: runs.files.update(selection_files[arm]),
+    )
     finalizer = StageAFinalizer(
-        _stage_a_summary(plan, combined_training, selection_results), events
+        _stage_a_summary(plan, training_results, selection_results), events
     )
     validated_existing: list[tuple[str, str]] = []
     real_validate = modal_artifacts.validate_canonical_job_output
@@ -1836,6 +2001,9 @@ def test_explicit_resume_revalidates_existing_and_schedules_only_missing_arms(
 
     monkeypatch.setattr(
         imported_adapter, "validate_canonical_job_output", validate_existing
+    )
+    monkeypatch.setattr(
+        imported_adapter, "validate_canonical_job_semantics", lambda **_: None
     )
     monkeypatch.setattr(
         imported_adapter,
@@ -1860,12 +2028,17 @@ def test_explicit_resume_revalidates_existing_and_schedules_only_missing_arms(
     assert [payload["job"]["arm"] for payload in selection.calls] == [
         "semantic", "glyph", "dot", "random", "direct", "filler"
     ]
-    assert validated_existing == [("train", "semantic"), ("train", "glyph")]
+    assert validated_existing == [
+        ("train", "semantic"),
+        ("train", "glyph"),
+        *(("train", job.arm) for job in plan.jobs),
+        *(("selection", job.arm) for job in plan.jobs),
+    ]
     printed = json.loads(capsys.readouterr().out)
     assert printed["resume"] is True
     assert printed["missing_training_arms"] == ["dot", "random", "direct", "filler"]
     assert summary["stopped_before_behavior"] is True
-    assert runs.files == original_files
+    assert all(runs.files[path] == content for path, content in original_files.items())
     assert runs.files[failed_attempt] == original_files[failed_attempt]
 
 
