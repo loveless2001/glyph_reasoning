@@ -152,6 +152,20 @@ Use three dedicated named volumes:
 GPU jobs mount input and model volumes read-only. They write only to the run
 volume. No launcher path uses the legacy `glyph-reasoning-vol` or `/vol/work`.
 
+The run volume uses disjoint namespaces:
+
+```text
+/runs/<run-id>/attempts/<stage>/<arm>/<attempt-id>/
+/runs/<run-id>/artifacts/phase-marker/checkpoints/pilot/seed-42/<arm>/
+/runs/<run-id>/artifacts/phase-marker/checkpoint-selections/pilot/seed-42/<arm>/
+/runs/<run-id>/receipts/<stage>/<arm>/<attempt-id>.json
+/runs/<run-id>/logs/<stage>/<arm>/<attempt-id>.log
+/runs/<run-id>/summary/
+```
+
+Receipts and logs never enter a producer's canonical checkpoint or selection
+directory because adding them there would change the producer's directory hash.
+
 Modal Volumes require explicit visibility coordination. Producers commit after
 a validated publish; consumers reload before reading a producer's new output.
 Concurrent jobs write disjoint arm-specific subtrees, and the design permits at
@@ -289,7 +303,9 @@ itself certify scientific correctness; repository gates remain authoritative.
 ## Failure and Resume Semantics
 
 - Canonical outputs are immutable and never overwritten.
-- Every invocation writes to a unique attempt path first.
+- Every container execution generates a unique attempt ID at container start
+  and writes to that attempt path first. A platform reschedule therefore gets a
+  new attempt ID even if Modal retains the parent invocation identifier.
 - Nonzero exit, timeout, exception, failed validator, or incomplete receipt
   leaves the attempt quarantined and unpromoted.
 - A rescheduled or manually repeated invocation that sees a partial attempt
