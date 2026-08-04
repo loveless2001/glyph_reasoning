@@ -83,10 +83,18 @@ def test_records_preserve_ordered_raw_outputs_and_are_independently_rescorable()
     )
     requests = (
         GenerationRequest(
-            "generation-1", "prompt 1", (11, 12), 64, {"seed": 42, "checkpoint": "ckpt"}
+            "generation-1",
+            "prompt 1",
+            (11, 12),
+            64,
+            {"seed": 42, "adapter_seed": 42, "checkpoint": "ckpt"},
         ),
         GenerationRequest(
-            "generation-2", "prompt 2", (21, 22), 64, {"seed": 42, "checkpoint": "ckpt"}
+            "generation-2",
+            "prompt 2",
+            (21, 22),
+            64,
+            {"seed": 42, "adapter_seed": 42, "checkpoint": "ckpt"},
         ),
     )
     outputs = (
@@ -111,7 +119,11 @@ def test_records_reject_missing_duplicate_or_reordered_output_ids():
     cell = EvaluationCell("primary", "glyph", "glyph", None, "greedy")
     example = DatasetExample("gsm8k", "test", "one", "1 + 1", "2", "question-1")
     request = GenerationRequest(
-        "generation-1", "prompt", (1,), 64, {"seed": 42, "checkpoint": "ckpt"}
+        "generation-1",
+        "prompt",
+        (1,),
+        64,
+        {"seed": 42, "adapter_seed": 42, "checkpoint": "ckpt"},
     )
     duplicate = GenerationOutput("generation-1", "Final answer: 2", (2,), ())
     with pytest.raises(ValueError, match="unique"):
@@ -134,7 +146,12 @@ def test_sampled_cells_expand_to_five_deterministic_independent_completions(conf
     )
 
     requests = build_generation_requests(
-        cell, examples, config, checkpoint="fake://glyph", fake=True
+        cell,
+        examples,
+        config,
+        checkpoint="fake://glyph",
+        adapter_seed=42,
+        fake=True,
     )
 
     assert len(requests) == 10
@@ -153,7 +170,12 @@ def test_sampled_cells_expand_to_five_deterministic_independent_completions(conf
     assert all(request.decoding["temperature"] == 0.7 for request in requests)
     assert all(request.decoding["top_p"] == 0.95 for request in requests)
     assert requests == build_generation_requests(
-        cell, examples, config, checkpoint="fake://glyph", fake=True
+        cell,
+        examples,
+        config,
+        checkpoint="fake://glyph",
+        adapter_seed=42,
+        fake=True,
     )
 
     sampling_parameters = [_vllm_sampling_parameters((request,)) for request in requests]
@@ -168,6 +190,7 @@ def test_sampled_cells_expand_to_five_deterministic_independent_completions(conf
         request.generation_id for request in requests
     ]
     assert [record.gold_answer for record in records] == ["2"] * 5 + ["4"] * 5
+    assert [record.seed for record in records] == [42] * 10
 
 
 def test_vllm_sampling_parameters_retain_the_request_sample_seed(config):
@@ -180,7 +203,12 @@ def test_vllm_sampling_parameters_retain_the_request_sample_seed(config):
     parameters = _vllm_sampling_parameters(
         (
             build_generation_requests(
-                cell, examples, config, checkpoint="fake://glyph", fake=True
+                cell,
+                examples,
+                config,
+                checkpoint="fake://glyph",
+                adapter_seed=42,
+                fake=True,
             )[0],
         )
     )
@@ -206,6 +234,7 @@ def test_production_request_construction_rejects_fake_tokenizer_or_checkpoint(co
             tokenize=lambda _: (1,),
             tokenizer_revision="wrong-revision",
             split_manifest=split_manifest,
+            adapter_seed=101,
         )
     with pytest.raises(ValueError, match="checkpoint"):
         build_generation_requests(
@@ -213,6 +242,23 @@ def test_production_request_construction_rejects_fake_tokenizer_or_checkpoint(co
             examples,
             config,
             checkpoint="unconfigured://checkpoint",
+            tokenize=lambda _: (1,),
+            tokenizer_revision=QWEN25_7B_TOKENIZER_REVISION,
+            split_manifest=split_manifest,
+            adapter_seed=101,
+        )
+
+
+def test_production_request_construction_requires_explicit_adapter_seed(config, split_manifest):
+    split_manifest = replace(split_manifest, config_hash=sha256_json(asdict(config)))
+    cell = EvaluationCell("primary", "glyph", "glyph", None, "greedy")
+    example = DatasetExample("gsm8k", "test", "one", "1 + 1", "2", "question-1")
+    with pytest.raises(ValueError, match="adapter seed"):
+        build_generation_requests(
+            cell,
+            (example,),
+            config,
+            checkpoint="/checkpoints/glyph",
             tokenize=lambda _: (1,),
             tokenizer_revision=QWEN25_7B_TOKENIZER_REVISION,
             split_manifest=split_manifest,
@@ -227,6 +273,7 @@ def test_vllm_preflight_rejects_fake_or_unpinned_requests_before_import():
         64,
         {
             "seed": 42,
+            "adapter_seed": 42,
             "checkpoint": "fake://glyph",
             "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
             "run_kind": "production",
@@ -249,13 +296,16 @@ def test_vllm_preflight_rejects_fake_or_unpinned_requests_before_import():
 
 def test_vllm_backend_binds_every_request_checkpoint_to_its_model_before_import():
     with pytest.raises(ValueError, match="real checkpoint"):
-        VLLMGenerationBackend("fake://glyph")
+        VLLMGenerationBackend("fake://glyph", adapter_seed=42)
     with pytest.raises(ValueError, match="real checkpoint"):
-        VLLMGenerationBackend("unconfigured://checkpoint")
+        VLLMGenerationBackend("unconfigured://checkpoint", adapter_seed=42)
+    with pytest.raises(ValueError, match="adapter seed"):
+        VLLMGenerationBackend("/checkpoints/glyph-final")
 
-    backend = VLLMGenerationBackend("/checkpoints/glyph-final")
+    backend = VLLMGenerationBackend("/checkpoints/glyph-final", adapter_seed=42)
     shared = {
         "seed": 42,
+        "adapter_seed": 42,
         "run_kind": "production",
         "config_hash": "a" * 64,
         "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
@@ -278,6 +328,13 @@ def test_vllm_backend_binds_every_request_checkpoint_to_its_model_before_import(
     )
     with pytest.raises(ValueError, match="backend model"):
         backend.generate((matching, mismatched))
+    wrong_seed = replace(
+        matching,
+        generation_id="wrong-seed",
+        decoding={**matching.decoding, "adapter_seed": 101},
+    )
+    with pytest.raises(ValueError, match="backend adapter seed"):
+        backend.generate((matching, wrong_seed))
 
 
 def test_provenance_envelope_rejects_empty_or_mismatched_production_lineage(
@@ -302,6 +359,7 @@ def test_provenance_envelope_rejects_empty_or_mismatched_production_lineage(
         completion_token_ids=(2,),
         decoding={
             "run_kind": "production",
+            "adapter_seed": 42,
             "config_hash": sha256_json(asdict(config)),
             "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
             "split_artifact_id": split_manifest.artifact_id,
@@ -328,3 +386,5 @@ def test_provenance_envelope_rejects_empty_or_mismatched_production_lineage(
             config,
             split_manifest,
         )
+    with pytest.raises(ValueError, match="adapter seed"):
+        build_provenance_envelope(replace(record, seed=101), config, split_manifest)

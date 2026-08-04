@@ -73,6 +73,7 @@ class GenerationOutput:
 @dataclass(frozen=True)
 class ProvenanceEnvelope:
     run_kind: str
+    adapter_seed: int
     config_hash: str
     tokenizer_revision: str
     split_artifact_id: str
@@ -108,10 +109,15 @@ class FakeGenerationBackend:
 class VLLMGenerationBackend:
     """Lazy production adapter; importing this module never imports or loads vLLM."""
 
-    def __init__(self, model: str, **llm_kwargs: object) -> None:
+    def __init__(
+        self, model: str, *, adapter_seed: int | None = None, **llm_kwargs: object
+    ) -> None:
         if not _is_production_checkpoint(model):
             raise ValueError("vLLM backend requires a real checkpoint model identifier")
+        if not isinstance(adapter_seed, int) or isinstance(adapter_seed, bool):
+            raise ValueError("vLLM backend requires an explicit integer adapter seed")
         self._model = model
+        self._adapter_seed = adapter_seed
         self._llm_kwargs = dict(llm_kwargs)
         self._llm: Any | None = None
 
@@ -123,6 +129,8 @@ class VLLMGenerationBackend:
             _validate_production_request(request)
             if request.decoding["checkpoint"] != self._model:
                 raise ValueError("vLLM request checkpoint must exactly match backend model")
+            if request.decoding["adapter_seed"] != self._adapter_seed:
+                raise ValueError("vLLM request must match backend adapter seed")
         if self._llm is None:
             from vllm import LLM  # Imported only when the production backend is used.
 
@@ -190,10 +198,13 @@ def records_from_outputs(
     _validate_outputs(requests, outputs)
     rows: list[GenerationRecord] = []
     for example, request, output in zip(expanded_examples, requests, outputs):
-        seed = request.decoding.get("seed")
+        sampling_seed = request.decoding.get("seed")
+        adapter_seed = request.decoding.get("adapter_seed")
         checkpoint = request.decoding.get("checkpoint")
-        if not isinstance(seed, int) or isinstance(seed, bool):
+        if not isinstance(sampling_seed, int) or isinstance(sampling_seed, bool):
             raise ValueError("generation request decoding must include integer seed")
+        if not isinstance(adapter_seed, int) or isinstance(adapter_seed, bool):
+            raise ValueError("generation request decoding must include integer adapter seed")
         if not isinstance(checkpoint, str) or not checkpoint:
             raise ValueError("generation request decoding must include checkpoint")
         decoding = dict(request.decoding)
@@ -212,7 +223,7 @@ def records_from_outputs(
                 question_hash=example.question_hash,
                 gold_answer=example.answer,
                 training_arm=cell.training_arm,
-                seed=seed,
+                seed=adapter_seed,
                 checkpoint=checkpoint,
                 prompt_condition=cell.prompt_condition,
                 prompt_hash=_text_hash(request.prompt),
@@ -236,9 +247,14 @@ def build_generation_requests(
     tokenize: Callable[[str], Sequence[int]] | None = None,
     tokenizer_revision: str | None = None,
     split_manifest: ArtifactManifest | None = None,
+    adapter_seed: int | None = None,
     fake: bool = False,
 ) -> tuple[GenerationRequest, ...]:
     """Expand each sampled prompt into five independently persisted requests."""
+    if not isinstance(adapter_seed, int) or isinstance(adapter_seed, bool):
+        raise ValueError("request construction requires an explicit integer adapter seed")
+    if adapter_seed not in (config.pilot_seed, *config.confirmatory_seeds):
+        raise ValueError("adapter seed is not declared by the experiment config")
     if fake:
         if not checkpoint.startswith("fake://"):
             raise ValueError("fake request construction requires a fake:// checkpoint")
@@ -252,7 +268,12 @@ def build_generation_requests(
         split_parent_hashes: tuple[str, ...] = ()
     else:
         _validate_production_construction(
-            config, checkpoint, tokenize, tokenizer_revision, split_manifest
+            config,
+            checkpoint,
+            tokenize,
+            tokenizer_revision,
+            split_manifest,
+            adapter_seed,
         )
         assert tokenize is not None
         assert tokenizer_revision is not None
@@ -274,7 +295,8 @@ def build_generation_requests(
         )
         for completion_index in range(completion_count):
             decoding: dict[str, object] = {
-                "seed": config.pilot_seed + completion_index,
+                "seed": adapter_seed + completion_index,
+                "adapter_seed": adapter_seed,
                 "checkpoint": checkpoint,
                 "run_kind": run_kind,
                 "config_hash": config_hash,
@@ -335,6 +357,7 @@ def _validate_envelope_binding(record: GenerationRecord, provenance: ProvenanceE
         raise ValueError("provenance parent hashes do not match generation record")
     bindings = {
         "run_kind": provenance.run_kind,
+        "adapter_seed": provenance.adapter_seed,
         "config_hash": provenance.config_hash,
         "tokenizer_revision": provenance.tokenizer_revision,
         "split_artifact_id": provenance.split_artifact_id,
@@ -357,8 +380,13 @@ def build_provenance_envelope(
     tokenizer_revision = record.decoding.get("tokenizer_revision")
     split_artifact_id = record.decoding.get("split_artifact_id")
     split_parent_hashes = tuple(record.decoding.get("split_parent_hashes", ()))
+    adapter_seed = record.decoding.get("adapter_seed")
     if not all(isinstance(value, str) and value for value in (config_hash, tokenizer_revision, split_artifact_id)):
         raise ValueError("record provenance requires config, tokenizer, and split identifiers")
+    if not isinstance(adapter_seed, int) or isinstance(adapter_seed, bool):
+        raise ValueError("record provenance requires an integer adapter seed")
+    if record.seed != adapter_seed:
+        raise ValueError("generation record adapter seed does not match request provenance")
     if run_kind == PRODUCTION_RUN_KIND:
         expected_config_hash = sha256_json(asdict(config))
         if config_hash != expected_config_hash or split_manifest.config_hash != expected_config_hash:
@@ -379,6 +407,7 @@ def build_provenance_envelope(
             raise ValueError("fake provenance must use explicit smoke lineage")
     return ProvenanceEnvelope(
         run_kind=str(run_kind),
+        adapter_seed=adapter_seed,
         config_hash=str(config_hash),
         tokenizer_revision=str(tokenizer_revision),
         split_artifact_id=str(split_artifact_id),
@@ -412,6 +441,7 @@ def _vllm_sampling_parameters(requests: Sequence[GenerationRequest]) -> dict[str
         raise ValueError("vLLM sampling parameters require one independent request")
     ignored = {
         "checkpoint",
+        "adapter_seed",
         "fake_answer",
         "completion_index",
         "run_kind",
@@ -432,6 +462,7 @@ def _validate_production_construction(
     tokenize: Callable[[str], Sequence[int]] | None,
     tokenizer_revision: str | None,
     split_manifest: ArtifactManifest | None,
+    adapter_seed: int,
 ) -> None:
     if not _is_production_checkpoint(checkpoint):
         raise ValueError("production request construction requires a real checkpoint")
@@ -444,6 +475,8 @@ def _validate_production_construction(
     expected_config_hash = sha256_json(asdict(config))
     if split_manifest.config_hash != expected_config_hash:
         raise ValueError("production request construction requires matching split config hash")
+    if adapter_seed not in (config.pilot_seed, *config.confirmatory_seeds):
+        raise ValueError("production request construction requires a declared adapter seed")
 
 
 def _validate_production_request(request: GenerationRequest) -> None:
@@ -453,6 +486,9 @@ def _validate_production_request(request: GenerationRequest) -> None:
         raise ValueError("vLLM request checkpoint must be real")
     if request.decoding.get("tokenizer_revision") != QWEN25_7B_TOKENIZER_REVISION:
         raise ValueError("vLLM request tokenizer revision is not pinned")
+    adapter_seed = request.decoding.get("adapter_seed")
+    if not isinstance(adapter_seed, int) or isinstance(adapter_seed, bool):
+        raise ValueError("vLLM request lacks integer adapter seed")
     if not isinstance(request.decoding.get("config_hash"), str):
         raise ValueError("vLLM request lacks config hash")
     if not isinstance(request.decoding.get("split_artifact_id"), str):
@@ -543,7 +579,12 @@ def _dry_run(arguments: argparse.Namespace) -> int:
     rows: list[dict[str, object]] = []
     for cell in build_behavior_matrix(config, split_manifest):
         requests = build_generation_requests(
-            cell, examples, config, checkpoint=f"fake://{cell.training_arm}", fake=True
+            cell,
+            examples,
+            config,
+            checkpoint=f"fake://{cell.training_arm}",
+            adapter_seed=config.pilot_seed,
+            fake=True,
         )
         records = records_from_outputs(
             cell,
