@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 from pathlib import Path
+import shlex
 
 from phase_marker.config import ExperimentConfig
 from phase_marker.io import canonical_json
@@ -123,7 +124,9 @@ def build_pilot_plan(
         config_path=config_path,
         approval=approval,
     )
-    jobs = _validate_manifest_jobs(manifest_jobs, config, approval, resources)
+    jobs = _validate_manifest_jobs(
+        manifest_jobs, config, approval, resources, config_path, artifact_root
+    )
     split = _validate_split_manifest(artifact_root, config)
     materialization_ids = _validate_materializations(
         artifact_root, config, split.artifact_id
@@ -195,6 +198,8 @@ def _validate_manifest_jobs(
     config: ExperimentConfig,
     approval: ApprovalMetadata,
     resources: StageAResources,
+    config_path: Path,
+    artifact_root: Path,
 ) -> tuple[PilotJob, ...]:
     if len(manifest_jobs) != len(_EXPECTED_ARMS):
         raise ValueError("pilot command manifest must contain exactly six jobs")
@@ -226,12 +231,18 @@ def _validate_manifest_jobs(
 
         training_command = _required_command(item.get("command"), "training")
         selection_command = _required_command(item.get("selection_command"), "selection")
-        _validate_command_scope(training_command, selection_command)
+        expected_training, expected_selection = _expected_commands(
+            config_path, artifact_root, config.pilot_seed, expected_arm
+        )
+        if shlex.split(training_command) != expected_training:
+            raise ValueError("pilot training command is not the approved form")
+        if shlex.split(selection_command) != expected_selection:
+            raise ValueError("pilot selection command is not the approved form")
         expected_outputs = item["expected_outputs"]
         if (
             not isinstance(expected_outputs, list)
-            or len(expected_outputs) != 5
-            or not all(isinstance(path, str) and path for path in expected_outputs)
+            or expected_outputs
+            != _expected_outputs(artifact_root, config.pilot_seed, expected_arm)
         ):
             raise ValueError("pilot command manifest expected outputs are invalid")
         jobs.append(
@@ -253,22 +264,44 @@ def _required_command(value: object, command_type: str) -> str:
     return value
 
 
-def _validate_command_scope(training_command: str, selection_command: str) -> None:
-    if "phase_marker.training train" not in training_command:
-        raise ValueError("pilot training command is invalid")
-    if "phase_marker.behavior select" not in selection_command:
-        raise ValueError("pilot selection command is invalid")
-    commands = f"{training_command}\n{selection_command}"
-    if any(
-        forbidden in commands
-        for forbidden in (
-            "--kind confirmatory",
-            "phase_marker.behavior run",
-            "phase_marker.activations",
-            "phase_marker.interventions",
-        )
-    ):
-        raise ValueError("pilot command manifest contains excluded behavior or mechanism work")
+def _expected_commands(
+    config_path: Path, artifact_root: Path, seed: int, arm: str
+) -> tuple[list[str], list[str]]:
+    output_dir = artifact_root / "checkpoints" / _PILOT_KIND / f"seed-{seed}" / arm
+    manifest = output_dir / "run-manifest.json"
+    selection_output = (
+        artifact_root / "checkpoint-selections" / _PILOT_KIND / f"seed-{seed}" / arm
+    )
+    return (
+        [
+            "./.venv/bin/python", "-m", "phase_marker.training", "train",
+            "--config", str(config_path), "--arm", arm, "--seed", str(seed),
+            "--data", str(artifact_root / "training-data" / f"{arm}.jsonl"),
+            "--output-dir", str(output_dir), "--manifest", str(manifest),
+        ],
+        [
+            "./.venv/bin/python", "-m", "phase_marker.behavior", "select",
+            "--config", str(config_path), "--kind", _PILOT_KIND, "--seed", str(seed),
+            "--arm", arm, "--split-manifest",
+            str(artifact_root / "splits" / "manifest.json"), "--validation-examples",
+            str(artifact_root / "splits" / "validation.jsonl"), "--training-manifest",
+            str(manifest), "--backend", "vllm", "--output", str(selection_output),
+        ],
+    )
+
+
+def _expected_outputs(artifact_root: Path, seed: int, arm: str) -> list[str]:
+    output_dir = artifact_root / "checkpoints" / _PILOT_KIND / f"seed-{seed}" / arm
+    selection_output = (
+        artifact_root / "checkpoint-selections" / _PILOT_KIND / f"seed-{seed}" / arm
+    )
+    return [
+        str(output_dir / "adapter_config.json"),
+        str(output_dir / "adapter_model.safetensors"),
+        str(output_dir / "run-manifest.json"),
+        str(selection_output / "manifest.json"),
+        str(selection_output / "evidence.jsonl"),
+    ]
 
 
 def _is_sha256(value: object) -> bool:

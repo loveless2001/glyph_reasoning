@@ -145,6 +145,32 @@ def test_pilot_plan_rejects_mutated_manifest_contract(
 
 
 @pytest.mark.parametrize(
+    "extra_command",
+    [
+        pytest.param("phase_marker.synthetic build", id="synthetic"),
+        pytest.param("phase_marker.activations capture", id="capture"),
+        pytest.param("phase_marker.interventions run", id="intervention"),
+    ],
+)
+def test_pilot_plan_rejects_an_added_excluded_command(
+    monkeypatch: pytest.MonkeyPatch,
+    prepared_artifacts: Path,
+    extra_command: str,
+) -> None:
+    real_manifest = modal_plan.build_command_manifest
+
+    def mutated(*args: object, **kwargs: object) -> tuple[dict[str, object], ...]:
+        jobs = [dict(job) for job in real_manifest(*args, **kwargs)]
+        jobs[0]["selection_command"] += f"; ./.venv/bin/python -m {extra_command}"
+        return tuple(jobs)
+
+    monkeypatch.setattr(modal_plan, "build_command_manifest", mutated)
+
+    with pytest.raises(ValueError):
+        _plan(prepared_artifacts)
+
+
+@pytest.mark.parametrize(
     ("source_hash", "dependency_lock_hash"),
     [
         ("not-a-sha", LOCK_HASH),
