@@ -259,9 +259,22 @@ def _write_checkpoint_selections(root: Path, config: ExperimentConfig) -> None:
                 "path": str(checkpoint_path), "checkpoint_hash": checkpoint_hash, "step": 100,
                 "strict_accuracy": 0.5, "mean_gold_answer_logprob": -1.0, "row_count": 600,
             }
+            selection_path = (
+                root / "checkpoint-selections" / "confirmatory" / f"seed-{seed}" / f"{arm}.json"
+            )
+            evidence_path = selection_path.with_suffix(".evidence.jsonl")
+            validation_rows = [json.loads(line) for line in validation_examples.read_text().splitlines()]
+            evidence_path.parent.mkdir(parents=True, exist_ok=True)
+            evidence_path.write_text("".join(canonical_json({
+                "example_id": row["example_id"], "question_hash": row["question_hash"],
+                "checkpoint_id": checkpoint_hash, "checkpoint_path": str(checkpoint_path),
+                "strict_correct": index % 2 == 0,
+                "gold_answer_logprob_contribution": -1.0,
+            }) + "\n" for index, row in enumerate(validation_rows)), encoding="utf-8")
             payload = {
                 "schema_version": 1, "kind": "phase_marker_checkpoint_selection",
                 "evidence_scope": "experiment", "backend": "vllm",
+                "model_id": config.model_id, "model_revision": QWEN25_7B_TOKENIZER_REVISION,
                 "config_hash": sha256_json(asdict(config)), "run_kind": "confirmatory",
                 "arm": arm, "seed": seed, "selected_on": "validation",
                 "criterion": {
@@ -275,13 +288,15 @@ def _write_checkpoint_selections(root: Path, config: ExperimentConfig) -> None:
                 "validation_examples_hash": hashlib.sha256(validation_examples.read_bytes()).hexdigest(),
                 "training_manifest_file": str(training_path), "training_manifest_hash": training_hash,
                 "materialization_artifact_id": materialization_id, "candidates": [candidate],
+                "evidence_file": str(evidence_path),
+                "evidence_hash": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
                 "selected_path": str(checkpoint_path), "selected_checkpoint_hash": checkpoint_hash,
                 "selected_step": 100,
                 "parent_hashes": [split_id, materialization_id, training_hash], "completed": True,
             }
             payload["artifact_id"] = sha256_json(payload)
             _write_json(
-                root / "checkpoint-selections" / "confirmatory" / f"seed-{seed}" / f"{arm}.json",
+                selection_path,
                 payload,
             )
 
@@ -291,7 +306,19 @@ def _write_behavior_and_audit(root: Path, config: ExperimentConfig) -> tuple[Pat
     generation_root = root / "raw-generations" / "confirmatory"
     generation_root.mkdir(parents=True)
     records = [
-        {"generation_id": f"audit:{source}:{index}", "source": source}
+        {
+            "generation_id": f"audit:{source}:{index}", "source": source,
+            "question_hash": sha256_json(f"{source}:{index}"), "training_arm": "glyph",
+            "seed": 101, "prompt_condition": "glyph", "gold_answer": "1",
+            "extracted_answer": "1", "score": {
+                "generation_id": f"audit:{source}:{index}", "source": source,
+                "question_hash": sha256_json(f"{source}:{index}"), "training_arm": "glyph",
+                "seed": 101, "prompt_condition": "glyph", "gold_answer": "1",
+                "extracted_answer": "1", "normalized_gold": "1",
+                "normalized_prediction": "1", "correct": True, "parse_error": None,
+                "equivalence_reason": "numeric_equivalent",
+            },
+        }
         for source in ("gsm8k", "svamp", "math") for index in range(100)
     ]
     records_path = generation_root / "records.jsonl"
@@ -321,9 +348,9 @@ def _write_behavior_and_audit(root: Path, config: ExperimentConfig) -> tuple[Pat
     labels_path = root / "audit" / "manual-labels.tsv"
     labels_path.parent.mkdir(parents=True)
     labels_path.write_text(
-        "generation_id\tsource\tmanual_correct\n"
+        "generation_id\tsource\tquestion_hash\ttraining_arm\tseed\tprompt_condition\tgold_answer\textracted_answer\tauto_correct\tmanual_correct\n"
         + "".join(
-            f"audit:{source}:{index}\t{source}\ttrue\n"
+            f"audit:{source}:{index}\t{source}\t{sha256_json(f'{source}:{index}')}\tglyph\t101\tglyph\t1\t1\ttrue\ttrue\n"
             for source in ("gsm8k", "svamp", "math") for index in range(100)
         ),
         encoding="utf-8",
@@ -423,11 +450,15 @@ def test_command_manifest_binds_operator_supplied_approval_metadata(
 ) -> None:
     approval = ApprovalMetadata(
         hardware="1x NVIDIA H100 80GB",
-        max_duration_hours=6.0,
-        estimated_gpu_hours=4.5,
+        max_duration_hours=9.0,
+        training_gpu_hours=4.5,
+        selection_gpu_hours=1.0,
+        behavior_gpu_hours=2.0,
         spend_cap_usd=25.0,
         estimated_spend_usd=18.0,
-        evaluation_workload="six-arm pilot training only; no evaluation generation",
+        workload_schema_version=1, training_jobs=6, checkpoint_selection_jobs=6,
+        behavior_evaluation_jobs=1, manual_audit_rows=300, statistics_jobs=1,
+        mechanism_jobs_excluded=True,
     )
     jobs = build_command_manifest(
         config,
@@ -443,6 +474,20 @@ def test_command_manifest_binds_operator_supplied_approval_metadata(
         any(path.endswith(f"/{job['arm']}.json") for path in job["expected_outputs"])
         for job in jobs
     )
+
+
+def test_command_manifest_rejects_approval_workload_undercount(
+    tmp_path: Path, config: ExperimentConfig
+) -> None:
+    approval = ApprovalMetadata(
+        hardware="1x H100", max_duration_hours=4, training_gpu_hours=1,
+        selection_gpu_hours=1, behavior_gpu_hours=1, spend_cap_usd=10,
+        estimated_spend_usd=8, workload_schema_version=1, training_jobs=5,
+        checkpoint_selection_jobs=6, behavior_evaluation_jobs=1,
+        manual_audit_rows=300, statistics_jobs=1, mechanism_jobs_excluded=True,
+    )
+    with pytest.raises(ValueError, match="counts"):
+        build_command_manifest(config, tmp_path, kind="pilot", seeds=(42,), approval=approval)
 
 
 @pytest.mark.parametrize("stage", pipeline_module.STAGES)
@@ -470,8 +515,11 @@ def test_each_successful_stage_constructs_only_its_requested_commands(
         {"seed": 42, "counts": {"train": 8, "validation": 4, "test": 4}},
     )
     approval = ApprovalMetadata(
-        hardware="1x H100", max_duration_hours=2, estimated_gpu_hours=2,
-        spend_cap_usd=10, estimated_spend_usd=8, evaluation_workload="bounded fixture",
+        hardware="1x H100", max_duration_hours=4, training_gpu_hours=1,
+        selection_gpu_hours=1, behavior_gpu_hours=1,
+        spend_cap_usd=10, estimated_spend_usd=8, workload_schema_version=1,
+        training_jobs=6, checkpoint_selection_jobs=6, behavior_evaluation_jobs=1,
+        manual_audit_rows=300, statistics_jobs=1, mechanism_jobs_excluded=True,
     )
 
     result = pipeline_module._run_gate(
@@ -729,6 +777,27 @@ def test_behavior_gate_requires_complete_validation_selection_matrix(
     assert "selection" in result.reason
 
 
+def test_behavior_gate_rejects_omitted_declared_checkpoint_candidate(
+    tmp_path: Path, config: ExperimentConfig
+) -> None:
+    _write_split(tmp_path, config)
+    _write_materializations(tmp_path, config)
+    _write_training_runs(tmp_path, config)
+    _write_checkpoint_selections(tmp_path, config)
+    path = tmp_path / "checkpoint-selections/confirmatory/seed-101/glyph.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["candidates"] = []
+    payload["artifact_id"] = sha256_json(
+        {key: value for key, value in payload.items() if key != "artifact_id"}
+    )
+    _write_json(path, payload)
+
+    result = run_gate("behavior", config, tmp_path)
+
+    assert result.passed is False
+    assert "candidate" in result.reason
+
+
 @pytest.mark.parametrize(
     "stage",
     ("render", "tokenize", "train", "behavior", "audit", "statistics", "capture", "intervene"),
@@ -883,3 +952,25 @@ def test_statistics_gate_rejects_label_not_bound_to_behavior_generation(
 
     assert result.passed is False
     assert "behavior generation" in result.reason
+
+
+def test_statistics_gate_rejects_flipped_label_with_forged_claimed_metrics(
+    tmp_path: Path, config: ExperimentConfig
+) -> None:
+    _, audit_path = _write_behavior_and_audit(tmp_path, config)
+    payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    labels_path = Path(payload["labels_file"])
+    labels_path.write_text(
+        labels_path.read_text(encoding="utf-8").replace("\ttrue\ttrue\n", "\ttrue\tfalse\n", 1),
+        encoding="utf-8",
+    )
+    payload["labels_hash"] = hashlib.sha256(labels_path.read_bytes()).hexdigest()
+    payload["artifact_id"] = sha256_json(
+        {key: value for key, value in payload.items() if key != "artifact_id"}
+    )
+    _write_json(audit_path, payload)
+
+    result = run_gate("statistics", config, tmp_path)
+
+    assert result.passed is False
+    assert "row counts" in result.reason

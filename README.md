@@ -85,17 +85,29 @@ For example, the excluded pilot training gate is:
   --artifact-root artifacts/phase-marker \
   --hardware '1x A100 80GB' \
   --max-duration-hours 8 \
-  --estimated-gpu-hours 6 \
+  --training-gpu-hours 4 \
+  --selection-gpu-hours 1 \
+  --behavior-gpu-hours 1 \
   --spend-cap-usd 25 \
   --estimated-spend-usd 18 \
-  --evaluation-workload 'six pilot adapters plus frozen behavior evaluation'
+  --workload-schema-version 1 \
+  --training-jobs 6 \
+  --checkpoint-selection-jobs 6 \
+  --behavior-evaluation-jobs 1 \
+  --manual-audit-rows 300 \
+  --statistics-jobs 1 \
+  --mechanism-jobs-excluded
 ```
 
 That command only validates manifest hashes, lineage, counts, exclusions, and
 completion evidence, then prints the six exact GPU commands as data. It never
 launches them. A train, behavior, capture, or intervention gate fails closed
 unless every approval field above is present and the estimates remain within
-the declared duration and spend caps. The dry run remains planning-only and
+the declared duration and spend caps. Counts must exactly match the requested
+pilot (6 training and 6 selection jobs) or confirmatory (18 and 18) commands;
+training, selection, and behavior GPU-hours are separate and summed. Capture
+and intervention require a later approval and are explicitly excluded here.
+The dry run remains planning-only and
 never reports approval readiness.
 
 Behavior runs additionally require the immutable split manifest, exact example
@@ -104,7 +116,13 @@ seed/arm pair. The approval manifest includes a separate `behavior select`
 workload for each adapter: it scores every training-manifest-declared
 checkpoint on the validation split only, ranks strict exact-answer accuracy,
 then teacher-forced mean gold-answer log probability, then earliest step. The
-selected PEFT adapter must name the frozen Qwen base model and revision;
+candidate set must match the declared checkpoints one-for-one. Each selection
+binds a hashed JSONL with per-example ID, question hash, checkpoint ID, strict
+score, and full gold-continuation log-probability contribution; consumers
+recompute the candidate aggregates. Production selection and behavior accept
+only the canonical sibling `validation.jsonl` and `test.jsonl` files from a
+fully recomputed split envelope. The selected PEFT adapter must name the frozen
+Qwen base model and revision;
 production behavior loads that base with vLLM LoRA enabled and supplies the
 selected adapter as a `LoRARequest`.
 

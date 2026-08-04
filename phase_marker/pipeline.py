@@ -42,12 +42,11 @@ CANONICAL_CONFIRMATORY_SEEDS = (101, 202, 303)
 DEFAULT_CONFIG_PATH = Path("configs/phase-marker-qwen25-7b.toml")
 _SHA256_LENGTH = 64
 _APPROVAL_FIELDS = (
-    "hardware",
-    "max_duration_hours",
-    "estimated_gpu_hours",
-    "spend_cap_usd",
-    "estimated_spend_usd",
-    "evaluation_workload",
+    "hardware", "max_duration_hours", "training_gpu_hours",
+    "selection_gpu_hours", "behavior_gpu_hours", "spend_cap_usd",
+    "estimated_spend_usd", "workload_schema_version", "training_jobs",
+    "checkpoint_selection_jobs", "behavior_evaluation_jobs",
+    "manual_audit_rows", "statistics_jobs", "mechanism_jobs_excluded",
 )
 _BEHAVIOR_MANIFEST_FIELDS = frozenset(
     {
@@ -95,17 +94,27 @@ class GateResult:
 class ApprovalMetadata:
     hardware: str
     max_duration_hours: float
-    estimated_gpu_hours: float
+    training_gpu_hours: float
+    selection_gpu_hours: float
+    behavior_gpu_hours: float
     spend_cap_usd: float
     estimated_spend_usd: float
-    evaluation_workload: str
+    workload_schema_version: int
+    training_jobs: int
+    checkpoint_selection_jobs: int
+    behavior_evaluation_jobs: int
+    manual_audit_rows: int
+    statistics_jobs: int
+    mechanism_jobs_excluded: bool
 
     def __post_init__(self) -> None:
-        if not self.hardware.strip() or not self.evaluation_workload.strip():
-            raise ValueError("approval hardware and evaluation workload must be nonempty")
+        if not self.hardware.strip() or self.workload_schema_version != 1:
+            raise ValueError("approval hardware and workload schema must be explicit")
         numeric = (
             self.max_duration_hours,
-            self.estimated_gpu_hours,
+            self.training_gpu_hours,
+            self.selection_gpu_hours,
+            self.behavior_gpu_hours,
             self.spend_cap_usd,
             self.estimated_spend_usd,
         )
@@ -116,10 +125,22 @@ class ApprovalMetadata:
             for value in numeric
         ):
             raise ValueError("approval duration, GPU-hours, and spend values must be positive")
-        if self.estimated_gpu_hours > self.max_duration_hours:
-            raise ValueError("estimated GPU-hours cannot exceed the maximum duration")
+        if self.total_gpu_hours > self.max_duration_hours:
+            raise ValueError("total estimated GPU-hours cannot exceed the maximum duration")
         if self.estimated_spend_usd > self.spend_cap_usd:
             raise ValueError("estimated spend cannot exceed the spend cap")
+        counts = (
+            self.training_jobs, self.checkpoint_selection_jobs,
+            self.behavior_evaluation_jobs, self.manual_audit_rows, self.statistics_jobs,
+        )
+        if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in counts):
+            raise ValueError("approval workload counts must be positive integers")
+        if self.mechanism_jobs_excluded is not True:
+            raise ValueError("capture/intervention work must be explicitly excluded")
+
+    @property
+    def total_gpu_hours(self) -> float:
+        return self.training_gpu_hours + self.selection_gpu_hours + self.behavior_gpu_hours
 
 
 class GateFailure(ValueError):
@@ -183,6 +204,9 @@ def build_command_manifest(
     requested_arms = tuple(config.arms if arms is None else arms)
     if requested_arms != tuple(config.arms):
         raise ValueError("command manifests require all six configured arms in frozen order")
+    expected_jobs = len(seeds) * len(requested_arms)
+    if approval is not None:
+        _validate_approval_workload(approval, expected_jobs)
     jobs: list[dict[str, object]] = []
     for seed in seeds:
         for arm in requested_arms:
@@ -224,7 +248,7 @@ def build_command_manifest(
                     ),
                     "approval": None if approval is None else asdict(approval),
                     "estimated_gpu_hours": (
-                        None if approval is None else approval.estimated_gpu_hours
+                        None if approval is None else approval.training_gpu_hours / expected_jobs
                     ),
                     "command": shlex.join(arguments),
                     "selection_command": shlex.join((
@@ -357,6 +381,11 @@ def _run_gate(
             tuple(dict.fromkeys(checked)),
             (),
         )
+    if approval is not None:
+        try:
+            _validate_approval_workload(approval, len(seeds) * len(config.arms))
+        except ValueError as error:
+            return GateResult(stage, False, str(error), tuple(dict.fromkeys(checked)), ())
     commands = _commands_for_stage(
         stage,
         config,
@@ -373,6 +402,19 @@ def _run_gate(
         tuple(dict.fromkeys(checked)),
         commands,
     )
+
+
+def _validate_approval_workload(
+    approval: ApprovalMetadata, expected_training_jobs: int
+) -> None:
+    if (
+        approval.training_jobs != expected_training_jobs
+        or approval.checkpoint_selection_jobs != expected_training_jobs
+        or approval.behavior_evaluation_jobs != 1
+        or approval.manual_audit_rows != 300
+        or approval.statistics_jobs != 1
+    ):
+        raise ValueError("approval workload counts do not match emitted experiment commands")
 
 
 @dataclass(frozen=True)
@@ -853,7 +895,15 @@ def _validate_audit_manifest(
     if payload.get("labels_hash") != _sha256_file(labels_path):
         raise GateFailure(f"audit label file hash mismatch: {path}")
     with labels_path.open(encoding="utf-8", newline="") as handle:
-        rows = list(csv.DictReader(handle, delimiter="\t"))
+        reader = csv.DictReader(handle, delimiter="\t")
+        expected_label_fields = [
+            "generation_id", "source", "question_hash", "training_arm", "seed",
+            "prompt_condition", "gold_answer", "extracted_answer", "auto_correct",
+            "manual_correct",
+        ]
+        if reader.fieldnames != expected_label_fields:
+            raise GateFailure("audit labels TSV must use the exact schema")
+        rows = list(reader)
     if not rows or any(not row.get("generation_id") or not row.get("source") for row in rows):
         raise GateFailure(f"audit labels TSV is malformed: {labels_path}")
     source_counts = Counter(row["source"] for row in rows)
@@ -866,24 +916,48 @@ def _validate_audit_manifest(
     behavior_rows = _jsonl_rows_required(
         behavior_path.parent / records_file, "behavior records"
     )
-    behavior_generations = {
-        row.get("generation_id"): row.get("source") for row in behavior_rows
-    }
+    scored_rows: dict[str, tuple[Mapping[str, Any], Mapping[str, Any]]] = {}
+    for row in behavior_rows:
+        score = row.get("score")
+        generation_id = row.get("generation_id")
+        if not isinstance(score, Mapping) or not isinstance(generation_id, str):
+            raise GateFailure("behavior records lack recomputable score evidence")
+        scored_rows[generation_id] = (row, score)
+    selected_ids: set[str] = set()
+    for source in ("gsm8k", "svamp", "math"):
+        candidates = [key for key, (row, _) in scored_rows.items() if row.get("source") == source]
+        candidates.sort(key=lambda key: (
+            hashlib.sha256(f"20260804\0{source}\0{key}".encode()).hexdigest(), key
+        ))
+        selected_ids.update(candidates[:100])
     label_ids = [row["generation_id"] for row in rows]
-    if len(label_ids) != len(set(label_ids)) or any(
-        behavior_generations.get(row["generation_id"]) != row["source"]
-        for row in rows
-    ):
+    if len(label_ids) != len(set(label_ids)) or set(label_ids) != selected_ids:
         raise GateFailure(
-            "audit labels must uniquely bind source-matched behavior generation IDs"
+            "audit labels must exactly bind the deterministic behavior generation sample"
         )
+    disagreements = 0
+    for row in rows:
+        envelope, score = scored_rows[row["generation_id"]]
+        expected_values = {
+            "source": envelope.get("source"), "question_hash": envelope.get("question_hash"),
+            "training_arm": envelope.get("training_arm"), "seed": str(envelope.get("seed")),
+            "prompt_condition": envelope.get("prompt_condition"),
+            "gold_answer": score.get("gold_answer"),
+            "extracted_answer": score.get("extracted_answer") or "",
+            "auto_correct": str(score.get("correct")).lower(),
+        }
+        if any(row[field] != value for field, value in expected_values.items()):
+            raise GateFailure("audit labels immutable score evidence mismatch")
+        if row["manual_correct"].strip().lower() not in {"true", "false"}:
+            raise GateFailure("audit manual_correct must be true or false")
+        disagreements += (row["manual_correct"].strip().lower() == "true") is not score.get("correct")
     if payload.get("row_count") != 300 or payload.get("source_counts") != dict(source_counts):
         raise GateFailure("audit manifest must bind the exact 300-row source counts")
     if payload.get("passed") is not True:
         raise GateFailure(f"audit completion marker did not pass: {path}")
-    disagreements = payload.get("disagreements")
+    claimed_disagreements = payload.get("disagreements")
     total = payload.get("total")
-    if not isinstance(disagreements, int) or total != 300:
+    if claimed_disagreements != disagreements or total != 300:
         raise GateFailure(f"audit row counts are malformed: {path}")
     rate = payload.get("rate")
     if not isinstance(rate, (int, float)) or rate != disagreements / total or rate > 0.01:
@@ -1452,10 +1526,18 @@ def _parser() -> argparse.ArgumentParser:
 def _add_approval_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hardware")
     parser.add_argument("--max-duration-hours", type=float)
-    parser.add_argument("--estimated-gpu-hours", type=float)
+    parser.add_argument("--training-gpu-hours", type=float)
+    parser.add_argument("--selection-gpu-hours", type=float)
+    parser.add_argument("--behavior-gpu-hours", type=float)
     parser.add_argument("--spend-cap-usd", type=float)
     parser.add_argument("--estimated-spend-usd", type=float)
-    parser.add_argument("--evaluation-workload")
+    parser.add_argument("--workload-schema-version", type=int)
+    parser.add_argument("--training-jobs", type=int)
+    parser.add_argument("--checkpoint-selection-jobs", type=int)
+    parser.add_argument("--behavior-evaluation-jobs", type=int)
+    parser.add_argument("--manual-audit-rows", type=int)
+    parser.add_argument("--statistics-jobs", type=int)
+    parser.add_argument("--mechanism-jobs-excluded", action="store_true", default=None)
 
 
 def _approval_from_arguments(arguments: argparse.Namespace) -> ApprovalMetadata | None:
@@ -1470,10 +1552,18 @@ def _approval_from_arguments(arguments: argparse.Namespace) -> ApprovalMetadata 
     return ApprovalMetadata(
         hardware=arguments.hardware,
         max_duration_hours=arguments.max_duration_hours,
-        estimated_gpu_hours=arguments.estimated_gpu_hours,
+        training_gpu_hours=arguments.training_gpu_hours,
+        selection_gpu_hours=arguments.selection_gpu_hours,
+        behavior_gpu_hours=arguments.behavior_gpu_hours,
         spend_cap_usd=arguments.spend_cap_usd,
         estimated_spend_usd=arguments.estimated_spend_usd,
-        evaluation_workload=arguments.evaluation_workload,
+        workload_schema_version=arguments.workload_schema_version,
+        training_jobs=arguments.training_jobs,
+        checkpoint_selection_jobs=arguments.checkpoint_selection_jobs,
+        behavior_evaluation_jobs=arguments.behavior_evaluation_jobs,
+        manual_audit_rows=arguments.manual_audit_rows,
+        statistics_jobs=arguments.statistics_jobs,
+        mechanism_jobs_excluded=arguments.mechanism_jobs_excluded,
     )
 
 

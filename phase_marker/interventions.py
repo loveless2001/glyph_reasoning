@@ -6,6 +6,7 @@ import argparse
 import copy
 import hashlib
 import json
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -965,12 +966,27 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    manifest = _smoke(args.output_root) if args.command == "smoke" else _run(args)
+    if args.command == "smoke":
+        manifest = _smoke(args.output_root)
+    else:
+        destination = args.output_root
+        if destination.exists():
+            raise FileExistsError(f"refusing to overwrite intervention output: {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            dir=destination.parent, prefix=f".{destination.name}-staging-"
+        ) as temporary:
+            staging = Path(temporary) / "publish"
+            args.output_root = staging
+            manifest = _run(args)
+            staging.replace(destination)
     print(canonical_json(manifest))
     return 0
 
 
 def _run(args: argparse.Namespace) -> dict[str, object]:
+    if args.output_root.exists():
+        raise FileExistsError(f"refusing to overwrite intervention output: {args.output_root}")
     if args.backend == "tiny-fixture" and not args.allow_test_backend:
         raise ValueError("tiny-fixture requires explicit --allow-test-backend")
     config = ExperimentConfig.load(args.config)
@@ -1024,6 +1040,35 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
                 or row[hash_field] != hashlib.sha256(batch_path.read_bytes()).hexdigest()
             ):
                 raise ValueError("aligned pair batch path or hash mismatch")
+    loaded_batches: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
+    if args.backend == "hf":
+        tensor_name = activation.get("tensor_file")
+        tensor_hash = activation.get("tensor_hash")
+        if not isinstance(tensor_name, str) or not isinstance(tensor_hash, str):
+            raise ValueError("activation tensor binding is missing")
+        tensor_path = args.activation_manifest.parent / tensor_name
+        if not tensor_path.is_file() or hashlib.sha256(tensor_path.read_bytes()).hexdigest() != tensor_hash:
+            raise ValueError("activation tensor path or hash mismatch")
+        activation_tensors = torch.load(tensor_path, map_location="cpu", weights_only=True)
+        if not isinstance(activation_tensors, Mapping) or set(activation_tensors) != {"residual", "attention"}:
+            raise ValueError("activation tensor payload is malformed")
+        for name, tensor in activation_tensors.items():
+            if not isinstance(tensor, torch.Tensor) or tensor.dtype not in {
+                torch.float16, torch.bfloat16, torch.float32, torch.float64
+            }:
+                raise ValueError(f"activation {name} tensor is malformed")
+        if activation.get("checkpoint_artifact_id") != checkpoint.get("artifact_id"):
+            raise ValueError("activation/checkpoint lineage mismatch")
+        for row in rows:
+            recipient = torch.load(row["recipient_batch_path"], map_location="cpu", weights_only=True)
+            donor = torch.load(row["donor_batch_path"], map_location="cpu", weights_only=True)
+            recipient_inputs, _, _ = _batch_parts(recipient)
+            donor_inputs, _, _ = _batch_parts(donor)
+            _validate_aligned_inputs(recipient_inputs, donor_inputs)
+            sequence_length = recipient_inputs["input_ids"].shape[1]  # type: ignore[index]
+            _validate_positions(tuple(row["positions"]), sequence_length)
+            _target_ids(row["target_token_ids"], recipient_inputs["input_ids"].shape[0], "recipient")  # type: ignore[index]
+            loaded_batches.append((recipient, donor))
     if args.backend == "tiny-fixture":
         manifest = _smoke(args.output_root)
     else:
@@ -1036,9 +1081,7 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
             checkpoint_path, revision=args.model_revision, local_files_only=True
         ).eval()
         produced: list[InterventionRecord] = []
-        for row in rows:
-            recipient = torch.load(row["recipient_batch_path"], map_location="cpu", weights_only=True)
-            donor = torch.load(row["donor_batch_path"], map_location="cpu", weights_only=True)
+        for row, (recipient, donor) in zip(rows, loaded_batches, strict=True):
             spec = InterventionSpec(
                 row["method"], (row["layer"],), tuple(row["positions"]), row["norm_match"],
                 tuple(row["target_token_ids"]), row["control_name"],

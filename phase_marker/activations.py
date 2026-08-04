@@ -762,12 +762,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "smoke":
         manifest = _smoke(args.output_root)
     else:
-        manifest = _run_capture(args)
+        destination = args.output_root
+        if destination.exists():
+            raise FileExistsError(f"refusing to overwrite capture output: {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            dir=destination.parent, prefix=f".{destination.name}-staging-"
+        ) as temporary:
+            staging = Path(temporary) / "publish"
+            args.output_root = staging
+            manifest = _run_capture(args)
+            staging.replace(destination)
     print(canonical_json(manifest))
     return 0
 
 
 def _run_capture(args: argparse.Namespace) -> dict[str, object]:
+    if args.output_root.exists():
+        raise FileExistsError(f"refusing to overwrite capture output: {args.output_root}")
     if args.backend == "tiny-fixture" and not args.allow_test_backend:
         raise ValueError("tiny-fixture requires explicit --allow-test-backend")
     config = ExperimentConfig.load(args.config)
@@ -812,6 +824,11 @@ def _run_capture(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("tokenized batch path mismatch")
     if batch_manifest.get("batch_hash") != hashlib.sha256(args.tokenized_batch.read_bytes()).hexdigest():
         raise ValueError("tokenized batch hash mismatch")
+    batch = None
+    if args.backend == "hf":
+        batch = _load_and_validate_capture_batch(
+            args.tokenized_batch, batch_manifest, mode=args.mode
+        )
     if args.backend == "tiny-fixture":
         manifest = _smoke(args.output_root)
     else:  # model loading happens only after every immutable input has passed validation
@@ -823,9 +840,7 @@ def _run_capture(args: argparse.Namespace) -> dict[str, object]:
         model = AutoModelForCausalLM.from_pretrained(
             checkpoint_path, revision=args.model_revision, local_files_only=True
         ).eval()
-        batch = torch.load(args.tokenized_batch, map_location="cpu", weights_only=True)
-        if not isinstance(batch, Mapping):
-            raise ValueError("tokenized batch must contain a mapping")
+        assert batch is not None
         layers = tuple(batch_manifest.get("layers", ()))
         positions = tuple(batch_manifest.get("positions", ()))
         captured = capture_selected_states(model, batch, CaptureSpec(layers, positions))
@@ -857,6 +872,49 @@ def _run_capture(args: argparse.Namespace) -> dict[str, object]:
     envelope["artifact_id"] = sha256_json(envelope)
     _write_json_atomic(args.output_root / "manifest.json", envelope)
     return envelope
+
+
+def _load_and_validate_capture_batch(
+    path: Path, manifest: Mapping[str, object], *, mode: str
+) -> Mapping[str, object]:
+    batch = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(batch, Mapping):
+        raise ValueError("tokenized batch must contain a mapping")
+    input_ids = batch.get("input_ids")
+    if (
+        not isinstance(input_ids, torch.Tensor)
+        or input_ids.ndim != 2
+        or input_ids.dtype != torch.long
+        or input_ids.shape[0] < 1
+        or input_ids.shape[1] < 1
+    ):
+        raise ValueError("tokenized batch input_ids must be nonempty rank-2 torch.long")
+    for field in ("attention_mask", "position_ids"):
+        value = batch.get(field)
+        if value is not None and (
+            not isinstance(value, torch.Tensor)
+            or value.shape != input_ids.shape
+            or value.dtype != torch.long
+        ):
+            raise ValueError(f"tokenized batch {field} must match input_ids")
+    layers = manifest.get("layers")
+    positions = manifest.get("positions")
+    if (
+        not isinstance(layers, list) or not layers
+        or any(not isinstance(value, int) or value < 0 for value in layers)
+        or not isinstance(positions, list) or not positions
+        or any(not isinstance(value, int) or value < 0 or value >= input_ids.shape[1] for value in positions)
+    ):
+        raise ValueError("tokenized batch layers or positions are malformed")
+    if manifest.get("mode", mode) != mode:
+        raise ValueError("tokenized batch capture mode mismatch")
+    for field in ("example_ids", "conditions"):
+        values = batch.get(field)
+        if not isinstance(values, (list, tuple)) or len(values) != input_ids.shape[0] or any(
+            not isinstance(value, str) or not value for value in values
+        ):
+            raise ValueError(f"tokenized batch {field} must align with batch rows")
+    return batch
 
 
 def _load_capture_parent(

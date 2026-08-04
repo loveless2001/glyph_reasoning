@@ -583,11 +583,19 @@ def test_run_cli_tiny_fixture_emits_versioned_plumbing_manifest(
         training_path.write_text(canonical_json({"training": arm}) + "\n", encoding="utf-8")
         selected_path = f"/fixture/{arm}"
         checkpoint_hash = sha256_json({"checkpoint": arm})
+        evidence_path = tmp_path / f"{arm}.evidence.jsonl"
+        evidence_path.write_text(canonical_json({
+            "example_id": example["example_id"], "question_hash": example["question_hash"],
+            "checkpoint_id": checkpoint_hash, "checkpoint_path": selected_path,
+            "strict_correct": False, "gold_answer_logprob_contribution": 0.0,
+        }) + "\n", encoding="utf-8")
         payload = {
             "schema_version": 1,
             "kind": "phase_marker_checkpoint_selection",
             "evidence_scope": "plumbing_only",
             "backend": "tiny-fixture",
+            "model_id": config.model_id,
+            "model_revision": QWEN25_7B_TOKENIZER_REVISION,
             "config_hash": config_hash,
             "run_kind": "pilot",
             "arm": arm,
@@ -609,6 +617,8 @@ def test_run_cli_tiny_fixture_emits_versioned_plumbing_manifest(
                 "path": selected_path, "checkpoint_hash": checkpoint_hash, "step": 100,
                 "strict_accuracy": 0.0, "mean_gold_answer_logprob": 0.0, "row_count": 1,
             }],
+            "evidence_file": str(evidence_path),
+            "evidence_hash": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
             "selected_path": selected_path,
             "selected_checkpoint_hash": checkpoint_hash,
             "selected_step": 100,
@@ -687,7 +697,7 @@ def test_run_cli_tiny_fixture_emits_versioned_plumbing_manifest(
     )
     monkeypatch.setitem(sys.modules, "transformers", transformers)
     rejected_output = tmp_path / "rejected-production-output"
-    with pytest.raises(ValueError, match="bound file hash"):
+    with pytest.raises(ValueError, match="canonical sibling test.jsonl"):
         behavior_main([
             "run", "--config", str(config_path), "--kind", "pilot", "--seeds", "42",
             "--split-manifest", str(split_path), "--examples", str(examples_path),

@@ -263,8 +263,38 @@ def test_capture_cli_rejects_tiny_backend_without_explicit_opt_in(tmp_path: Path
                 "--model-id", "Qwen/Qwen2.5-7B-Instruct", "--model-revision", "deadbeef",
                 "--checkpoint-manifest", "missing.json", "--behavior-manifest", "missing.json",
                 "--synthetic-manifest", "missing.json", "--backend", "tiny-fixture",
-                "--output-root", str(tmp_path),
+                "--output-root", str(tmp_path / "absent-output"),
             )
+        )
+
+
+def test_capture_rejects_existing_output_before_any_input_or_loader(tmp_path: Path):
+    from phase_marker.activations import main
+
+    output = tmp_path / "existing"
+    output.mkdir()
+    with pytest.raises(FileExistsError, match="output"):
+        main((
+            "capture", "--config", "missing.toml", "--mode", "teacher_forced",
+            "--validation-selection-manifest", "missing.json",
+            "--tokenized-batch-manifest", "missing.json", "--tokenized-batch", "missing.pt",
+            "--model-id", "Qwen/Qwen2.5-7B-Instruct", "--model-revision", "deadbeef",
+            "--checkpoint-manifest", "missing.json", "--behavior-manifest", "missing.json",
+            "--synthetic-manifest", "missing.json", "--backend", "hf",
+            "--output-root", str(output),
+        ))
+
+
+def test_capture_rejects_corrupt_batch_before_transformers_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from phase_marker.activations import _load_and_validate_capture_batch
+
+    batch = tmp_path / "corrupt.pt"
+    batch.write_bytes(b"not a torch archive")
+    with pytest.raises(Exception):
+        _load_and_validate_capture_batch(
+            batch, {"layers": [0], "positions": [0]}, mode="teacher_forced"
         )
 
 

@@ -290,9 +290,9 @@ def test_manual_audit_ingestion_and_gate_block_only_above_one_percent(tmp_path):
     ]
     completed = tmp_path / "completed.tsv"
     completed.write_text(
-        "generation_id\tmanual_correct\n"
+        "generation_id\tsource\tquestion_hash\ttraining_arm\tseed\tprompt_condition\tgold_answer\textracted_answer\tauto_correct\tmanual_correct\n"
         + "".join(
-            f"audit-{index}\t{'false' if index == 0 else 'true'}\n"
+            f"audit-{index}\tgsm8k\tquestion-{index}\tglyph\t101\tglyph\t1\t1\ttrue\t{'false' if index == 0 else 'true'}\n"
             for index in range(100)
         ),
         encoding="utf-8",

@@ -432,9 +432,8 @@ def read_manual_audit_tsv(path: Path) -> dict[str, bool]:
     labels: dict[str, bool] = {}
     with path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
-        required = {"generation_id", "manual_correct"}
-        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
-            raise ValueError("manual audit TSV lacks required columns")
+        if reader.fieldnames != list(AUDIT_FIELDS):
+            raise ValueError("manual audit TSV must use the exact audit schema")
         for line_number, row in enumerate(reader, start=2):
             generation_id = row["generation_id"].strip()
             if not generation_id or generation_id in labels:
@@ -1110,6 +1109,7 @@ def _run_audit(arguments: argparse.Namespace) -> int:
         {"gsm8k": 100, "svamp": 100, "math": 100}
     ):
         raise ValueError("manual audit requires exactly 300 labels and 100 per source")
+    _validate_manual_audit_rows(arguments.manual_labels, selected)
     manual = read_manual_audit_tsv(arguments.manual_labels)
     result = apply_audit_gate(selected, manual, threshold=0.01)
     _prepare_audit_output_root(arguments.output_root, arguments.manual_labels)
@@ -1137,6 +1137,34 @@ def _run_audit(arguments: argparse.Namespace) -> int:
     _atomic_json(arguments.output_root / "manifest.json", manifest)
     print(canonical_json(manifest))
     return 0 if result.passed else 1
+
+
+def _validate_manual_audit_rows(
+    path: Path, selected: Sequence[AnalysisRecord]
+) -> None:
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames != list(AUDIT_FIELDS):
+            raise ValueError("manual audit TSV must use the exact audit schema")
+        rows = list(reader)
+    expected = {record.generation_id: record for record in selected}
+    if len(rows) != len(expected) or {row["generation_id"] for row in rows} != set(expected):
+        raise ValueError("manual audit TSV does not match the deterministic audit sample")
+    for row in rows:
+        record = expected[row["generation_id"]]
+        immutable = {
+            "source": record.source,
+            "question_hash": record.question_hash,
+            "training_arm": record.training_arm,
+            "seed": str(record.seed),
+            "prompt_condition": record.prompt_condition,
+            "gold_answer": record.gold_answer,
+            "extracted_answer": record.extracted_answer or "",
+            "auto_correct": str(record.correct).lower(),
+        }
+        if any(row[field] != value for field, value in immutable.items()):
+            raise ValueError("manual audit TSV immutable score evidence mismatch")
+        _parse_bool_label(row["manual_correct"], path, 0)
 
 
 def _run_analyze(arguments: argparse.Namespace) -> int:

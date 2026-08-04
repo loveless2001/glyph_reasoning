@@ -19,6 +19,7 @@ from phase_marker.training import (
     main,
     tokenize_assistant_only,
     verify_confirmatory_output,
+    _normalize_saved_adapter_identity,
 )
 
 
@@ -199,6 +200,32 @@ def test_lora_and_training_arguments_are_arm_invariant(config):
         "up_proj",
         "down_proj",
     }
+
+
+def test_cpu_tiny_qwen_peft_save_binds_canonical_base_identity(config, tmp_path):
+    pytest.importorskip("peft")
+    from peft import get_peft_model, PeftModel
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    tiny_config = Qwen2Config(
+        vocab_size=32, hidden_size=16, intermediate_size=32,
+        num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2,
+    )
+    tiny = Qwen2ForCausalLM(tiny_config)
+    snapshot = tmp_path / "models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a"
+    tiny_config.save_pretrained(snapshot)
+    tiny.name_or_path = str(snapshot)
+    adapter = get_peft_model(tiny, build_lora_config(config))
+    output = tmp_path / "adapter"
+    adapter.save_pretrained(output)
+
+    _normalize_saved_adapter_identity(output, config)
+
+    saved = __import__("json").loads((output / "adapter_config.json").read_text())
+    assert saved["base_model_name_or_path"] == "Qwen/Qwen2.5-7B-Instruct"
+    assert saved["revision"] == QWEN25_7B_TOKENIZER_REVISION
+    reloaded = PeftModel.from_pretrained(Qwen2ForCausalLM(tiny_config), output)
+    assert reloaded.peft_config["default"].base_model_name_or_path == config.model_id
 
 
 def test_run_manifest_binds_dataset_config_environment_and_checkpoints(config, tmp_path):

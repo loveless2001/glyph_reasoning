@@ -660,9 +660,25 @@ def test_run_cli_rejects_tiny_backend_without_explicit_opt_in(tmp_path: Path):
                 "--aligned-pairs-manifest", "missing.json",
                 "--activation-manifest", "missing.json", "--checkpoint-manifest", "missing.json",
                 "--model-id", "Qwen/Qwen2.5-7B-Instruct", "--model-revision", "deadbeef",
-                "--backend", "tiny-fixture", "--output-root", str(tmp_path),
+                "--backend", "tiny-fixture", "--output-root", str(tmp_path / "absent-output"),
             )
         )
+
+
+def test_run_rejects_existing_output_before_any_input_or_loader(tmp_path: Path):
+    from phase_marker.interventions import main
+
+    output = tmp_path / "existing"
+    output.mkdir()
+    with pytest.raises(FileExistsError, match="output"):
+        main((
+            "run", "--config", "missing.toml",
+            "--validation-selection-manifest", "missing.json",
+            "--aligned-pairs-manifest", "missing.json",
+            "--activation-manifest", "missing.json", "--checkpoint-manifest", "missing.json",
+            "--model-id", "Qwen/Qwen2.5-7B-Instruct", "--model-revision", "deadbeef",
+            "--backend", "hf", "--output-root", str(output),
+        ))
 
 
 def test_run_cli_tiny_fixture_emits_plumbing_only_envelope(tmp_path: Path):

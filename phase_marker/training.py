@@ -401,6 +401,7 @@ def _train(arguments: argparse.Namespace, command_arguments: list[str]) -> int:
     )
     trainer.train()
     trainer.save_model(str(arguments.output_dir))
+    _normalize_saved_adapter_identity(arguments.output_dir, config)
     tokenizer.save_pretrained(arguments.output_dir)
     trainer.save_state()
 
@@ -418,6 +419,22 @@ def _train(arguments: argparse.Namespace, command_arguments: list[str]) -> int:
     if arguments.manifest.resolve() != canonical_path.resolve():
         _write_manifest_immutable(arguments.manifest, manifest)
     return 0
+
+
+def _normalize_saved_adapter_identity(
+    output_dir: Path, config: ExperimentConfig
+) -> None:
+    """Bind PEFT outputs to the canonical Hub identity, not a cache snapshot."""
+    _require_supported_model(config)
+    paths = tuple(sorted(output_dir.glob("**/adapter_config.json")))
+    if not paths:
+        raise FileNotFoundError(f"saved PEFT adapter config is missing: {output_dir}")
+    for path in paths:
+        payload = _read_manifest(path)
+        normalized = dict(payload)
+        normalized["base_model_name_or_path"] = config.model_id
+        normalized["revision"] = QWEN25_7B_TOKENIZER_REVISION
+        path.write_text(canonical_json(normalized) + "\n", encoding="utf-8")
 
 
 def _integer_ids(value: object) -> list[int]:

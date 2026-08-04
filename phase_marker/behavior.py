@@ -201,6 +201,19 @@ class VLLMGenerationBackend:
         final_delimiter: str,
     ) -> float:
         """Teacher-force each frozen gold continuation and average its log probability."""
+        values = self.gold_answer_logprobs(
+            requests, gold_answers, tokenize=tokenize, final_delimiter=final_delimiter
+        )
+        return sum(values) / len(values)
+
+    def gold_answer_logprobs(
+        self,
+        requests: Sequence[GenerationRequest],
+        gold_answers: Sequence[str],
+        *,
+        tokenize: Callable[[str], Sequence[int]],
+        final_delimiter: str,
+    ) -> tuple[float, ...]:
         if len(requests) != len(gold_answers) or not requests:
             raise ValueError("gold-answer scoring requires one answer per request")
         from vllm import SamplingParams
@@ -238,7 +251,7 @@ class VLLMGenerationBackend:
                     raise ValueError("vLLM returned a malformed gold-answer logprob")
                 total += float(logprob)
             answer_logprobs.append(total)
-        return sum(answer_logprobs) / len(answer_logprobs)
+        return tuple(answer_logprobs)
 
 
 def select_validation_checkpoint(
@@ -769,6 +782,8 @@ _CHECKPOINT_SELECTION_FIELDS = frozenset(
         "selected_on",
         "evidence_scope",
         "backend",
+        "model_id",
+        "model_revision",
         "criterion",
         "split_artifact_id",
         "split_manifest_hash",
@@ -778,6 +793,8 @@ _CHECKPOINT_SELECTION_FIELDS = frozenset(
         "training_manifest_hash",
         "materialization_artifact_id",
         "candidates",
+        "evidence_file",
+        "evidence_hash",
         "selected_path",
         "selected_checkpoint_hash",
         "selected_step",
@@ -789,9 +806,16 @@ _CHECKPOINT_SELECTION_FIELDS = frozenset(
 
 
 def _run_selection(arguments: argparse.Namespace) -> int:
+    if arguments.output.exists() or arguments.output.with_suffix(".evidence.jsonl").exists():
+        raise FileExistsError(f"refusing to overwrite checkpoint selection: {arguments.output}")
     if arguments.backend == "tiny-fixture" and not arguments.allow_test_backend:
         raise SystemExit("--allow-test-backend is required for tiny-fixture")
     config = ExperimentConfig.load(arguments.config)
+    if arguments.backend == "vllm":
+        _validate_canonical_split_examples(
+            arguments.split_manifest, arguments.validation_examples, config,
+            expected_split="validation",
+        )
     expected_seeds = (config.pilot_seed,) if arguments.kind == "pilot" else tuple(config.confirmatory_seeds)
     if arguments.seed not in expected_seeds:
         raise ValueError(f"checkpoint selection seed must be one of {expected_seeds}")
@@ -864,11 +888,14 @@ def _run_selection(arguments: argparse.Namespace) -> int:
             config.model_id, revision=QWEN25_7B_TOKENIZER_REVISION, local_files_only=True
         )
     metrics: list[dict[str, object]] = []
+    evidence_rows: list[dict[str, object]] = []
     prompt_condition = arguments.arm if arguments.arm in {"glyph", "dot"} else "neutral"
     cell = EvaluationCell("primary", arguments.arm, prompt_condition, None, "greedy")
     for checkpoint, checkpoint_hash, step in candidate_inputs:
         if arguments.backend == "tiny-fixture":
             accuracy, mean_logprob = 0.0, 0.0
+            contributions = (0.0,) * len(examples)
+            strict_results = (False,) * len(examples)
         else:
             assert tokenizer is not None
             requests = build_generation_requests(
@@ -885,13 +912,14 @@ def _run_selection(arguments: argparse.Namespace) -> int:
                 config.model_id, model_revision=QWEN25_7B_TOKENIZER_REVISION,
                 adapter_path=str(checkpoint), adapter_seed=arguments.seed,
             )
+            outputs = backend.generate(requests)
             records = records_from_outputs(
-                cell, examples, requests, backend.generate(requests),
+                cell, examples, requests, outputs,
                 (split_id, materialization_id, _file_hash(arguments.training_manifest)),
             )
             scored = [score_generation(record) for record in records]
             accuracy = sum(row.correct for row in scored) / len(scored)
-            mean_logprob = backend.mean_gold_answer_logprob(
+            contributions = backend.gold_answer_logprobs(
                 requests,
                 tuple(example.answer for example in examples),
                 tokenize=lambda value: tokenizer.encode(
@@ -899,6 +927,17 @@ def _run_selection(arguments: argparse.Namespace) -> int:
                 ),
                 final_delimiter=config.final_delimiter,
             )
+            strict_results = tuple(row.correct for row in scored)
+            mean_logprob = sum(contributions) / len(contributions)
+        for example, strict_result, contribution in zip(
+            examples, strict_results, contributions, strict=True
+        ):
+            evidence_rows.append({
+                "example_id": example.example_id, "question_hash": example.question_hash,
+                "checkpoint_id": checkpoint_hash, "checkpoint_path": str(checkpoint),
+                "strict_correct": strict_result,
+                "gold_answer_logprob_contribution": contribution,
+            })
         metrics.append({
             "path": str(checkpoint), "checkpoint_hash": checkpoint_hash, "step": step,
             "strict_accuracy": accuracy, "mean_gold_answer_logprob": mean_logprob,
@@ -908,7 +947,9 @@ def _run_selection(arguments: argparse.Namespace) -> int:
     manifest: dict[str, object] = {
         "schema_version": 1, "kind": "phase_marker_checkpoint_selection",
         "evidence_scope": "plumbing_only" if arguments.backend == "tiny-fixture" else "experiment",
-        "backend": arguments.backend, "config_hash": config_hash, "run_kind": arguments.kind,
+        "backend": arguments.backend, "model_id": config.model_id,
+        "model_revision": QWEN25_7B_TOKENIZER_REVISION,
+        "config_hash": config_hash, "run_kind": arguments.kind,
         "arm": arguments.arm, "seed": arguments.seed, "selected_on": "validation",
         "criterion": {
             "primary": "maximize_strict_validation_exact_answer_accuracy",
@@ -921,16 +962,19 @@ def _run_selection(arguments: argparse.Namespace) -> int:
         "training_manifest_file": str(arguments.training_manifest),
         "training_manifest_hash": _file_hash(arguments.training_manifest),
         "materialization_artifact_id": materialization_id, "candidates": metrics,
+        "evidence_file": str(arguments.output.with_suffix(".evidence.jsonl")),
+        "evidence_hash": "",
         "selected_path": selected["path"],
         "selected_checkpoint_hash": selected["checkpoint_hash"],
         "selected_step": selected["step"],
         "parent_hashes": [split_id, materialization_id, _file_hash(arguments.training_manifest)],
         "completed": True,
     }
-    manifest["artifact_id"] = sha256_json(manifest)
-    if arguments.output.exists():
-        raise FileExistsError(f"refusing to overwrite checkpoint selection: {arguments.output}")
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path = arguments.output.with_suffix(".evidence.jsonl")
+    write_jsonl_atomic(evidence_path, evidence_rows)
+    manifest["evidence_hash"] = _file_hash(evidence_path)
+    manifest["artifact_id"] = sha256_json(manifest)
     arguments.output.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
     print(canonical_json(manifest))
     return 0
@@ -943,6 +987,11 @@ def _run_behavior(arguments: argparse.Namespace) -> int:
     seeds = tuple(arguments.seeds)
     _require_frozen_run(config, arguments.kind, seeds)
     split_payload = _load_json_object(arguments.split_manifest, "split manifest")
+    if arguments.backend == "vllm":
+        _validate_canonical_split_examples(
+            arguments.split_manifest, arguments.examples, config,
+            expected_split="test",
+        )
     config_hash = sha256_json(asdict(config))
     if split_payload.get("config_hash") != config_hash:
         raise ValueError("split manifest config hash mismatch")
@@ -1128,6 +1177,8 @@ def _load_checkpoint_selections(
             or payload["run_kind"] != kind
             or payload["selected_on"] != "validation"
             or payload["completed"] is not True
+            or payload["model_id"] != config.model_id
+            or payload["model_revision"] != QWEN25_7B_TOKENIZER_REVISION
         ):
             raise ValueError(f"checkpoint selection provenance mismatch: {path}")
         expected_scope = "plumbing_only" if allow_test else "experiment"
@@ -1147,6 +1198,7 @@ def _load_checkpoint_selections(
         for file_field, hash_field in (
             ("validation_examples_file", "validation_examples_hash"),
             ("training_manifest_file", "training_manifest_hash"),
+            ("evidence_file", "evidence_hash"),
         ):
             bound_path = Path(str(payload[file_field]))
             if not bound_path.is_file() or payload[hash_field] != _file_hash(bound_path):
@@ -1171,6 +1223,32 @@ def _load_checkpoint_selections(
         ]
         if len(selected_candidates) != 1 or select_validation_checkpoint(candidates) != selected_candidates[0]:
             raise ValueError(f"checkpoint selection winner does not match frozen criterion: {path}")
+        evidence = tuple(read_jsonl(Path(str(payload["evidence_file"]))))
+        examples = tuple(read_jsonl(Path(str(payload["validation_examples_file"]))))
+        expected_example_keys = {
+            (row.get("example_id"), row.get("question_hash")) for row in examples
+        }
+        for candidate in candidates:
+            assert isinstance(candidate, Mapping)
+            candidate_rows = [
+                row for row in evidence
+                if row.get("checkpoint_id") == candidate.get("checkpoint_hash")
+                and row.get("checkpoint_path") == candidate.get("path")
+            ]
+            if {
+                (row.get("example_id"), row.get("question_hash")) for row in candidate_rows
+            } != expected_example_keys or len(candidate_rows) != len(expected_example_keys):
+                raise ValueError(f"checkpoint selection per-example evidence mismatch: {path}")
+            strict = [row.get("strict_correct") for row in candidate_rows]
+            contributions = [row.get("gold_answer_logprob_contribution") for row in candidate_rows]
+            if (
+                any(not isinstance(value, bool) for value in strict)
+                or any(not isinstance(value, (int, float)) or isinstance(value, bool) for value in contributions)
+                or candidate.get("row_count") != len(candidate_rows)
+                or candidate.get("strict_accuracy") != sum(strict) / len(strict)
+                or candidate.get("mean_gold_answer_logprob") != sum(contributions) / len(contributions)
+            ):
+                raise ValueError(f"checkpoint selection aggregate evidence mismatch: {path}")
         parents = payload["parent_hashes"]
         if parents != [
             payload["split_artifact_id"], payload["materialization_artifact_id"],
@@ -1255,6 +1333,41 @@ def _validate_production_behavior_inputs(
             "path": relative, "hash": selection["selected_checkpoint_hash"]
         } not in declared:
             raise ValueError(f"selected checkpoint is not declared by training manifest: {path}")
+        declared_candidates = {
+            (str(path.parent / str(item["path"])), int(str(item["path"]).removeprefix("checkpoint-")), item["hash"])
+            for item in declared
+            if isinstance(item, Mapping) and set(item) == {"path", "hash"}
+        }
+        recorded_candidates = {
+            (item.get("path"), item.get("step"), item.get("checkpoint_hash"))
+            for item in selection["candidates"]  # type: ignore[union-attr]
+            if isinstance(item, Mapping)
+        }
+        if recorded_candidates != declared_candidates:
+            raise ValueError(f"checkpoint selection candidates do not exactly match training manifest: {path}")
+
+
+def _validate_canonical_split_examples(
+    split_manifest: Path,
+    examples_path: Path,
+    config: ExperimentConfig,
+    *,
+    expected_split: str,
+) -> None:
+    from phase_marker.pipeline import GateFailure, _validate_split_manifest
+
+    expected_path = split_manifest.parent / f"{expected_split}.jsonl"
+    if split_manifest.name != "manifest.json" or examples_path.resolve() != expected_path.resolve():
+        raise ValueError(f"production examples must be canonical sibling {expected_split}.jsonl")
+    try:
+        validated = _validate_split_manifest(split_manifest.parent.parent, config)
+    except GateFailure as error:
+        raise ValueError(str(error)) from error
+    if validated.path.resolve() != split_manifest.resolve():
+        raise ValueError("split manifest is not the canonical producer envelope")
+    rows = tuple(read_jsonl(examples_path))
+    if not rows or any(row.get("split") != expected_split for row in rows):
+        raise ValueError(f"canonical {expected_split} examples are malformed")
 
 
 def _example_from_row(row: Mapping[str, object]) -> DatasetExample:
