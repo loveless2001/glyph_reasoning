@@ -1422,6 +1422,7 @@ def _validate_attempt_receipt_job_identity(
 def _validate_receipt_job_identity(receipt: object, *, run_id: str) -> None:
     stage = getattr(receipt, "stage", None)
     arm = getattr(receipt, "arm", None)
+    source_hash = getattr(receipt, "source_hash", None)
     if (
         getattr(receipt, "run_id", None) != run_id
         or stage not in {"train", "selection"}
@@ -1429,6 +1430,8 @@ def _validate_receipt_job_identity(receipt: object, *, run_id: str) -> None:
         or getattr(receipt, "seed", None) != 42
         or getattr(receipt, "requested_gpu", None) != "H100"
         or getattr(receipt, "timeout_seconds", None) != 14_400
+        or not _is_sha256(source_hash)
+        or not run_id.endswith(f"-src-{str(source_hash)[:12]}")
     ):
         raise ValueError("attempt receipt identity is not an approved pilot job")
     expected_command = _status_expected_command(str(stage), str(arm))
@@ -1442,8 +1445,22 @@ def _validate_receipt_job_identity(receipt: object, *, run_id: str) -> None:
     promoted = getattr(receipt, "promoted", None)
     exit_status = getattr(receipt, "exit_status", None)
     failure_reason = getattr(receipt, "failure_reason", None)
+    observed_gpu = getattr(receipt, "observed_gpu", None)
     if validated is True:
-        if promoted is not True or exit_status != 0 or failure_reason is not None:
+        required_outputs = (
+            {"adapter_config.json", "adapter_model.safetensors", "run-manifest.json"}
+            if stage == "train"
+            else {"manifest.json", "evidence.jsonl"}
+        )
+        if (
+            promoted is not True
+            or exit_status != 0
+            or failure_reason is not None
+            or not _is_approved_observed_gpu(observed_gpu)
+            or not required_outputs.issubset(
+                set(getattr(receipt, "expected_outputs", ()))
+            )
+        ):
             raise ValueError("successful attempt receipt state is invalid")
     elif (
         validated is not False
@@ -1451,8 +1468,19 @@ def _validate_receipt_job_identity(receipt: object, *, run_id: str) -> None:
         or exit_status == 0
         or not isinstance(failure_reason, str)
         or not failure_reason
+        or (
+            observed_gpu is not None
+            and not _is_approved_observed_gpu(observed_gpu)
+        )
     ):
         raise ValueError("failed attempt receipt state is invalid")
+
+
+def _is_approved_observed_gpu(value: object) -> bool:
+    if not isinstance(value, str) or not value or "\n" in value or "\r" in value:
+        return False
+    tokens = value.upper().replace("-", " ").split()
+    return sum(token in {"H100", "H200"} for token in tokens) == 1
 
 
 def _receipt_shared_identity(receipt: object) -> tuple[str, ...]:
@@ -1480,6 +1508,7 @@ def _validate_status_canonical_output(
     receipt = load_attempt_receipt_payload(
         _decode_json_object(receipt_bytes, "canonical receipt")
     )
+    _validate_receipt_job_identity(receipt, run_id=run_id)
     expected_command = _status_expected_command(stage, arm)
     required_outputs = (
         {"adapter_config.json", "adapter_model.safetensors", "run-manifest.json"}
@@ -1881,6 +1910,8 @@ def _validate_downloaded_advertised_hashes(contents: Mapping[str, bytes]) -> Non
                     )
                     for item in imports
                 )
+                or tuple(item["module"] for item in imports)
+                != LOCKED_RUNTIME_IMPORTS
                 or smoke.get("validated") is not True
                 or smoke.get("failure_reason") is not None
                 or PurePosixPath(path).stem != artifact_id

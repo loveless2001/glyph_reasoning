@@ -59,6 +59,23 @@ COMPILE_HEADER = (
     "--output-file requirements-modal-phase-marker.txt --python-version 3.12 "
     "--python-platform x86_64-manylinux_2_28 --generate-hashes"
 )
+EXPECTED_LOCKED_RUNTIME_IMPORTS = (
+    "accelerate",
+    "datasets",
+    "einops",
+    "huggingface_hub",
+    "modal",
+    "numpy",
+    "peft",
+    "google.protobuf",
+    "safetensors",
+    "sentencepiece",
+    "statsmodels",
+    "tokenizers",
+    "torch",
+    "transformers",
+    "vllm",
+)
 
 
 class FakeRemoteFunction:
@@ -2572,6 +2589,132 @@ def test_status_reports_every_invalid_attempt_receipt(
     assert any("attempt" in error for error in result["errors"])
 
 
+@pytest.mark.parametrize(
+    "fault", ("a100", "missing-gpu", "missing-output", "arbitrary-output")
+)
+def test_status_rejects_invalid_successful_attempt_execution_evidence(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    fault: str,
+) -> None:
+    """Would fail if an unapproved successful execution looked trustworthy."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    receipt = _stage_a_receipt(plan, plan.jobs[0], "train")
+    if fault == "a100":
+        receipt["observed_gpu"] = "NVIDIA A100-SXM4-80GB"
+    elif fault == "missing-gpu":
+        receipt["observed_gpu"] = None
+    elif fault == "missing-output":
+        index = receipt["expected_outputs"].index("run-manifest.json")
+        receipt["expected_outputs"].pop(index)
+        receipt["output_hashes"].pop(index)
+    else:
+        receipt["expected_outputs"] = ["arbitrary-output.bin"]
+        receipt["output_hashes"] = ["d" * 64]
+    unsigned = dict(receipt)
+    unsigned.pop("artifact_id")
+    receipt["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+    filename = f"{receipt['attempt_id']}.json"
+    files = {
+        f"/runs/{plan.run_id}/receipts/attempts/{filename}": (
+            canonical_json(receipt) + "\n"
+        ).encode("utf-8")
+    }
+
+    result = imported_adapter.status_local(
+        StageARunsClient(files, []), run_id=plan.run_id
+    )
+
+    assert result["valid"] is False
+    assert any("attempt" in error for error in result["errors"])
+
+
+def test_status_accepts_successful_h200_attempt_execution_evidence(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+) -> None:
+    """Would fail if the approved H200-compatible boundary were narrowed to H100."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    receipt = _stage_a_receipt(plan, plan.jobs[0], "train")
+    receipt["observed_gpu"] = "NVIDIA H200 NVL"
+    unsigned = dict(receipt)
+    unsigned.pop("artifact_id")
+    receipt["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+    filename = f"{receipt['attempt_id']}.json"
+    files = {
+        f"/runs/{plan.run_id}/receipts/attempts/{filename}": (
+            canonical_json(receipt) + "\n"
+        ).encode("utf-8")
+    }
+
+    result = imported_adapter.status_local(
+        StageARunsClient(files, []), run_id=plan.run_id
+    )
+
+    assert result["valid"] is True
+
+
+@pytest.mark.parametrize("fault", ("wrong-source", "a100"))
+def test_status_rejects_invalid_lone_failed_attempt_identity(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    fault: str,
+) -> None:
+    """Would fail if a lone failed attempt escaped run and GPU binding."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    receipt = _failed_attempt_payload(plan, plan.jobs[0])
+    if fault == "wrong-source":
+        receipt["source_hash"] = "d" * 64
+    else:
+        receipt["observed_gpu"] = "NVIDIA A100-SXM4-80GB"
+    unsigned = dict(receipt)
+    unsigned.pop("artifact_id")
+    receipt["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+    filename = f"{receipt['attempt_id']}.json"
+    files = {
+        f"/runs/{plan.run_id}/receipts/attempts/{filename}": (
+            canonical_json(receipt) + "\n"
+        ).encode("utf-8")
+    }
+
+    result = imported_adapter.status_local(
+        StageARunsClient(files, []), run_id=plan.run_id
+    )
+
+    assert result["valid"] is False
+    assert any("attempt" in error for error in result["errors"])
+
+
+@pytest.mark.parametrize(
+    "observed_gpu", (None, "NVIDIA H100 80GB HBM3", "NVIDIA H200 NVL")
+)
+def test_status_accepts_approved_failed_attempt_gpu_evidence(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    observed_gpu: str | None,
+) -> None:
+    """Would fail if failed attempts required hardware they may not have observed."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    receipt = _failed_attempt_payload(plan, plan.jobs[0])
+    receipt["observed_gpu"] = observed_gpu
+    unsigned = dict(receipt)
+    unsigned.pop("artifact_id")
+    receipt["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+    filename = f"{receipt['attempt_id']}.json"
+    files = {
+        f"/runs/{plan.run_id}/receipts/attempts/{filename}": (
+            canonical_json(receipt) + "\n"
+        ).encode("utf-8")
+    }
+
+    result = imported_adapter.status_local(
+        StageARunsClient(files, []), run_id=plan.run_id
+    )
+
+    assert result["valid"] is True
+    assert result["training"][plan.jobs[0].arm] == "failed"
+
+
 class MutatingDownloadVolume(StageARunsClient):
     def __init__(self, files: dict[str, bytes], target: str) -> None:
         super().__init__(files, [])
@@ -2628,6 +2771,57 @@ def test_download_rejects_self_hashed_smoke_receipt_with_extra_schema(
         "validated": True,
         "failure_reason": None,
         "arbitrary": "must not export",
+    }
+    smoke["artifact_id"] = modal_artifacts.sha256_json(smoke)
+    volume.files[
+        f"/runs/{plan.run_id}/receipts/smoke/{smoke['artifact_id']}.json"
+    ] = (canonical_json(smoke) + "\n").encode("utf-8")
+
+    with pytest.raises(ValueError, match="smoke receipt"):
+        imported_adapter.download_evidence_local(
+            volume, run_id=plan.run_id, destination=tmp_path / "evidence",
+        )
+
+
+@pytest.mark.parametrize(
+    "fault", ("empty", "missing", "duplicate", "wrong")
+)
+def test_download_rejects_smoke_receipt_without_exact_locked_imports(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    """Would fail if smoke import evidence did not match the locked runtime exactly."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, training, _selection = _complete_status_volume(plan)
+    imports = [
+        {"module": module, "version": "locked-test-version"}
+        for module in EXPECTED_LOCKED_RUNTIME_IMPORTS
+    ]
+    if fault == "empty":
+        imports = []
+    elif fault == "missing":
+        imports.pop()
+    elif fault == "duplicate":
+        imports.append(dict(imports[-1]))
+    else:
+        imports[-1] = {"module": "unapproved_runtime", "version": "1.0"}
+    smoke: dict[str, object] = {
+        "schema_version": 1,
+        "stage": "smoke",
+        "hardware": "CPU",
+        "run_id": plan.run_id,
+        "source_hash": plan.source_hash,
+        "dependency_lock_hash": plan.dependency_lock_hash,
+        "bundle_id": plan.bundle_id,
+        "model_revision": plan.model_revision,
+        "model_cache_artifact_id": training[plan.jobs[0].arm][
+            "model_cache_artifact_id"
+        ],
+        "imports": imports,
+        "validated": True,
+        "failure_reason": None,
     }
     smoke["artifact_id"] = modal_artifacts.sha256_json(smoke)
     volume.files[
