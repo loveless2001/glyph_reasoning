@@ -109,6 +109,8 @@ class VLLMGenerationBackend:
     """Lazy production adapter; importing this module never imports or loads vLLM."""
 
     def __init__(self, model: str, **llm_kwargs: object) -> None:
+        if not _is_production_checkpoint(model):
+            raise ValueError("vLLM backend requires a real checkpoint model identifier")
         self._model = model
         self._llm_kwargs = dict(llm_kwargs)
         self._llm: Any | None = None
@@ -119,6 +121,8 @@ class VLLMGenerationBackend:
             return ()
         for request in requests:
             _validate_production_request(request)
+            if request.decoding["checkpoint"] != self._model:
+                raise ValueError("vLLM request checkpoint must exactly match backend model")
         if self._llm is None:
             from vllm import LLM  # Imported only when the production backend is used.
 
@@ -316,11 +320,30 @@ def serialize_generation_record(
     record: GenerationRecord, provenance: ProvenanceEnvelope
 ) -> dict[str, object]:
     """Add explicit token counts without changing the immutable raw record schema."""
+    _validate_envelope_binding(record, provenance)
     row = asdict(record)
     row["prompt_token_count"] = len(record.prompt_token_ids)
     row["completion_token_count"] = len(record.completion_token_ids)
     row["provenance"] = asdict(provenance)
     return row
+
+
+def _validate_envelope_binding(record: GenerationRecord, provenance: ProvenanceEnvelope) -> None:
+    if provenance.checkpoint != record.checkpoint:
+        raise ValueError("provenance checkpoint does not match generation record")
+    if provenance.parent_hashes != tuple(record.parent_hashes):
+        raise ValueError("provenance parent hashes do not match generation record")
+    bindings = {
+        "run_kind": provenance.run_kind,
+        "config_hash": provenance.config_hash,
+        "tokenizer_revision": provenance.tokenizer_revision,
+        "split_artifact_id": provenance.split_artifact_id,
+        "split_parent_hashes": provenance.split_parent_hashes,
+    }
+    for name, expected in bindings.items():
+        actual = record.decoding.get(name)
+        if actual != expected:
+            raise ValueError(f"provenance {name} does not match generation record")
 
 
 def build_provenance_envelope(

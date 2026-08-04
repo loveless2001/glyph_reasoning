@@ -10,6 +10,7 @@ from phase_marker.behavior import (
     FakeGenerationBackend,
     GenerationOutput,
     GenerationRequest,
+    VLLMGenerationBackend,
     build_generation_requests,
     build_behavior_matrix,
     records_from_outputs,
@@ -246,6 +247,39 @@ def test_vllm_preflight_rejects_fake_or_unpinned_requests_before_import():
         )
 
 
+def test_vllm_backend_binds_every_request_checkpoint_to_its_model_before_import():
+    with pytest.raises(ValueError, match="real checkpoint"):
+        VLLMGenerationBackend("fake://glyph")
+    with pytest.raises(ValueError, match="real checkpoint"):
+        VLLMGenerationBackend("unconfigured://checkpoint")
+
+    backend = VLLMGenerationBackend("/checkpoints/glyph-final")
+    shared = {
+        "seed": 42,
+        "run_kind": "production",
+        "config_hash": "a" * 64,
+        "tokenizer_revision": QWEN25_7B_TOKENIZER_REVISION,
+        "split_artifact_id": "b" * 64,
+        "split_parent_hashes": ("c" * 64,),
+    }
+    matching = GenerationRequest(
+        "matching",
+        "prompt",
+        (1,),
+        64,
+        {**shared, "checkpoint": "/checkpoints/glyph-final"},
+    )
+    mismatched = GenerationRequest(
+        "mismatched",
+        "prompt",
+        (1,),
+        64,
+        {**shared, "checkpoint": "/checkpoints/other-final"},
+    )
+    with pytest.raises(ValueError, match="backend model"):
+        backend.generate((matching, mismatched))
+
+
 def test_provenance_envelope_rejects_empty_or_mismatched_production_lineage(
     config, split_manifest
 ):
@@ -281,6 +315,10 @@ def test_provenance_envelope_rejects_empty_or_mismatched_production_lineage(
     assert persisted["provenance"] == asdict(provenance)
     assert persisted["prompt_token_count"] == 1
     assert persisted["completion_token_count"] == 1
+    with pytest.raises(ValueError, match="checkpoint"):
+        serialize_generation_record(
+            record, replace(provenance, checkpoint="/checkpoints/other")
+        )
 
     with pytest.raises(ValueError, match="parent"):
         build_provenance_envelope(replace(record, parent_hashes=()), config, split_manifest)
