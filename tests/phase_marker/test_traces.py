@@ -84,6 +84,53 @@ def test_parser_rejects_repeated_phase_marker_and_empty_answer():
         parse_legacy_trace(empty_answer)
 
 
+def test_parser_rejects_a_second_final_answer_delimiter():
+    repeated_delimiter = {
+        **LEGACY,
+        "messages": [*LEGACY["messages"]],
+    }
+    repeated_delimiter["messages"][1] = {
+        "role": "assistant",
+        "content": LEGACY["messages"][1]["content"].replace(
+            "Final answer: 5", "Final answer: 5\nFinal answer: 6"
+        ),
+    }
+
+    with pytest.raises(TraceParseError, match="repeated_final_delimiter"):
+        parse_legacy_trace(repeated_delimiter)
+
+
+def test_projection_preserves_multiline_phase_content_that_begins_with_dot():
+    dotted_content = {
+        **LEGACY,
+        "messages": [*LEGACY["messages"]],
+    }
+    dotted_content["messages"][1] = {
+        "role": "assistant",
+        "content": LEGACY["messages"][1]["content"].replace(
+            "Use arithmetic.", "Use arithmetic.\n. This is semantic content."
+        ),
+    }
+    trace = parse_legacy_trace(dotted_content)
+    semantic = render_training_example(trace, "semantic", 101, 512)["messages"][1]["content"]
+    dot = render_training_example(trace, "dot", 101, 512)["messages"][1]["content"]
+
+    assert semantic_projection(dot) == semantic
+    assert ". This is semantic content." in semantic_projection(dot)
+
+
+def test_custom_neutral_delimiter_is_structural_and_semantically_neutral():
+    trace = parse_legacy_trace(LEGACY)
+    semantic = render_training_example(trace, "semantic", 101, 512)["messages"][1]["content"]
+    rendered = render_training_example(
+        trace, "dot", 101, 512, neutral_delimiter="§"
+    )["messages"][1]["content"]
+
+    assert rendered.count("\n§\n") == 3
+    assert rendered.startswith("§\n")
+    assert semantic_projection(rendered, neutral_delimiter="§") == semantic
+
+
 def test_recover_question_requires_problem_delimiter():
     assert recover_question("Solve carefully.\n\nProblem:\nWhat is 2+3?\n") == "What is 2+3?"
     with pytest.raises(TraceParseError, match="missing_problem"):

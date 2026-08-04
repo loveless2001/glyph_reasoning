@@ -75,6 +75,8 @@ def parse_legacy_trace(row: Mapping[str, object]) -> CanonicalTrace:
     final = assistant[final_position + len(FINAL_GLYPH) :].strip()
     if not final.startswith(FINAL_DELIMITER):
         raise TraceParseError("missing_final_delimiter")
+    if final.count(FINAL_DELIMITER) != 1:
+        raise TraceParseError("repeated_final_delimiter")
     answer = final[len(FINAL_DELIMITER) :].strip()
     if not answer:
         raise TraceParseError("empty_answer")
@@ -91,13 +93,19 @@ def parse_legacy_trace(row: Mapping[str, object]) -> CanonicalTrace:
 
 
 def render_training_example(
-    trace: CanonicalTrace, arm: str, seed: int, max_filler_tokens: int
+    trace: CanonicalTrace,
+    arm: str,
+    seed: int,
+    max_filler_tokens: int,
+    *,
+    neutral_delimiter: str = DOT_DELIMITER,
 ) -> dict[str, object]:
     """Render one arm with exactly one literal final-answer delimiter."""
     if arm not in {"semantic", "glyph", "dot", "random", "direct", "filler"}:
         raise ValueError(f"unknown training arm: {arm}")
     if max_filler_tokens < 1:
         raise ValueError("max_filler_tokens must be positive")
+    _validate_neutral_delimiter(neutral_delimiter)
 
     if arm == "direct":
         assistant = _final_answer(trace.answer)
@@ -105,9 +113,9 @@ def render_training_example(
         length = _filler_length(trace, seed, max_filler_tokens)
         assistant = f"{'.' * length}\n{_final_answer(trace.answer)}"
     else:
-        markers = _markers_for_arm(trace, arm, seed)
+        markers = _markers_for_arm(trace, arm, seed, neutral_delimiter)
         body_lines = [
-            f"{marker}{phase.body}" if marker else phase.body
+            f"{marker}\n{phase.body}" if marker else phase.body
             for marker, phase in zip(markers, trace.phases)
         ]
         assistant = "\n".join([*body_lines, _final_answer(trace.answer)])
@@ -120,10 +128,17 @@ def render_training_example(
     }
 
 
-def semantic_projection(rendered_assistant: str) -> str:
+def semantic_projection(
+    rendered_assistant: str, *, neutral_delimiter: str = DOT_DELIMITER
+) -> str:
     """Remove only renderer boundary markers for cross-arm semantic comparisons."""
+    _validate_neutral_delimiter(neutral_delimiter)
     marker_pattern = "|".join(re.escape(spec[1]) for spec in PHASE_SPECS)
-    return re.sub(rf"(?m)^(?:{marker_pattern}|{re.escape(DOT_DELIMITER)})\s*", "", rendered_assistant)
+    return re.sub(
+        rf"(?m)^(?:{marker_pattern}|{re.escape(neutral_delimiter)})\n",
+        "",
+        rendered_assistant,
+    )
 
 
 def _messages(row: Mapping[str, object]) -> Sequence[object]:
@@ -163,17 +178,24 @@ def _final_answer(answer: str) -> str:
     return f"{FINAL_DELIMITER} {answer}"
 
 
-def _markers_for_arm(trace: CanonicalTrace, arm: str, seed: int) -> tuple[str, str, str, str]:
+def _markers_for_arm(
+    trace: CanonicalTrace, arm: str, seed: int, neutral_delimiter: str
+) -> tuple[str, str, str, str]:
     if arm == "semantic":
         return ("", "", "", "")
     if arm == "glyph":
-        return tuple(f"{glyph} " for _, glyph, _ in PHASE_SPECS)  # type: ignore[return-value]
+        return tuple(glyph for _, glyph, _ in PHASE_SPECS)  # type: ignore[return-value]
     if arm == "dot":
-        return (f"{DOT_DELIMITER} ",) * 4
+        return (neutral_delimiter,) * 4
     identities = [glyph for _, glyph, _ in PHASE_SPECS]
     deterministic = hashlib.sha256(f"{trace.trace_id}{seed}".encode("utf-8")).digest()
     ordered = [glyph for _, glyph in sorted(zip(deterministic[:4], identities))]
-    return tuple(f"{glyph} " for glyph in ordered)  # type: ignore[return-value]
+    return tuple(ordered)  # type: ignore[return-value]
+
+
+def _validate_neutral_delimiter(neutral_delimiter: str) -> None:
+    if not neutral_delimiter or "\n" in neutral_delimiter:
+        raise ValueError("neutral_delimiter must be a nonempty single-line string")
 
 
 def _filler_length(trace: CanonicalTrace, seed: int, max_filler_tokens: int) -> int:
