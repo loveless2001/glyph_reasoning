@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -210,6 +211,7 @@ def ablate_positions(
     model_inputs, recipient_ids, parents = _batch_parts(batch)
     batch_size = _batch_size(model_inputs)
     target_ids = _target_ids(spec.target_token_ids, batch_size, "recipient")
+    source_holder: dict[str, torch.Tensor] = {}
     with torch.no_grad():
         baseline_logits = _logits(model(**model_inputs))
 
@@ -225,6 +227,7 @@ def ablate_positions(
                 batch,
                 validation_mean,
             )
+            source_holder["selected"] = source[:, spec.positions, :].detach().clone()
             patched = replace_positions(
                 recipient_state, source, positions=spec.positions, norm_match=spec.norm_match
             )
@@ -235,6 +238,8 @@ def ablate_positions(
             intervened_logits = _logits(model(**model_inputs))
         finally:
             handle.remove()
+    if "selected" not in source_holder:
+        raise RuntimeError("ablation intervention hook did not run")
     if spec.control_name == "within_batch_shuffle":
         donor_ids = tuple(
             f"control:within_batch_shuffle:{source_id}"
@@ -242,6 +247,19 @@ def ablate_positions(
         )
     else:
         donor_ids = (f"control:{spec.control_name}",) * batch_size
+    source_positions = (
+        tuple(batch["matched_positions"])
+        if spec.control_name == "matched_non_marker_position"
+        else None
+    )
+    control_source_hashes = (
+        tuple(
+            _effective_tensor_hash(source_holder["selected"][index])
+            for index in range(batch_size)
+        )
+        if spec.control_name == "validation_mean"
+        else (None,) * batch_size
+    )
     return _result(
         baseline_logits,
         intervened_logits,
@@ -251,6 +269,8 @@ def ablate_positions(
         parents,
         target_ids,
         None,
+        source_positions=source_positions,
+        control_source_hashes=control_source_hashes,
     )
 
 
@@ -545,6 +565,9 @@ def _result(
     parent_hashes: tuple[str, ...],
     target_ids: torch.Tensor,
     donor_target_ids: torch.Tensor | None,
+    *,
+    source_positions: tuple[int, ...] | None = None,
+    control_source_hashes: tuple[str | None, ...] | None = None,
 ) -> InterventionResult:
     baseline_logprobs, baseline_ranks, baseline_correct = _score_target(baseline, target_ids)
     intervened_logprobs, intervened_ranks, intervened_correct = _score_target(
@@ -558,6 +581,10 @@ def _result(
     )
     if len(recipient_ids) != len(donor_ids) or len(recipient_ids) != target_ids.numel():
         raise AlignmentError("record provenance must align one-to-one with batch examples")
+    if control_source_hashes is None:
+        control_source_hashes = (None,) * len(recipient_ids)
+    if len(control_source_hashes) != len(recipient_ids):
+        raise AlignmentError("control source hashes must align one-to-one with records")
     records: list[InterventionRecord] = []
     for index, (recipient_id, donor_id) in enumerate(
         zip(recipient_ids, donor_ids, strict=True)
@@ -566,6 +593,7 @@ def _result(
         donor_target_id = (
             None if donor_target_ids is None else int(donor_target_ids[index].item())
         )
+        control_source_hash = control_source_hashes[index]
         payload = {
             "recipient_id": recipient_id,
             "donor_id": donor_id,
@@ -573,6 +601,8 @@ def _result(
             "control_name": spec.control_name,
             "layers": spec.layers,
             "positions": spec.positions,
+            "source_positions": source_positions,
+            "control_source_hash": control_source_hash,
             "norm_match": spec.norm_match,
             "recipient_target_token_id": recipient_target_id,
             "donor_target_token_id": donor_target_id,
@@ -587,6 +617,8 @@ def _result(
                 control_name=spec.control_name,
                 layers=spec.layers,
                 positions=spec.positions,
+                source_positions=source_positions,
+                control_source_hash=control_source_hash,
                 baseline_target_logprob=float(baseline_logprobs[index].item()),
                 intervened_target_logprob=float(intervened_logprobs[index].item()),
                 baseline_target_rank=int(baseline_ranks[index].item()),
@@ -611,6 +643,18 @@ def _result(
         baseline_logits=baseline.detach().cpu().clone(),
         intervened_logits=intervened.detach().cpu().clone(),
     )
+
+
+def _effective_tensor_hash(value: torch.Tensor) -> str:
+    effective = value.detach().contiguous().cpu()
+    header = canonical_json(
+        {
+            "dtype": str(effective.dtype).removeprefix("torch."),
+            "shape": list(effective.shape),
+        }
+    ).encode("utf-8")
+    raw_values = effective.view(torch.uint8).numpy().tobytes()
+    return hashlib.sha256(header + b"\0" + raw_values).hexdigest()
 
 
 def _score_target(

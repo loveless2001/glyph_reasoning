@@ -260,6 +260,77 @@ def test_ablation_zero_and_validation_mean_share_record_path(recipient_batch):
     assert not torch.equal(zero.intervened_logits, mean.intervened_logits)
 
 
+def test_validation_mean_hash_binds_effective_tensor_and_prevents_id_collision(
+    recipient_batch
+):
+    model = TinyCausalLM().eval()
+    first_source = torch.full((6,), 0.25, dtype=torch.float64)
+    second_source = torch.full((6,), 0.75, dtype=torch.float64)
+    first_before = first_source.clone()
+    second_before = second_source.clone()
+    intervention = spec(
+        method="ablate",
+        positions=(2,),
+        control_name="validation_mean",
+    )
+
+    first = ablate_positions(model, recipient_batch, intervention, first_source)
+    second = ablate_positions(model, recipient_batch, intervention, second_source)
+    repeated = ablate_positions(model, recipient_batch, intervention, first_source.clone())
+
+    assert not torch.equal(first.intervened_logits, second.intervened_logits)
+    assert first.record.intervention_id != second.record.intervention_id
+    assert first.record.intervention_id == repeated.record.intervention_id
+    assert first.record.control_source_hash == (
+        "809fda63375cdcd1d10698ab638ae000e439b14969ad0949c56eb52ac9d5ef06"
+    )
+    assert first.record.control_source_hash != second.record.control_source_hash
+    assert first.record.source_positions is None
+    assert torch.equal(first_source, first_before)
+    assert torch.equal(second_source, second_before)
+
+
+def test_matched_positions_are_inspectable_and_prevent_id_collision(recipient_batch):
+    model = TinyCausalLM().eval()
+    input_before = recipient_batch["input_ids"].clone()
+    first_batch = {**recipient_batch, "matched_positions": (0,)}
+    second_batch = {**recipient_batch, "matched_positions": (1,)}
+    intervention = spec(
+        method="ablate",
+        positions=(2,),
+        control_name="matched_non_marker_position",
+    )
+
+    first = ablate_positions(model, first_batch, intervention)
+    second = ablate_positions(model, second_batch, intervention)
+    repeated = ablate_positions(model, first_batch, intervention)
+
+    assert not torch.equal(first.intervened_logits, second.intervened_logits)
+    assert first.record.intervention_id != second.record.intervention_id
+    assert first.record.intervention_id == repeated.record.intervention_id
+    assert first.record.source_positions == (0,)
+    assert second.record.source_positions == (1,)
+    assert first.record.control_source_hash is None
+    assert torch.equal(recipient_batch["input_ids"], input_before)
+
+
+def test_controls_without_external_tensor_sources_record_none_source_fields(
+    recipient_batch, donor_batch
+):
+    model = TinyCausalLM().eval()
+    donor = patch_residual_positions(model, recipient_batch, donor_batch, spec())
+    zero = ablate_positions(
+        model,
+        recipient_batch,
+        spec(method="ablate", control_name="zero"),
+    )
+
+    assert donor.record.source_positions is None
+    assert donor.record.control_source_hash is None
+    assert zero.record.source_positions is None
+    assert zero.record.control_source_hash is None
+
+
 def test_shuffle_and_random_donor_controls_use_the_same_intervention_path():
     model = TinyCausalLM().eval()
     recipient = {

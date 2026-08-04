@@ -76,6 +76,8 @@ class InterventionRecord:
     control_name: str
     layers: tuple[int, ...]
     positions: tuple[int, ...]
+    source_positions: tuple[int, ...] | None
+    control_source_hash: str | None
     baseline_target_logprob: float
     intervened_target_logprob: float
     baseline_target_rank: int
