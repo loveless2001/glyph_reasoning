@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
+import shlex
+import shutil
+import subprocess
+import tempfile
 from typing import Protocol
+import uuid
 
-from phase_marker.io import sha256_json
+from phase_marker.io import canonical_json, sha256_json
 
 
 SOURCE_INCLUDE_PATHS = ("phase_marker/**/*.py", "modal_phase_marker.py")
@@ -33,6 +40,8 @@ _MANIFEST_PATHS = (
     *(f"{_ARTIFACT_ROOT}/training-data/{arm}.manifest.json" for arm in _ARMS),
 )
 _SHA256_CHARS = frozenset("0123456789abcdef")
+_PILOT_KIND = "pilot"
+_PILOT_SEED = 42
 
 
 class VolumeClient(Protocol):
@@ -55,6 +64,323 @@ class InputBundle:
     bundle_id: str
     files: tuple[BundleFile, ...]
     artifact_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AttemptReceipt:
+    """An immutable, content-addressed record of one execution attempt."""
+
+    schema_version: int
+    run_id: str
+    bundle_id: str
+    stage: str
+    arm: str
+    seed: int
+    attempt_id: str
+    command: str
+    command_hash: str
+    source_hash: str
+    dependency_lock_hash: str
+    model_cache_artifact_id: str
+    requested_gpu: str
+    observed_gpu: str | None
+    started_at: str
+    finished_at: str
+    elapsed_seconds: float
+    timeout_seconds: int
+    exit_status: int
+    validated: bool
+    promoted: bool
+    expected_outputs: tuple[str, ...]
+    output_hashes: tuple[str, ...]
+    failure_reason: str | None
+    artifact_id: str
+
+    def recomputed_artifact_id(self) -> str:
+        """Return the receipt identity from every immutable field but itself."""
+        return sha256_json(_receipt_payload(self, include_artifact_id=False))
+
+
+def create_attempt_id() -> str:
+    """Allocate a fresh namespace for an execution or rescheduled execution."""
+    return str(uuid.uuid4())
+
+
+def prepare_ephemeral_workspace(
+    *,
+    code_root: Path,
+    input_root: Path,
+    run_root: Path,
+    bundle: InputBundle,
+    stage: str,
+    arm: str,
+    attempt_id: str,
+    canonical_training_root: Path | None = None,
+) -> Path:
+    """Recreate only approved repository paths under a one-attempt workspace."""
+    if stage not in {"train", "selection"}:
+        raise ValueError("workspace stage is invalid")
+    if arm not in _ARMS:
+        raise ValueError("workspace arm is invalid")
+    if not attempt_id or Path(attempt_id).name != attempt_id:
+        raise ValueError("attempt ID must be a single path component")
+
+    code = Path(code_root).resolve()
+    inputs = Path(input_root).resolve()
+    validate_bundle_at_root(bundle, inputs)
+    python = code / ".venv/bin/python"
+    package = code / "phase_marker"
+    if not python.is_file() or not package.is_dir():
+        raise ValueError("code root lacks the approved Python runtime or package")
+    if stage == "selection" and canonical_training_root is None:
+        raise ValueError("selection workspace requires a canonical training root")
+    if stage == "train" and canonical_training_root is not None:
+        raise ValueError("training workspace cannot bind canonical training output")
+
+    attempt_root = Path(run_root).resolve() / "attempts" / attempt_id
+    if attempt_root.exists():
+        raise FileExistsError("attempt workspace already exists")
+    workspace = attempt_root / "workspace"
+    try:
+        workspace.mkdir(parents=True)
+        _symlink_exact_path(python, workspace / ".venv/bin/python")
+        _symlink_exact_path(package, workspace / "phase_marker", directory=True)
+        adapter = code / "modal_phase_marker.py"
+        if adapter.is_file():
+            _symlink_exact_path(adapter, workspace / "modal_phase_marker.py")
+        for item in bundle.files:
+            destination = workspace / item.path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(inputs / item.path, destination)
+            destination.chmod(0o444)
+        if canonical_training_root is not None:
+            training = Path(canonical_training_root).resolve()
+            if not training.is_dir():
+                raise ValueError("canonical training root is missing")
+            target = (
+                workspace / _ARTIFACT_ROOT / "checkpoints" / _PILOT_KIND
+                / f"seed-{_PILOT_SEED}" / arm
+            )
+            _symlink_exact_path(training, target, directory=True)
+    except BaseException:
+        shutil.rmtree(attempt_root, ignore_errors=True)
+        raise
+    return workspace
+
+
+def run_exact_command(
+    command: str,
+    *,
+    workspace: Path,
+    log_path: Path,
+    env: Mapping[str, str],
+) -> int:
+    """Run only a frozen pilot command from its isolated workspace, without a shell."""
+    argv = _approved_command_argv(command)
+    root = Path(workspace).resolve()
+    if not root.is_dir():
+        raise ValueError("workspace is missing")
+    log = Path(log_path).resolve()
+    if not _is_within(log, root):
+        raise ValueError("log path must remain inside the ephemeral workspace")
+    if any(not isinstance(key, str) or not isinstance(value, str) for key, value in env.items()):
+        raise ValueError("subprocess environment must contain string keys and values")
+
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("wb") as handle:
+        result = subprocess.run(
+            argv,
+            cwd=root,
+            env=dict(env),
+            shell=False,
+            check=False,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+        )
+    return int(result.returncode)
+
+
+def write_attempt_receipt(run_root: Path, receipt: AttemptReceipt) -> Path:
+    """Atomically persist a verified receipt outside attempt outputs and checkpoints."""
+    _validate_receipt(receipt)
+    root = Path(run_root).resolve()
+    receipt_path = root / "receipts" / f"{receipt.attempt_id}.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    if receipt_path.exists():
+        raise FileExistsError("attempt receipt already exists")
+    payload = canonical_json(_receipt_payload(receipt, include_artifact_id=True)) + "\n"
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=receipt_path.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+        # link(2) is an atomic create-if-absent operation, preserving receipts forever.
+        os.link(temporary, receipt_path)
+    except FileExistsError as error:
+        raise FileExistsError("attempt receipt already exists") from error
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return receipt_path
+
+
+def promote_validated_output(
+    source: Path,
+    attempt_root: Path,
+    canonical_root: Path,
+    receipt: AttemptReceipt,
+) -> Path:
+    """Copy an accepted output into its attempt namespace, then atomically promote it."""
+    _validate_receipt(receipt)
+    if receipt.exit_status != 0 or not receipt.validated:
+        raise ValueError("promotion requires a validated successful receipt")
+    source_path = Path(source).resolve()
+    if not source_path.is_dir():
+        raise ValueError("promotion source is missing or not a directory")
+    target = Path(canonical_root).resolve()
+    if target.exists():
+        raise FileExistsError("canonical output already exists")
+
+    root = Path(attempt_root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    staged = root / "promotion-staging"
+    if staged.exists():
+        raise FileExistsError("attempt promotion staging already exists")
+    shutil.copytree(source_path, staged, copy_function=shutil.copy2)
+    if _tree_hashes(source_path) != _tree_hashes(staged):
+        shutil.rmtree(staged)
+        raise ValueError("attempt output copy does not match source bytes")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock = target.parent / f".{target.name}.promotion.lock"
+    try:
+        lock.touch(exist_ok=False)
+    except FileExistsError as error:
+        raise FileExistsError("canonical promotion is already in progress") from error
+    try:
+        if target.exists():
+            raise FileExistsError("canonical output already exists")
+        staged.replace(target)
+    finally:
+        lock.unlink(missing_ok=True)
+    return target
+
+
+def _receipt_payload(receipt: AttemptReceipt, *, include_artifact_id: bool) -> dict[str, object]:
+    payload = asdict(receipt)
+    payload["expected_outputs"] = list(receipt.expected_outputs)
+    payload["output_hashes"] = list(receipt.output_hashes)
+    if not include_artifact_id:
+        payload.pop("artifact_id")
+    return payload
+
+
+def _validate_receipt(receipt: AttemptReceipt) -> None:
+    if receipt.schema_version != 1:
+        raise ValueError("receipt schema version is invalid")
+    if not receipt.run_id or not receipt.attempt_id or Path(receipt.attempt_id).name != receipt.attempt_id:
+        raise ValueError("receipt identity is invalid")
+    if receipt.stage not in {"train", "selection"} or receipt.arm not in _ARMS:
+        raise ValueError("receipt stage or arm is invalid")
+    if receipt.seed != _PILOT_SEED:
+        raise ValueError("receipt seed is invalid")
+    if not all(
+        _is_sha256(value)
+        for value in (
+            receipt.bundle_id,
+            receipt.command_hash,
+            receipt.source_hash,
+            receipt.dependency_lock_hash,
+            receipt.model_cache_artifact_id,
+            receipt.artifact_id,
+            *receipt.output_hashes,
+        )
+    ):
+        raise ValueError("receipt hash fields are invalid")
+    if (
+        not isinstance(receipt.command, str)
+        or not receipt.command
+        or not isinstance(receipt.requested_gpu, str)
+        or not receipt.requested_gpu
+        or (receipt.observed_gpu is not None and not isinstance(receipt.observed_gpu, str))
+        or not isinstance(receipt.started_at, str)
+        or not isinstance(receipt.finished_at, str)
+        or not isinstance(receipt.elapsed_seconds, (float, int))
+        or isinstance(receipt.elapsed_seconds, bool)
+        or receipt.elapsed_seconds < 0
+        or not isinstance(receipt.timeout_seconds, int)
+        or isinstance(receipt.timeout_seconds, bool)
+        or receipt.timeout_seconds <= 0
+        or not isinstance(receipt.exit_status, int)
+        or isinstance(receipt.exit_status, bool)
+        or not isinstance(receipt.validated, bool)
+        or not isinstance(receipt.promoted, bool)
+        or not all(isinstance(path, str) and path for path in receipt.expected_outputs)
+        or (receipt.failure_reason is not None and not isinstance(receipt.failure_reason, str))
+    ):
+        raise ValueError("receipt fields are invalid")
+    if receipt.artifact_id != receipt.recomputed_artifact_id():
+        raise ValueError("receipt artifact ID does not match its fields")
+
+
+def _approved_command_argv(command: str) -> list[str]:
+    if not isinstance(command, str) or not command:
+        raise ValueError("approved command is required")
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError as error:
+        raise ValueError("approved command is malformed") from error
+    for arm in _ARMS:
+        if argv == _workspace_training_command(arm) or argv == _workspace_selection_command(arm):
+            return argv
+    raise ValueError("command is not an approved command")
+
+
+def _workspace_training_command(arm: str) -> list[str]:
+    output = f"{_ARTIFACT_ROOT}/checkpoints/{_PILOT_KIND}/seed-{_PILOT_SEED}/{arm}"
+    return [
+        "./.venv/bin/python", "-m", "phase_marker.training", "train",
+        "--config", "configs/phase-marker-qwen25-7b.toml", "--arm", arm,
+        "--seed", str(_PILOT_SEED), "--data", f"{_ARTIFACT_ROOT}/training-data/{arm}.jsonl",
+        "--output-dir", output, "--manifest", f"{output}/run-manifest.json",
+    ]
+
+
+def _workspace_selection_command(arm: str) -> list[str]:
+    training = f"{_ARTIFACT_ROOT}/checkpoints/{_PILOT_KIND}/seed-{_PILOT_SEED}/{arm}"
+    output = f"{_ARTIFACT_ROOT}/checkpoint-selections/{_PILOT_KIND}/seed-{_PILOT_SEED}/{arm}"
+    return [
+        "./.venv/bin/python", "-m", "phase_marker.behavior", "select",
+        "--config", "configs/phase-marker-qwen25-7b.toml", "--kind", _PILOT_KIND,
+        "--seed", str(_PILOT_SEED), "--arm", arm, "--split-manifest",
+        f"{_ARTIFACT_ROOT}/splits/manifest.json", "--validation-examples",
+        f"{_ARTIFACT_ROOT}/splits/validation.jsonl", "--training-manifest",
+        f"{training}/run-manifest.json", "--backend", "vllm", "--output", output,
+    ]
+
+
+def _symlink_exact_path(source: Path, destination: Path, *, directory: bool = False) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.symlink_to(source, target_is_directory=directory)
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _tree_hashes(root: Path) -> tuple[tuple[str, int, str], ...]:
+    records: list[tuple[str, int, str]] = []
+    for path in sorted(root.rglob("*"), key=lambda value: value.relative_to(root).as_posix()):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("attempt output must contain regular files only")
+        records.append((path.relative_to(root).as_posix(), path.stat().st_size, _file_sha256(path)))
+    return tuple(records)
 
 
 def require_clean_tracked_status(status: str) -> None:

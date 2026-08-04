@@ -14,11 +14,17 @@ from phase_marker.io import canonical_json, sha256_json
 from phase_marker.modal_artifacts import (
     INPUT_ALLOWLIST,
     SOURCE_INCLUDE_PATHS,
+    AttemptReceipt,
     BundleFile,
     build_input_bundle,
+    create_attempt_id,
     hash_source_tree,
+    prepare_ephemeral_workspace,
+    promote_validated_output,
     require_clean_tracked_status,
+    run_exact_command,
     validate_bundle_at_root,
+    write_attempt_receipt,
 )
 import phase_marker.modal_plan as modal_plan
 from tests.phase_marker.test_pipeline import _write_materializations, _write_split
@@ -27,6 +33,41 @@ from tests.phase_marker.test_pipeline import _write_materializations, _write_spl
 CONFIG_PATH = Path("configs/phase-marker-qwen25-7b.toml")
 SOURCE_HASH = "1" * 64
 LOCK_HASH = "2" * 64
+
+
+def receipt_fixture(**changes: object) -> AttemptReceipt:
+    fields: dict[str, object] = {
+        "schema_version": 1,
+        "run_id": "pilot-s42-cfg-12345678-split-12345678-src-123456789012",
+        "bundle_id": "a" * 64,
+        "stage": "train",
+        "arm": "glyph",
+        "seed": 42,
+        "attempt_id": "f41aa3e7-f05f-48e3-87d6-5877fcce21d1",
+        "command": "./.venv/bin/python -m phase_marker.training train --config configs/phase-marker-qwen25-7b.toml --arm glyph --seed 42 --data artifacts/phase-marker/training-data/glyph.jsonl --output-dir artifacts/phase-marker/checkpoints/pilot/seed-42/glyph --manifest artifacts/phase-marker/checkpoints/pilot/seed-42/glyph/run-manifest.json",
+        "command_hash": "b" * 64,
+        "source_hash": "c" * 64,
+        "dependency_lock_hash": "d" * 64,
+        "model_cache_artifact_id": "e" * 64,
+        "requested_gpu": "H100",
+        "observed_gpu": None,
+        "started_at": "2026-08-05T00:00:00+00:00",
+        "finished_at": "2026-08-05T00:00:01+00:00",
+        "elapsed_seconds": 1.0,
+        "timeout_seconds": 60,
+        "exit_status": 0,
+        "validated": True,
+        "promoted": False,
+        "expected_outputs": ("adapter_config.json",),
+        "output_hashes": ("f" * 64,),
+        "failure_reason": None,
+        "artifact_id": "",
+    }
+    fields.update(changes)
+    receipt = AttemptReceipt(**fields)
+    if "artifact_id" not in changes:
+        return replace(receipt, artifact_id=receipt.recomputed_artifact_id())
+    return receipt
 
 
 @pytest.fixture
@@ -321,3 +362,138 @@ def test_cli_prints_plan_or_only_run_id_without_side_effects(
 
     modal_plan.main(["run-id", *argv[1:]])
     assert capsys.readouterr().out.strip() == plan_payload["run_id"]
+
+
+def test_workspace_recreates_exact_repository_paths(repo_fixture: Path, tmp_path: Path) -> None:
+    """Would fail if a workspace used host paths or omitted a bundled input."""
+    bundle = build_input_bundle(repo_fixture)
+    code_root = tmp_path / "code"
+    (code_root / ".venv/bin").mkdir(parents=True)
+    (code_root / ".venv/bin/python").write_text("#!/bin/sh\n", encoding="utf-8")
+    (code_root / "phase_marker").mkdir()
+    (code_root / "phase_marker/__init__.py").write_text("", encoding="utf-8")
+
+    workspace = prepare_ephemeral_workspace(
+        code_root=code_root,
+        input_root=repo_fixture,
+        run_root=tmp_path / "runs",
+        bundle=bundle,
+        stage="train",
+        arm="glyph",
+        attempt_id="attempt-1",
+    )
+
+    assert (workspace / ".venv/bin/python").is_symlink()
+    assert (workspace / "phase_marker").is_symlink()
+    assert (workspace / "configs/phase-marker-qwen25-7b.toml").is_file()
+    assert (workspace / "artifacts/phase-marker/training-data/glyph.jsonl").is_file()
+    assert workspace.is_relative_to(tmp_path / "runs" / "attempts" / "attempt-1")
+
+
+def test_workspace_rejects_existing_attempt_directory(repo_fixture: Path, tmp_path: Path) -> None:
+    """Would fail if a retry could overwrite a prior attempt workspace."""
+    bundle = build_input_bundle(repo_fixture)
+    code_root = tmp_path / "code"
+    (code_root / ".venv/bin").mkdir(parents=True)
+    (code_root / ".venv/bin/python").touch()
+    (code_root / "phase_marker").mkdir()
+    (tmp_path / "runs/attempts/a1").mkdir(parents=True)
+
+    with pytest.raises(FileExistsError, match="attempt workspace already exists"):
+        prepare_ephemeral_workspace(
+            code_root=code_root, input_root=repo_fixture, run_root=tmp_path / "runs",
+            bundle=bundle, stage="train", arm="glyph", attempt_id="a1",
+        )
+
+
+def test_exact_command_uses_no_shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Would fail if command execution reintroduced a shell boundary."""
+    calls: list[tuple[object, dict[str, object]]] = []
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **kw: calls.append((argv, kw)) or type("Result", (), {"returncode": 0})(),
+    )
+
+    result = run_exact_command(
+        "./.venv/bin/python -m phase_marker.training train "
+        "--config configs/phase-marker-qwen25-7b.toml --arm glyph --seed 42 "
+        "--data artifacts/phase-marker/training-data/glyph.jsonl "
+        "--output-dir artifacts/phase-marker/checkpoints/pilot/seed-42/glyph "
+        "--manifest artifacts/phase-marker/checkpoints/pilot/seed-42/glyph/run-manifest.json",
+        workspace=tmp_path,
+        log_path=tmp_path / "logs/train.log",
+        env={"A": "B"},
+    )
+
+    assert result == 0
+    assert calls[0][0][:4] == ["./.venv/bin/python", "-m", "phase_marker.training", "train"]
+    assert calls[0][1]["shell"] is False
+    assert calls[0][1]["cwd"] == tmp_path
+    assert (tmp_path / "logs/train.log").is_file()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -m phase_marker.training train --arm glyph --seed 42",
+        "./.venv/bin/python -m phase_marker.training train --arm glyph --seed 101",
+        "./.venv/bin/python -m phase_marker.training train --arm glyph --seed 42; id",
+        "./.venv/bin/python -m phase_marker.training train --arm glyph --seed 42 --data ../outside.jsonl",
+    ],
+)
+def test_exact_command_rejects_unapproved_shapes(tmp_path: Path, command: str) -> None:
+    """Would fail if the boundary merely blacklisted a few shell characters."""
+    with pytest.raises(ValueError, match="approved command"):
+        run_exact_command(command, workspace=tmp_path, log_path=tmp_path / "run.log", env={})
+
+
+def test_failed_attempt_never_promotes(tmp_path: Path) -> None:
+    """Would fail if a failed or unvalidated attempt could reach canonical output."""
+    receipt = receipt_fixture(exit_status=1, validated=False)
+    with pytest.raises(ValueError, match="validated successful receipt"):
+        promote_validated_output(
+            tmp_path / "output", tmp_path / "attempts/a1",
+            tmp_path / "canonical/glyph", receipt,
+        )
+    assert not (tmp_path / "canonical/glyph").exists()
+
+
+def test_receipt_and_log_are_outside_hashed_output(tmp_path: Path) -> None:
+    """Would fail if receipt persistence were mixed into a checkpoint output tree."""
+    receipt_path = write_attempt_receipt(tmp_path / "runs", receipt_fixture())
+    assert "/receipts/" in receipt_path.as_posix()
+    assert "/checkpoints/" not in receipt_path.as_posix()
+
+
+def test_receipt_rejects_stale_artifact_id(tmp_path: Path) -> None:
+    """Would fail if receipt fields could be changed without changing their identity."""
+    receipt = receipt_fixture(artifact_id="0" * 64)
+    with pytest.raises(ValueError, match="artifact ID"):
+        write_attempt_receipt(tmp_path / "runs", receipt)
+
+
+def test_promotion_copies_attempt_bytes_once_and_refuses_existing_canonical(tmp_path: Path) -> None:
+    """Would fail if promotion overwrote a canonical result or changed output bytes."""
+    source = tmp_path / "workspace-output"
+    source.mkdir()
+    (source / "adapter.bin").write_bytes(b"frozen adapter bytes")
+    attempt_root = tmp_path / "runs/attempts/a1"
+    canonical = tmp_path / "canonical/glyph"
+
+    promoted = promote_validated_output(source, attempt_root, canonical, receipt_fixture())
+
+    assert promoted == canonical
+    assert (canonical / "adapter.bin").read_bytes() == b"frozen adapter bytes"
+    assert (source / "adapter.bin").read_bytes() == b"frozen adapter bytes"
+    with pytest.raises(FileExistsError, match="canonical output already exists"):
+        promote_validated_output(source, tmp_path / "runs/attempts/a2", canonical, receipt_fixture())
+
+
+def test_rescheduled_executions_get_distinct_uuid_attempt_ids() -> None:
+    """Would fail if a reschedule could reuse an attempt's mutable namespace."""
+    first = create_attempt_id()
+    second = create_attempt_id()
+    assert first != second
+    assert len(first) == 36
+    assert len(second) == 36
