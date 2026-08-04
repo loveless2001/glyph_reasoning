@@ -118,7 +118,7 @@ def build_pilot_plan(
     if not _is_sha256(source_hash) or not _is_sha256(dependency_lock_hash):
         raise ValueError("source and dependency lock hashes must be lowercase sha256 values")
 
-    root = _repo_root_for_artifact_root(artifact_root)
+    root, config_path, artifact_root = _approved_pilot_paths(config_path, artifact_root)
     _reject_duplicate_artifact_ids(bundle.artifact_ids)
     validate_bundle_at_root(bundle, root)
     bundle_split_id, *bundle_materialization_ids = _bundle_artifact_ids(bundle, artifact_root)
@@ -320,11 +320,18 @@ def _is_sha256(value: object) -> bool:
     )
 
 
-def _repo_root_for_artifact_root(artifact_root: Path) -> Path:
-    resolved = Path(artifact_root).resolve()
-    if resolved.name != "phase-marker" or resolved.parent.name != "artifacts":
-        raise ValueError("artifact root must be repo-root/artifacts/phase-marker")
-    return resolved.parent.parent
+def _approved_pilot_paths(config_path: Path, artifact_root: Path) -> tuple[Path, Path, Path]:
+    resolved_config = Path(config_path).resolve()
+    if resolved_config.parent.name != "configs":
+        raise ValueError("config path must be the approved configuration")
+    repo_root = resolved_config.parent.parent
+    approved_config = (repo_root / "configs/phase-marker-qwen25-7b.toml").resolve()
+    if resolved_config != approved_config:
+        raise ValueError("config path must be the approved configuration")
+    approved_artifact_root = (repo_root / "artifacts/phase-marker").resolve()
+    if Path(artifact_root).resolve() != approved_artifact_root:
+        raise ValueError("artifact root must be the approved artifact root")
+    return repo_root, approved_config, approved_artifact_root
 
 
 def _bundle_artifact_ids(bundle: InputBundle, artifact_root: Path) -> tuple[str, ...]:

@@ -192,6 +192,79 @@ def test_plan_rejects_missing_or_duplicate_bundle_artifact_ids(repo_fixture: Pat
         )
 
 
+def test_plan_requires_the_bundled_config_and_canonical_artifact_root(
+    repo_fixture: Path,
+) -> None:
+    config_path = repo_fixture / CONFIG_PATH
+    artifact_root = repo_fixture / "artifacts/phase-marker"
+    bundle = build_input_bundle(repo_fixture)
+    alternate_config = repo_fixture / "configs/alternate.toml"
+    shutil.copyfile(config_path, alternate_config)
+    alternate_artifact_root = repo_fixture / "artifacts/alternate-phase-marker"
+    alternate_artifact_root.mkdir()
+    config_link = repo_fixture / "configs/alternate-link.toml"
+    config_link.symlink_to(alternate_config)
+    artifact_link = repo_fixture / "artifacts/alternate-link"
+    artifact_link.symlink_to(alternate_artifact_root, target_is_directory=True)
+
+    for path in (
+        alternate_config,
+        config_link,
+        repo_fixture / "configs/../configs/alternate.toml",
+    ):
+        with pytest.raises(ValueError, match="approved configuration"):
+            modal_plan.build_pilot_plan(
+                path, artifact_root, bundle=bundle,
+                source_hash=SOURCE_HASH, dependency_lock_hash=LOCK_HASH,
+            )
+    for path in (
+        alternate_artifact_root,
+        artifact_link,
+        repo_fixture / "artifacts/../artifacts/alternate-phase-marker",
+    ):
+        with pytest.raises(ValueError, match="approved artifact root"):
+            modal_plan.build_pilot_plan(
+                config_path, path, bundle=bundle,
+                source_hash=SOURCE_HASH, dependency_lock_hash=LOCK_HASH,
+            )
+
+    canonical_config_alias = repo_fixture / "configs/canonical-link.toml"
+    canonical_config_alias.symlink_to(config_path)
+    canonical_artifact_alias = repo_fixture / "artifacts/canonical-link"
+    canonical_artifact_alias.symlink_to(artifact_root, target_is_directory=True)
+    plan = modal_plan.build_pilot_plan(
+        repo_fixture / "configs/../configs/canonical-link.toml",
+        repo_fixture / "artifacts/../artifacts/canonical-link",
+        bundle=bundle,
+        source_hash=SOURCE_HASH,
+        dependency_lock_hash=LOCK_HASH,
+    )
+    assert plan.config_hash == sha256_json(asdict(ExperimentConfig.load(config_path)))
+
+
+def test_cli_requires_the_bundled_config_and_canonical_artifact_root(
+    repo_fixture: Path,
+) -> None:
+    lock = repo_fixture / "requirements-modal-phase-marker.txt"
+    lock.write_text("example==1\n", encoding="utf-8")
+    alternate_config = repo_fixture / "configs/alternate.toml"
+    shutil.copyfile(repo_fixture / CONFIG_PATH, alternate_config)
+    alternate_artifact_root = repo_fixture / "artifacts/alternate-phase-marker"
+    alternate_artifact_root.mkdir()
+    common = ["--repo-root", str(repo_fixture), "--dependency-lock", lock.name]
+
+    with pytest.raises(ValueError, match="approved configuration"):
+        modal_plan.main([
+            "plan", *common, "--config", "configs/alternate.toml",
+            "--artifact-root", "artifacts/phase-marker",
+        ])
+    with pytest.raises(ValueError, match="approved artifact root"):
+        modal_plan.main([
+            "run-id", *common, "--config", str(CONFIG_PATH),
+            "--artifact-root", "artifacts/alternate-phase-marker",
+        ])
+
+
 def test_cli_prints_plan_or_only_run_id_without_side_effects(
     repo_fixture: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
