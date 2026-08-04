@@ -340,11 +340,16 @@ def _train(arguments: argparse.Namespace, command_arguments: list[str]) -> int:
         arguments.output_dir / "run-manifest.json"
     ).exists():
         raise FileExistsError("refusing to overwrite an immutable completed run manifest")
+    _require_single_process_world_size()
+    if not torch.cuda.is_available() or not is_torch_bf16_gpu_available():
+        raise RuntimeError("LoRA training requires a BF16-capable CUDA device")
+    if torch.cuda.device_count() != 1:
+        raise ValueError(
+            "LoRA training requires exactly one visible CUDA device for effective batch size 16"
+        )
     training_arguments = build_training_arguments(
         config, arguments.arm, arguments.seed, arguments.output_dir
     )
-    if not torch.cuda.is_available() or not is_torch_bf16_gpu_available():
-        raise RuntimeError("LoRA training requires a BF16-capable CUDA device")
 
     from datasets import Dataset
     from peft import get_peft_model

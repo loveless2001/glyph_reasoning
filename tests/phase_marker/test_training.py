@@ -6,6 +6,7 @@ import re
 
 import pytest
 
+import phase_marker.training as training
 from phase_marker.config import ExperimentConfig
 from phase_marker.io import canonical_json, sha256_json
 from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
@@ -379,3 +380,37 @@ def test_training_arguments_reject_multi_process_world_size(
 
     with pytest.raises(ValueError, match="world size must be exactly 1"):
         build_training_arguments(config, "glyph", 101, tmp_path / "run")
+
+
+def test_train_preflight_rejects_multiple_visible_cuda_devices(
+    config, tmp_path, monkeypatch
+):
+    data, _, _ = write_materialized_arm(tmp_path, config)
+    arguments = _build_parser().parse_args(
+        [
+            "train",
+            "--config",
+            "configs/phase-marker-qwen25-7b.toml",
+            "--arm",
+            "glyph",
+            "--seed",
+            "101",
+            "--data",
+            str(data),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--manifest",
+            str(tmp_path / "run-manifest.json"),
+        ]
+    )
+    monkeypatch.setattr(training.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(training, "is_torch_bf16_gpu_available", lambda: True)
+    monkeypatch.setattr(training.torch.cuda, "device_count", lambda: 2)
+
+    def fail_at_model_boundary(_model_id):
+        raise AssertionError("multi-device preflight crossed the model boundary")
+
+    monkeypatch.setattr(training, "_cached_model_snapshot", fail_at_model_boundary)
+
+    with pytest.raises(ValueError, match="exactly one visible CUDA device"):
+        training._train(arguments, [])
