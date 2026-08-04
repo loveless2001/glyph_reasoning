@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import builtins
-from dataclasses import replace
+from contextlib import contextmanager
+from dataclasses import asdict, replace
 import hashlib
+import io
+import importlib
 import importlib.util
 import json
 from pathlib import Path
@@ -16,8 +19,14 @@ import pytest
 
 from phase_marker.config import ExperimentConfig
 from phase_marker.io import canonical_json
-from phase_marker.modal_artifacts import build_input_bundle
+from phase_marker.modal_artifacts import (
+    build_input_bundle,
+    build_model_cache_manifest,
+    hash_source_tree,
+)
+import phase_marker.modal_artifacts as modal_artifacts
 import phase_marker.modal_plan as modal_plan
+from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
 from tests.phase_marker.test_pipeline import _write_materializations, _write_split
 
 
@@ -112,6 +121,53 @@ class FakeVolume:
         if name in {"commit", "reload"}:
             raise AssertionError(f"adapter attempted volume client RPC: {name}")
         raise AttributeError(name)
+
+
+class RecordingVolume:
+    """Small local stand-in for the Modal volume methods used by staging."""
+
+    def __init__(self, files: dict[str, bytes] | None = None) -> None:
+        self.files = dict(files or {})
+        self.put_calls: list[SimpleNamespace] = []
+
+    def listdir(self, path: str, *, recursive: bool = False) -> list[SimpleNamespace]:
+        assert recursive is True
+        prefix = path.rstrip("/") + "/"
+        return [
+            SimpleNamespace(path=remote_path, type="file")
+            for remote_path in sorted(self.files)
+            if remote_path == path or remote_path.startswith(prefix)
+        ]
+
+    def read_file(self, path: str) -> list[bytes]:
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return [self.files[path]]
+
+    @contextmanager
+    def batch_upload(self) -> object:
+        pending: list[tuple[str, bytes]] = []
+
+        class Batch:
+            def put_file(inner_self, local_file: object, remote_path: str) -> None:
+                if isinstance(local_file, (str, Path)):
+                    content = Path(local_file).read_bytes()
+                else:
+                    assert isinstance(local_file, io.BytesIO)
+                    content = local_file.getvalue()
+                self.put_calls.append(SimpleNamespace(remote_path=remote_path, content=content))
+                pending.append((remote_path, content))
+
+        yield Batch()
+        self.files.update(pending)
+
+
+class CommitOnlyVolume:
+    def __init__(self) -> None:
+        self.commit_count = 0
+
+    def commit(self) -> None:
+        self.commit_count += 1
 
 
 class FakeApp:
@@ -382,12 +438,46 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
     )
     assert "gpu" not in status_options
 
-    assert set(imported_adapter.app.remote_functions) == {"gpu_resources", "status_resources"}
+    cache_options = next(
+        call[1] for call in fake.declaration_calls
+        if call[0] == "function" and set(call[1]["volumes"]) == {"/model-cache"}
+    )
+    assert cache_options == {
+        "image": imported_adapter.cpu_image,
+        "cpu": 4.0,
+        "memory": 32_768,
+        "timeout": 7_200,
+        "retries": 0,
+        "volumes": {"/model-cache": imported_adapter.model_volume},
+    }
+    smoke_options = next(
+        call[1] for call in fake.declaration_calls
+        if call[0] == "function" and set(call[1]["volumes"]) == {
+            "/mnt/inputs", "/mnt/model", "/mnt/runs",
+        } and "gpu" not in call[1]
+    )
+    assert smoke_options["image"] is imported_adapter.cpu_image
+    assert smoke_options["cpu"] == 2.0
+    assert smoke_options["memory"] == 8_192
+    assert smoke_options["timeout"] == 900
+    assert smoke_options["retries"] == 0
+    assert smoke_options["volumes"]["/mnt/inputs"].read_only is True
+    assert smoke_options["volumes"]["/mnt/model"].read_only is True
+    assert smoke_options["volumes"]["/mnt/runs"] is imported_adapter.runs_volume
+
+    assert set(imported_adapter.app.remote_functions) == {
+        "cache_model_remote", "smoke_remote", "gpu_resources", "status_resources",
+    }
+    assert isinstance(imported_adapter.cache_model_remote, imported_adapter.RemoteFunction)
+    assert isinstance(imported_adapter.smoke_remote, imported_adapter.RemoteFunction)
     assert isinstance(imported_adapter.gpu_resources, imported_adapter.RemoteFunction)
     assert isinstance(imported_adapter.status_resources, imported_adapter.RemoteFunction)
     assert [
         call[1] for call in fake.declaration_calls if call[0] == "local_entrypoint_decorated"
-    ] == ["status"]
+    ] == ["status", "stage_inputs", "cache_model", "smoke"]
+    assert "plan" not in [
+        call[1] for call in fake.declaration_calls if call[0] == "local_entrypoint_decorated"
+    ]
 
 
 def test_apply_approved_app_tags_validates_before_the_client_rpc(
@@ -469,3 +559,475 @@ def test_pure_python_plan_cli_does_not_import_or_call_modal(
     assert modal_imports == ["modal"]
     assert fake.declaration_calls
     assert fake.rpc_calls == []
+
+
+def _bundle_volume_files(bundle: object, repo_root: Path) -> dict[str, bytes]:
+    bundle_id = bundle.bundle_id
+    files = {
+        f"/bundles/{bundle_id}/{item.path}": (repo_root / item.path).read_bytes()
+        for item in bundle.files
+    }
+    files[f"/bundles/{bundle_id}/bundle-manifest.json"] = (
+        canonical_json(asdict(bundle)) + "\n"
+    ).encode("utf-8")
+    return files
+
+
+def test_stage_inputs_uploads_only_allowlisted_bundle(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if staging omitted an input or uploaded an unapproved local file."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume = RecordingVolume()
+    monkeypatch.chdir(pilot_repo)
+
+    result = imported_adapter.stage_inputs_local(
+        bundle,
+        volume,
+        approved_run_id=plan.run_id,
+        plan=plan,
+        budget_acknowledged=True,
+    )
+
+    assert [call.remote_path for call in volume.put_calls] == [
+        f"/bundles/{bundle.bundle_id}/{item.path}" for item in bundle.files
+    ] + [f"/bundles/{bundle.bundle_id}/bundle-manifest.json"]
+    assert result == {"bundle_id": bundle.bundle_id, "uploaded": True}
+    assert volume.files == _bundle_volume_files(bundle, pilot_repo)
+
+
+def test_byte_identical_restaging_is_noop(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if an identical bundle could be overwritten or uploaded twice."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume = RecordingVolume(_bundle_volume_files(bundle, pilot_repo))
+    monkeypatch.chdir(pilot_repo)
+
+    result = imported_adapter.stage_inputs_local(
+        bundle,
+        volume,
+        approved_run_id=plan.run_id,
+        plan=plan,
+        budget_acknowledged=True,
+    )
+
+    assert result == {"bundle_id": bundle.bundle_id, "uploaded": False}
+    assert volume.put_calls == []
+
+
+def test_stage_inputs_reads_the_repository_bound_into_the_plan(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if an explicit repository plan silently staged the process CWD."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    unrelated_cwd = tmp_path / "unrelated"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+    volume = RecordingVolume()
+
+    result = imported_adapter.stage_inputs_local(
+        bundle,
+        volume,
+        approved_run_id=plan.run_id,
+        plan=plan,
+        budget_acknowledged=True,
+    )
+
+    assert result["uploaded"] is True
+    assert volume.files == _bundle_volume_files(bundle, pilot_repo)
+
+
+def test_stage_inputs_rejects_conflicting_or_out_of_scope_remote_bytes(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if staging trusted a conflicting or escaped remote listing."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    expected = _bundle_volume_files(bundle, pilot_repo)
+    first_path = next(iter(expected))
+    monkeypatch.chdir(pilot_repo)
+
+    with pytest.raises(FileExistsError, match="conflicting remote bundle"):
+        imported_adapter.stage_inputs_local(
+            bundle,
+            RecordingVolume({first_path: b"wrong"}),
+            approved_run_id=plan.run_id,
+            plan=plan,
+            budget_acknowledged=True,
+        )
+
+    escaped = RecordingVolume()
+    escaped.listdir = lambda path, recursive=False: [
+        SimpleNamespace(path="/bundles/not-this-bundle/secret", type="file")
+    ]
+    with pytest.raises(ValueError, match="outside the bundle ID"):
+        imported_adapter.stage_inputs_local(
+            bundle,
+            escaped,
+            approved_run_id=plan.run_id,
+            plan=plan,
+            budget_acknowledged=True,
+        )
+
+    file_at_directory = RecordingVolume()
+    file_at_directory.listdir = lambda path, recursive=False: [
+        SimpleNamespace(path=f"/bundles/{bundle.bundle_id}/configs", type="file")
+    ]
+    with pytest.raises(FileExistsError, match="conflicting remote bundle path"):
+        imported_adapter.stage_inputs_local(
+            bundle,
+            file_at_directory,
+            approved_run_id=plan.run_id,
+            plan=plan,
+            budget_acknowledged=True,
+        )
+    assert file_at_directory.put_calls == []
+
+
+def test_stage_inputs_requires_budget_and_matching_full_identities(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a partial approval or unrelated bundle could mutate the volume."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    monkeypatch.chdir(pilot_repo)
+
+    for approved_run_id, approved_plan, acknowledged, message in (
+        (plan.run_id[:-1], plan, True, "full approved run ID"),
+        (plan.run_id, plan, False, "USD 1000"),
+        (plan.run_id, replace(plan, bundle_id="0" * 64), True, "bundle identity"),
+    ):
+        volume = RecordingVolume()
+        with pytest.raises(ValueError, match=message):
+            imported_adapter.stage_inputs_local(
+                bundle,
+                volume,
+                approved_run_id=approved_run_id,
+                plan=approved_plan,
+                budget_acknowledged=acknowledged,
+            )
+        assert volume.put_calls == []
+
+
+def _write_smoke_model_cache(model_root: Path) -> tuple[Path, Path]:
+    snapshot = (
+        model_root / "canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots"
+        / QWEN25_7B_TOKENIZER_REVISION
+    )
+    snapshot.mkdir(parents=True)
+    metadata = (
+        (
+            "config.json",
+            {
+                "architectures": ["Qwen2ForCausalLM"],
+                "hidden_size": 3584,
+                "intermediate_size": 18944,
+                "model_type": "qwen2",
+                "num_attention_heads": 28,
+                "num_hidden_layers": 28,
+                "num_key_value_heads": 4,
+                "vocab_size": 152064,
+            },
+        ),
+        (
+            "generation_config.json",
+            {"bos_token_id": 151643, "eos_token_id": 151645, "pad_token_id": 151643},
+        ),
+        (
+            "tokenizer.json",
+            {
+                "version": "1.0",
+                "added_tokens": [{"id": 0, "content": "<|endoftext|>"}],
+                "normalizer": {"type": "NFC"},
+                "pre_tokenizer": {"type": "Sequence", "pretokenizers": []},
+                "post_processor": {"type": "ByteLevel"},
+                "decoder": {"type": "ByteLevel"},
+                "model": {
+                    "type": "BPE",
+                    "vocab": {"<|endoftext|>": 0, "t": 1, "o": 2, "to": 3},
+                    "merges": ["t o"],
+                },
+            },
+        ),
+        (
+            "tokenizer_config.json",
+            {
+                "tokenizer_class": "Qwen2Tokenizer",
+                "chat_template": "{{ message['content'] }}",
+                "model_max_length": 131072,
+            },
+        ),
+        (
+            "model.safetensors.index.json",
+            {
+                "metadata": {"total_size": 4},
+                "weight_map": {"model.weight": "model-00001-of-00001.safetensors"},
+            },
+        ),
+    )
+    for name, payload in metadata:
+        (snapshot / name).write_text(json.dumps(payload), encoding="utf-8")
+    (snapshot / "model-00001-of-00001.safetensors").write_bytes(b"fake weights\n")
+    manifest = build_model_cache_manifest(snapshot)
+    manifest_path = snapshot.parent / f"{QWEN25_7B_TOKENIZER_REVISION}.manifest.json"
+    manifest_path.write_text(canonical_json(asdict(manifest)) + "\n", encoding="utf-8")
+    return snapshot, manifest_path
+
+
+def _prepare_smoke_roots(
+    pilot_repo: Path, tmp_path: Path,
+) -> tuple[modal_plan.PilotPlan, Path, Path, Path]:
+    source_package = pilot_repo / "phase_marker"
+    source_package.mkdir()
+    (source_package / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (pilot_repo / "modal_phase_marker.py").write_text("APP = 'smoke'\n", encoding="utf-8")
+    source_hash = hash_source_tree(pilot_repo)
+    lock_hash = modal_plan._file_sha256(pilot_repo / LOCK_PATH.name)
+    bundle = build_input_bundle(pilot_repo)
+    plan = modal_plan.build_pilot_plan(
+        pilot_repo / CONFIG_PATH,
+        pilot_repo / "artifacts/phase-marker",
+        bundle=bundle,
+        source_hash=source_hash,
+        dependency_lock_hash=lock_hash,
+    )
+
+    input_root = tmp_path / "inputs"
+    for remote_path, content in _bundle_volume_files(bundle, pilot_repo).items():
+        destination = input_root / remote_path.lstrip("/")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+    model_root = tmp_path / "model"
+    _write_smoke_model_cache(model_root)
+    run_root = tmp_path / "runs"
+    return plan, input_root, model_root, run_root
+
+
+def test_cpu_smoke_validates_imports_source_bundle_and_cache_without_loading_model(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if smoke skipped a preflight input or instantiated model weights."""
+    plan, input_root, model_root, run_root = _prepare_smoke_roots(pilot_repo, tmp_path)
+    imported: list[str] = []
+
+    class ImportProbe:
+        __version__ = "locked-test-version"
+
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"smoke accessed runtime API while importing: {name}")
+
+    def import_module(name: str) -> ImportProbe:
+        imported.append(name)
+        return ImportProbe()
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    monkeypatch.setattr(imported_adapter, "CODE_ROOT", pilot_repo)
+    monkeypatch.setattr(imported_adapter, "INPUT_MOUNT_ROOT", input_root)
+    monkeypatch.setattr(imported_adapter, "MODEL_MOUNT_ROOT", model_root)
+    monkeypatch.setattr(imported_adapter, "RUN_MOUNT_ROOT", run_root)
+    run_volume = CommitOnlyVolume()
+    monkeypatch.setattr(imported_adapter, "runs_volume", run_volume)
+
+    result = imported_adapter.smoke_remote.local(modal_plan.pilot_plan_payload(plan))
+
+    assert imported == list(imported_adapter.LOCKED_RUNTIME_IMPORTS)
+    assert run_volume.commit_count == 1
+    receipt_path = Path(str(result["receipt_path"]))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["validated"] is True
+    assert receipt["run_id"] == plan.run_id
+    assert receipt["source_hash"] == plan.source_hash
+    assert receipt["bundle_id"] == plan.bundle_id
+    assert receipt["model_revision"] == QWEN25_7B_TOKENIZER_REVISION
+    assert receipt_path.stem == receipt["artifact_id"]
+    assert receipt["artifact_id"] == modal_artifacts.sha256_json({
+        key: value for key, value in receipt.items() if key != "artifact_id"
+    })
+
+
+def test_cpu_smoke_persists_content_addressed_failure_and_reraises(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if an import failure disappeared or returned a successful receipt."""
+    plan, input_root, model_root, run_root = _prepare_smoke_roots(pilot_repo, tmp_path)
+
+    def fail_import(name: str) -> SimpleNamespace:
+        if name == "vllm":
+            raise ImportError("simulated locked import failure")
+        return SimpleNamespace(__version__="locked-test-version")
+
+    monkeypatch.setattr(importlib, "import_module", fail_import)
+    monkeypatch.setattr(imported_adapter, "CODE_ROOT", pilot_repo)
+    monkeypatch.setattr(imported_adapter, "INPUT_MOUNT_ROOT", input_root)
+    monkeypatch.setattr(imported_adapter, "MODEL_MOUNT_ROOT", model_root)
+    monkeypatch.setattr(imported_adapter, "RUN_MOUNT_ROOT", run_root)
+    run_volume = CommitOnlyVolume()
+    monkeypatch.setattr(imported_adapter, "runs_volume", run_volume)
+
+    with pytest.raises(ImportError, match="simulated locked import failure"):
+        imported_adapter.smoke_remote.local(modal_plan.pilot_plan_payload(plan))
+
+    receipts = list((run_root / f"runs/{plan.run_id}/receipts/smoke").glob("*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipt["validated"] is False
+    assert "ImportError" in receipt["failure_reason"]
+    assert receipts[0].stem == receipt["artifact_id"]
+    assert run_volume.commit_count == 1
+
+
+def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Would fail if an operator action crossed its boundary before attribution and disclosure."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    monkeypatch.setattr(imported_adapter, "_build_operator_context", lambda root: (bundle, plan))
+    boundaries: list[tuple[str, object]] = []
+
+    def stage_boundary(*args: object, **kwargs: object) -> dict[str, object]:
+        assert imported_adapter.fake_modal.rpc_calls[-1][0] == "set_tags"
+        boundaries.append(("stage-inputs", kwargs))
+        return {"bundle_id": bundle.bundle_id, "uploaded": True}
+
+    class RemoteBoundary:
+        def __init__(self, name: str, result: dict[str, object]) -> None:
+            self.name = name
+            self.result = result
+
+        def remote(self, payload: object) -> dict[str, object]:
+            assert imported_adapter.fake_modal.rpc_calls[-1][0] == "set_tags"
+            boundaries.append((self.name, payload))
+            return self.result
+
+    monkeypatch.setattr(imported_adapter, "stage_inputs_local", stage_boundary)
+    monkeypatch.setattr(
+        imported_adapter,
+        "cache_model_remote",
+        RemoteBoundary("cache-model", {"artifact_id": "a" * 64}),
+    )
+    monkeypatch.setattr(
+        imported_adapter,
+        "smoke_remote",
+        RemoteBoundary(
+            "smoke",
+            {"artifact_id": "b" * 64, "receipt_path": f"/runs/{plan.run_id}/smoke.json"},
+        ),
+    )
+
+    imported_adapter.stage_inputs(
+        repo_root=str(pilot_repo),
+        approved_run_id=plan.run_id,
+        budget_acknowledged=True,
+    )
+    stage_output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert stage_output[0] == {
+        "operation": "stage-inputs",
+        "run_id": plan.run_id,
+        "bundle_id": bundle.bundle_id,
+        "file_count": len(bundle.files) + 1,
+        "destination": f"{imported_adapter.VOLUME_NAMES[0]}:/bundles/{bundle.bundle_id}",
+        "budget_acknowledged_usd": 1_000.0,
+    }
+
+    imported_adapter.cache_model(
+        repo_root=str(pilot_repo),
+        approved_run_id=plan.run_id,
+        budget_acknowledged=True,
+    )
+    cache_output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert cache_output[0] == {
+        "operation": "cache-model",
+        "run_id": plan.run_id,
+        "model_revision": QWEN25_7B_TOKENIZER_REVISION,
+        "cpu": 4.0,
+        "memory_mib": 32_768,
+        "timeout_seconds": 7_200,
+        "destination": f"{imported_adapter.VOLUME_NAMES[1]}:/model-cache/canonical",
+        "source_hash": plan.source_hash,
+        "dependency_lock_hash": plan.dependency_lock_hash,
+        "budget_acknowledged_usd": 1_000.0,
+    }
+
+    imported_adapter.smoke(
+        repo_root=str(pilot_repo),
+        approved_run_id=plan.run_id,
+        budget_acknowledged=True,
+    )
+    smoke_output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert smoke_output[0] == {
+        "operation": "smoke",
+        "run_id": plan.run_id,
+        "hardware": "CPU",
+        "cpu": 2.0,
+        "memory_mib": 8_192,
+        "timeout_seconds": 900,
+        "checks": ["locked-imports", "source-hash", "dependency-lock-hash", "input-bundle", "model-cache"],
+        "budget_acknowledged_usd": 1_000.0,
+    }
+    assert smoke_output[1]["receipt_path"] == f"/runs/{plan.run_id}/smoke.json"
+    assert [name for name, _ in boundaries] == ["stage-inputs", "cache-model", "smoke"]
+
+
+@pytest.mark.parametrize("entrypoint", ("stage_inputs", "cache_model", "smoke"))
+@pytest.mark.parametrize(
+    ("approved_run_id", "budget_acknowledged", "message"),
+    (("truncated", True, "full approved run ID"), ("valid", False, "USD 1000")),
+)
+def test_operator_entrypoints_reject_before_tags_or_remote_boundary(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+    approved_run_id: str,
+    budget_acknowledged: bool,
+    message: str,
+) -> None:
+    """Would fail if an incomplete operator acknowledgement caused any remote action."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    monkeypatch.setattr(imported_adapter, "_build_operator_context", lambda root: (bundle, plan))
+    monkeypatch.setattr(
+        imported_adapter,
+        "stage_inputs_local",
+        lambda *args, **kwargs: pytest.fail("crossed staging boundary"),
+    )
+    forbidden_remote = SimpleNamespace(
+        remote=lambda *args, **kwargs: pytest.fail("crossed compute boundary")
+    )
+    monkeypatch.setattr(imported_adapter, "cache_model_remote", forbidden_remote)
+    monkeypatch.setattr(imported_adapter, "smoke_remote", forbidden_remote)
+    actual_run_id = plan.run_id if approved_run_id == "valid" else approved_run_id
+
+    with pytest.raises(ValueError, match=message):
+        getattr(imported_adapter, entrypoint)(
+            repo_root=str(pilot_repo),
+            approved_run_id=actual_run_id,
+            budget_acknowledged=budget_acknowledged,
+        )
+
+    assert imported_adapter.fake_modal.rpc_calls == []

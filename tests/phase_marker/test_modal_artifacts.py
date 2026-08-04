@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -42,6 +43,23 @@ from tests.phase_marker.test_pipeline import _write_materializations, _write_spl
 CONFIG_PATH = Path("configs/phase-marker-qwen25-7b.toml")
 SOURCE_HASH = "1" * 64
 LOCK_HASH = "2" * 64
+
+
+class CommitVolume:
+    def __init__(self, on_commit: object | None = None) -> None:
+        self.commit_count = 0
+        self.on_commit = on_commit
+
+    def commit(self) -> None:
+        if self.on_commit is not None:
+            self.on_commit()
+        self.commit_count += 1
+
+
+class FailingCommitVolume(CommitVolume):
+    def commit(self) -> None:
+        self.commit_count += 1
+        raise RuntimeError("simulated receipt commit failure")
 
 
 def _pinned_qwen_model_config() -> dict[str, object]:
@@ -320,6 +338,226 @@ def test_real_pinned_qwen_model_cache_is_valid_when_full_offline_snapshot_exists
     manifest = build_model_cache_manifest(snapshot)
 
     validate_model_cache_manifest(snapshot, manifest)
+
+
+def _cache_plan_payload(repo_fixture: Path) -> dict[str, object]:
+    bundle = build_input_bundle(repo_fixture)
+    plan = modal_plan.build_pilot_plan(
+        repo_fixture / CONFIG_PATH,
+        repo_fixture / "artifacts/phase-marker",
+        bundle=bundle,
+        source_hash=SOURCE_HASH,
+        dependency_lock_hash=LOCK_HASH,
+    )
+    return modal_plan.pilot_plan_payload(plan)
+
+
+def _install_fake_snapshot_download(
+    monkeypatch: pytest.MonkeyPatch,
+    source: Path,
+    calls: list[dict[str, object]],
+) -> None:
+    def snapshot_download(**kwargs: object) -> str:
+        calls.append(dict(kwargs))
+        destination = (
+            Path(str(kwargs["cache_dir"]))
+            / "models--Qwen--Qwen2.5-7B-Instruct"
+            / "snapshots"
+            / QWEN25_7B_TOKENIZER_REVISION
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination)
+        return str(destination)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", snapshot_download)
+
+
+def test_cache_model_downloads_pinned_revision_validates_then_promotes_once(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if cache publication preceded full validation or used a floating revision."""
+    cache_root = tmp_path / "model-cache"
+    calls: list[dict[str, object]] = []
+    _install_fake_snapshot_download(monkeypatch, qwen_snapshot, calls)
+    observed_at_commit: list[tuple[Path, Path]] = []
+
+    def assert_complete_at_commit() -> None:
+        canonical = (
+            cache_root / "canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots"
+            / QWEN25_7B_TOKENIZER_REVISION
+        )
+        manifest_path = canonical.parent / f"{QWEN25_7B_TOKENIZER_REVISION}.manifest.json"
+        manifest = modal_artifacts.load_model_cache_manifest(manifest_path)
+        validate_model_cache_manifest(canonical, manifest)
+        observed_at_commit.append((canonical, manifest_path))
+
+    volume = CommitVolume(assert_complete_at_commit)
+    result = modal_artifacts.cache_model_to_volume(
+        plan_payload=_cache_plan_payload(repo_fixture),
+        cache_root=cache_root,
+        volume=volume,
+    )
+
+    assert calls == [{
+        "repo_id": "Qwen/Qwen2.5-7B-Instruct",
+        "revision": QWEN25_7B_TOKENIZER_REVISION,
+        "cache_dir": str(cache_root / "hub"),
+    }]
+    assert volume.commit_count == 1
+    assert len(observed_at_commit) == 1
+    canonical, manifest_path = observed_at_commit[0]
+    assert Path(str(result["snapshot_path"])) == canonical
+    assert Path(str(result["manifest_path"])) == manifest_path
+    assert not manifest_path.is_relative_to(canonical)
+    assert result["cached"] is True
+    assert result["artifact_id"] == modal_artifacts.load_model_cache_manifest(
+        manifest_path
+    ).artifact_id
+
+
+def test_cache_model_identical_repeat_is_noop_and_conflict_never_overwrites(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a cache retry redownloaded or overwrote canonical model bytes."""
+    cache_root = tmp_path / "model-cache"
+    calls: list[dict[str, object]] = []
+    _install_fake_snapshot_download(monkeypatch, qwen_snapshot, calls)
+    first_volume = CommitVolume()
+    first = modal_artifacts.cache_model_to_volume(
+        plan_payload=_cache_plan_payload(repo_fixture), cache_root=cache_root,
+        volume=first_volume,
+    )
+    canonical = Path(str(first["snapshot_path"]))
+    original = (canonical / "config.json").read_bytes()
+
+    second_volume = CommitVolume()
+    second = modal_artifacts.cache_model_to_volume(
+        plan_payload=_cache_plan_payload(repo_fixture), cache_root=cache_root,
+        volume=second_volume,
+    )
+    assert second == {**first, "cached": False}
+    assert len(calls) == 1
+    assert second_volume.commit_count == 0
+
+    (canonical / "config.json").write_bytes(b"conflicting canonical bytes")
+    with pytest.raises(ValueError, match="canonical model cache conflicts"):
+        modal_artifacts.cache_model_to_volume(
+            plan_payload=_cache_plan_payload(repo_fixture), cache_root=cache_root,
+            volume=CommitVolume(),
+        )
+    assert (canonical / "config.json").read_bytes() != original
+    assert len(calls) == 1
+
+
+def test_cache_model_validates_plan_before_download_and_records_failed_attempt(
+    repo_fixture: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if invalid approval data reached Hugging Face or failures lacked evidence."""
+    cache_root = tmp_path / "model-cache"
+    invalid = _cache_plan_payload(repo_fixture)
+    invalid["model_revision"] = "main"
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        lambda **kwargs: calls.append(dict(kwargs)) or pytest.fail("downloaded invalid plan"),
+    )
+    volume = CommitVolume()
+
+    with pytest.raises(ValueError, match="plan payload"):
+        modal_artifacts.cache_model_to_volume(
+            plan_payload=invalid, cache_root=cache_root, volume=volume,
+        )
+    assert calls == []
+    receipts = list(cache_root.glob("attempts/cache-model/*/receipt.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipt["validated"] is False
+    assert receipt["stage"] == "cache-model"
+    assert receipt["artifact_id"] == sha256_json({
+        key: value for key, value in receipt.items() if key != "artifact_id"
+    })
+    assert volume.commit_count == 1
+
+
+@pytest.mark.parametrize("mutation", ("extra-resource", "empty-command"))
+def test_cache_model_rejects_nested_plan_drift_before_download(
+    repo_fixture: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """Would fail if nested resource or job drift reached the download boundary."""
+    payload = deepcopy(_cache_plan_payload(repo_fixture))
+    if mutation == "extra-resource":
+        payload["resources"]["unapproved"] = True
+    else:
+        payload["jobs"][0]["training_command"] = ""
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        lambda **kwargs: calls.append(dict(kwargs)) or pytest.fail("downloaded drifted plan"),
+    )
+
+    with pytest.raises(ValueError, match="plan payload"):
+        modal_artifacts.cache_model_to_volume(
+            plan_payload=payload,
+            cache_root=tmp_path / "model-cache",
+            volume=CommitVolume(),
+        )
+    assert calls == []
+
+
+def test_cache_failure_preserves_original_error_when_receipt_commit_fails(
+    repo_fixture: Path, tmp_path: Path,
+) -> None:
+    """Would fail if evidence persistence masked the cache failure operators need."""
+    payload = _cache_plan_payload(repo_fixture)
+    payload["model_revision"] = "main"
+    volume = FailingCommitVolume()
+
+    with pytest.raises(ValueError, match="plan payload") as raised:
+        modal_artifacts.cache_model_to_volume(
+            plan_payload=payload,
+            cache_root=tmp_path / "model-cache",
+            volume=volume,
+        )
+
+    assert volume.commit_count == 1
+    assert any("receipt persistence also failed" in note for note in raised.value.__notes__)
+
+
+def test_cpu_smoke_invalid_run_id_receipt_cannot_escape_run_root(
+    repo_fixture: Path, tmp_path: Path,
+) -> None:
+    """Would fail if malformed remote payload identity controlled a receipt path."""
+    payload = _cache_plan_payload(repo_fixture)
+    payload["run_id"] = "../../escaped"
+    run_root = tmp_path / "run-volume"
+    volume = CommitVolume()
+
+    with pytest.raises(ValueError, match="plan payload"):
+        modal_artifacts.run_cpu_smoke(
+            plan_payload=payload,
+            code_root=repo_fixture,
+            input_root=tmp_path / "inputs",
+            model_root=tmp_path / "model",
+            run_root=run_root,
+            volume=volume,
+            runtime_imports=("json",),
+        )
+
+    receipts = list((run_root / "runs/invalid-plan/receipts/smoke").glob("*.json"))
+    assert len(receipts) == 1
+    assert not (tmp_path / "escaped").exists()
+    assert volume.commit_count == 1
 
 
 def receipt_fixture(**changes: object) -> AttemptReceipt:

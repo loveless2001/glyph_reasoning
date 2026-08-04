@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -70,6 +71,60 @@ _PINNED_QWEN_GENERATION_METADATA = {
     "eos_token_id": 151645,
     "pad_token_id": 151643,
 }
+_PLAN_PAYLOAD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "seed",
+        "config_hash",
+        "split_artifact_id",
+        "materialization_artifact_ids",
+        "model_revision",
+        "source_hash",
+        "dependency_lock_hash",
+        "bundle_id",
+        "resources",
+        "jobs",
+        "run_id",
+    }
+)
+_PLAN_JOB_FIELDS = frozenset(
+    {
+        "arm",
+        "seed",
+        "model_revision",
+        "training_command",
+        "selection_command",
+        "expected_outputs",
+    }
+)
+_PLAN_RESOURCE_FIELDS = frozenset(
+    {
+        "hardware",
+        "timeout_seconds",
+        "max_containers",
+        "training_gpu_hours",
+        "selection_gpu_hours",
+        "behavior_gpu_hours",
+        "max_gpu_hours",
+        "stage_a_estimated_spend_usd",
+        "estimated_spend_usd",
+        "spend_cap_usd",
+    }
+)
+_EXPECTED_PLAN_RESOURCES = {
+    "hardware": "H100",
+    "timeout_seconds": 14_400,
+    "max_containers": 2,
+    "training_gpu_hours": 24.0,
+    "selection_gpu_hours": 24.0,
+    "behavior_gpu_hours": 72.0,
+    "max_gpu_hours": 120.0,
+    "stage_a_estimated_spend_usd": 250.0,
+    "estimated_spend_usd": 600.0,
+    "spend_cap_usd": 1_000.0,
+}
+_EXPECTED_PLAN_ARMS = ("semantic", "glyph", "dot", "random", "direct", "filler")
 
 
 class VolumeClient(Protocol):
@@ -638,6 +693,250 @@ def validate_model_cache_manifest(snapshot: Path, manifest: ModelCacheManifest) 
             raise ValueError(f"model cache file hash mismatch: {item.path}")
 
 
+def load_model_cache_manifest(path: Path) -> ModelCacheManifest:
+    """Read and validate the shape and content identity of a cache manifest."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("model cache manifest is missing or invalid") from error
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "schema_version", "model_id", "model_revision", "files", "artifact_id",
+    }:
+        raise ValueError("model cache manifest is missing or invalid")
+    files_payload = payload["files"]
+    if not isinstance(files_payload, list) or any(
+        not isinstance(item, Mapping) or set(item) != {"path", "size", "sha256"}
+        for item in files_payload
+    ):
+        raise ValueError("model cache manifest is missing or invalid")
+    try:
+        manifest = ModelCacheManifest(
+            schema_version=payload["schema_version"],
+            model_id=payload["model_id"],
+            model_revision=payload["model_revision"],
+            files=tuple(
+                ModelCacheFile(
+                    path=item["path"], size=item["size"], sha256=item["sha256"]
+                )
+                for item in files_payload
+            ),
+            artifact_id=payload["artifact_id"],
+        )
+    except (KeyError, TypeError) as error:
+        raise ValueError("model cache manifest is missing or invalid") from error
+    _validate_model_cache_manifest_shape(manifest)
+    return manifest
+
+
+def cache_model_to_volume(
+    *,
+    plan_payload: Mapping[str, object],
+    cache_root: Path,
+    volume: VolumeClient,
+) -> dict[str, object]:
+    """Populate and immutably publish the exact pinned Qwen cache on CPU."""
+    root = Path(cache_root).resolve()
+    attempt_id = create_attempt_id()
+    attempt_root = root / "attempts" / "cache-model" / attempt_id
+    try:
+        _validate_pilot_plan_payload(plan_payload)
+        canonical = (
+            root
+            / "canonical"
+            / "models--Qwen--Qwen2.5-7B-Instruct"
+            / "snapshots"
+            / QWEN25_7B_TOKENIZER_REVISION
+        )
+        manifest_path = canonical.parent / f"{QWEN25_7B_TOKENIZER_REVISION}.manifest.json"
+        existing = _existing_model_cache_result(canonical, manifest_path)
+        if existing is not None:
+            return existing
+
+        # Keep this import at the CPU execution boundary. Importing this module is offline.
+        from huggingface_hub import snapshot_download
+
+        downloaded = Path(
+            snapshot_download(
+                repo_id=REQUIRED_MODEL_ID,
+                revision=QWEN25_7B_TOKENIZER_REVISION,
+                cache_dir=str(root / "hub"),
+            )
+        )
+        hub_root = (root / "hub").resolve()
+        resolved_download = downloaded.resolve()
+        if not _is_within(resolved_download, hub_root):
+            raise ValueError("downloaded snapshot escaped the model cache hub")
+        source_manifest = build_model_cache_manifest(resolved_download)
+
+        staged = (
+            attempt_root
+            / "models--Qwen--Qwen2.5-7B-Instruct"
+            / "snapshots"
+            / QWEN25_7B_TOKENIZER_REVISION
+        )
+        staged.mkdir(parents=True)
+        for item in source_manifest.files:
+            destination = staged / item.path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(resolved_download / item.path, destination, follow_symlinks=True)
+        staged_manifest = build_model_cache_manifest(staged)
+        if staged_manifest != source_manifest:
+            raise ValueError("staged model cache does not match downloaded bytes")
+        validate_model_cache_manifest(staged, staged_manifest)
+
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        lock = canonical.parent / ".cache-promotion.lock"
+        try:
+            lock.touch(exist_ok=False)
+        except FileExistsError as error:
+            raise FileExistsError("canonical model cache promotion is already in progress") from error
+        try:
+            if canonical.exists() or manifest_path.exists():
+                raise FileExistsError("canonical model cache already exists")
+            staged.replace(canonical)
+            with manifest_path.open("x", encoding="utf-8") as handle:
+                handle.write(canonical_json(asdict(staged_manifest)) + "\n")
+        finally:
+            lock.unlink(missing_ok=True)
+
+        published_manifest = load_model_cache_manifest(manifest_path)
+        validate_model_cache_manifest(canonical, published_manifest)
+        volume.commit()
+        return _model_cache_result(
+            canonical, manifest_path, published_manifest, cached=True
+        )
+    except Exception as error:
+        try:
+            _write_cache_attempt_receipt(
+                attempt_root,
+                plan_payload=plan_payload,
+                attempt_id=attempt_id,
+                error=error,
+            )
+            volume.commit()
+        except Exception as persistence_error:
+            error.add_note(
+                "cache-model receipt persistence also failed: "
+                f"{type(persistence_error).__name__}: {persistence_error}"
+            )
+        raise
+
+
+def _existing_model_cache_result(
+    canonical: Path, manifest_path: Path,
+) -> dict[str, object] | None:
+    if not canonical.exists() and not manifest_path.exists():
+        return None
+    if not canonical.is_dir() or not manifest_path.is_file():
+        raise ValueError("canonical model cache conflicts with an incomplete publication")
+    try:
+        manifest = load_model_cache_manifest(manifest_path)
+        validate_model_cache_manifest(canonical, manifest)
+    except (OSError, ValueError) as error:
+        raise ValueError("canonical model cache conflicts with its manifest") from error
+    return _model_cache_result(canonical, manifest_path, manifest, cached=False)
+
+
+def _model_cache_result(
+    canonical: Path,
+    manifest_path: Path,
+    manifest: ModelCacheManifest,
+    *,
+    cached: bool,
+) -> dict[str, object]:
+    return {
+        "model_revision": manifest.model_revision,
+        "artifact_id": manifest.artifact_id,
+        "snapshot_path": str(canonical),
+        "manifest_path": str(manifest_path),
+        "cached": cached,
+    }
+
+
+def _validate_pilot_plan_payload(payload: Mapping[str, object]) -> None:
+    if not isinstance(payload, Mapping) or set(payload) != _PLAN_PAYLOAD_FIELDS:
+        raise ValueError("pilot plan payload fields are invalid")
+    hashes = (
+        payload["config_hash"],
+        payload["split_artifact_id"],
+        payload["source_hash"],
+        payload["dependency_lock_hash"],
+        payload["bundle_id"],
+    )
+    materialization_ids = payload["materialization_artifact_ids"]
+    resources = payload["resources"]
+    jobs = payload["jobs"]
+    if (
+        payload["schema_version"] != 1
+        or payload["kind"] != "pilot"
+        or payload["seed"] != _PILOT_SEED
+        or payload["model_revision"] != QWEN25_7B_TOKENIZER_REVISION
+        or not all(_is_sha256(value) for value in hashes)
+        or not isinstance(materialization_ids, list)
+        or len(materialization_ids) != len(_EXPECTED_PLAN_ARMS)
+        or not all(_is_sha256(value) for value in materialization_ids)
+        or len(set(materialization_ids)) != len(materialization_ids)
+        or not isinstance(resources, Mapping)
+        or set(resources) != _PLAN_RESOURCE_FIELDS
+        or dict(resources) != _EXPECTED_PLAN_RESOURCES
+        or not isinstance(jobs, list)
+        or len(jobs) != len(_EXPECTED_PLAN_ARMS)
+    ):
+        raise ValueError("pilot plan payload identity or resource envelope is invalid")
+    for arm, job in zip(_EXPECTED_PLAN_ARMS, jobs, strict=True):
+        if (
+            not isinstance(job, Mapping)
+            or set(job) != _PLAN_JOB_FIELDS
+            or job["arm"] != arm
+            or job["seed"] != _PILOT_SEED
+            or job["model_revision"] != QWEN25_7B_TOKENIZER_REVISION
+            or not isinstance(job["training_command"], str)
+            or not job["training_command"]
+            or not isinstance(job["selection_command"], str)
+            or not job["selection_command"]
+            or not isinstance(job["expected_outputs"], list)
+            or len(job["expected_outputs"]) != 5
+            or not all(
+                isinstance(path, str) and path for path in job["expected_outputs"]
+            )
+        ):
+            raise ValueError("pilot plan payload jobs are invalid")
+    expected_run_id = (
+        f"pilot-s42-cfg-{str(payload['config_hash'])[:8]}"
+        f"-split-{str(payload['split_artifact_id'])[:8]}"
+        f"-src-{str(payload['source_hash'])[:12]}"
+    )
+    if payload["run_id"] != expected_run_id:
+        raise ValueError("pilot plan payload run ID is invalid")
+
+
+def _write_cache_attempt_receipt(
+    attempt_root: Path,
+    *,
+    plan_payload: Mapping[str, object],
+    attempt_id: str,
+    error: Exception,
+) -> Path:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "stage": "cache-model",
+        "attempt_id": attempt_id,
+        "run_id": plan_payload.get("run_id") if isinstance(plan_payload, Mapping) else None,
+        "model_revision": (
+            plan_payload.get("model_revision") if isinstance(plan_payload, Mapping) else None
+        ),
+        "validated": False,
+        "promoted": False,
+        "failure_reason": f"{type(error).__name__}: {error}",
+    }
+    payload["artifact_id"] = sha256_json(payload)
+    attempt_root.mkdir(parents=True, exist_ok=True)
+    path = attempt_root / "receipt.json"
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(canonical_json(payload) + "\n")
+    return path
+
+
 def _pinned_qwen_snapshot_root(snapshot: Path) -> Path:
     root = Path(snapshot)
     if (
@@ -833,6 +1132,184 @@ def validate_bundle_at_root(bundle: InputBundle, root: Path) -> None:
             raise ValueError(f"bundle file is missing: {item.path}")
         if path.stat().st_size != item.size or _file_sha256(path) != item.sha256:
             raise ValueError(f"bundle file hash mismatch: {item.path}")
+
+
+def load_input_bundle(path: Path) -> InputBundle:
+    """Read a staged input-bundle manifest and validate its content identity."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("input bundle manifest is missing or invalid") from error
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "schema_version", "bundle_id", "files", "artifact_ids",
+    }:
+        raise ValueError("input bundle manifest is missing or invalid")
+    files_payload = payload["files"]
+    artifact_ids = payload["artifact_ids"]
+    if (
+        not isinstance(files_payload, list)
+        or any(
+            not isinstance(item, Mapping) or set(item) != {"path", "size", "sha256"}
+            for item in files_payload
+        )
+        or not isinstance(artifact_ids, list)
+    ):
+        raise ValueError("input bundle manifest is missing or invalid")
+    try:
+        bundle = InputBundle(
+            schema_version=payload["schema_version"],
+            bundle_id=payload["bundle_id"],
+            files=tuple(
+                BundleFile(path=item["path"], size=item["size"], sha256=item["sha256"])
+                for item in files_payload
+            ),
+            artifact_ids=tuple(artifact_ids),
+        )
+    except (KeyError, TypeError) as error:
+        raise ValueError("input bundle manifest is missing or invalid") from error
+    _validate_bundle_shape(bundle)
+    return bundle
+
+
+def run_cpu_smoke(
+    *,
+    plan_payload: Mapping[str, object],
+    code_root: Path,
+    input_root: Path,
+    model_root: Path,
+    run_root: Path,
+    volume: VolumeClient,
+    runtime_imports: tuple[str, ...],
+) -> dict[str, object]:
+    """Validate the locked CPU preflight and persist one content-addressed receipt."""
+    run_id = plan_payload.get("run_id") if isinstance(plan_payload, Mapping) else None
+    receipt_namespace = run_id if _is_path_identity(run_id) else "invalid-plan"
+    receipt_root = Path(run_root) / "runs" / receipt_namespace / "receipts" / "smoke"
+    imported: list[dict[str, object]] = []
+    model_cache_artifact_id: str | None = None
+    try:
+        _validate_pilot_plan_payload(plan_payload)
+        if not runtime_imports or len(set(runtime_imports)) != len(runtime_imports):
+            raise ValueError("locked runtime import list is invalid")
+        for name in runtime_imports:
+            if not isinstance(name, str) or not name:
+                raise ValueError("locked runtime import list is invalid")
+            module = importlib.import_module(name)
+            version = getattr(module, "__version__", None)
+            imported.append(
+                {"module": name, "version": version if isinstance(version, str) else None}
+            )
+
+        code = Path(code_root).resolve()
+        if hash_source_tree(code) != plan_payload["source_hash"]:
+            raise ValueError("CPU smoke source hash does not match the plan")
+        lock = code / "requirements-modal-phase-marker.txt"
+        if not lock.is_file() or _file_sha256(lock) != plan_payload["dependency_lock_hash"]:
+            raise ValueError("CPU smoke dependency lock hash does not match the plan")
+
+        bundle_root = Path(input_root) / "bundles" / str(plan_payload["bundle_id"])
+        bundle = load_input_bundle(bundle_root / "bundle-manifest.json")
+        if bundle.bundle_id != plan_payload["bundle_id"]:
+            raise ValueError("CPU smoke bundle identity does not match the plan")
+        validate_bundle_at_root(bundle, bundle_root)
+
+        snapshot = (
+            Path(model_root)
+            / "canonical"
+            / "models--Qwen--Qwen2.5-7B-Instruct"
+            / "snapshots"
+            / QWEN25_7B_TOKENIZER_REVISION
+        )
+        manifest_path = snapshot.parent / f"{QWEN25_7B_TOKENIZER_REVISION}.manifest.json"
+        manifest = load_model_cache_manifest(manifest_path)
+        validate_model_cache_manifest(snapshot, manifest)
+        model_cache_artifact_id = manifest.artifact_id
+
+        receipt = _cpu_smoke_receipt_payload(
+            plan_payload=plan_payload,
+            imported=imported,
+            model_cache_artifact_id=model_cache_artifact_id,
+            validated=True,
+            failure_reason=None,
+        )
+        receipt_path = _write_content_addressed_receipt(receipt_root, receipt)
+        volume.commit()
+        return {
+            "validated": True,
+            "artifact_id": receipt["artifact_id"],
+            "receipt_path": str(receipt_path),
+        }
+    except Exception as error:
+        receipt = _cpu_smoke_receipt_payload(
+            plan_payload=plan_payload,
+            imported=imported,
+            model_cache_artifact_id=model_cache_artifact_id,
+            validated=False,
+            failure_reason=f"{type(error).__name__}: {error}",
+        )
+        _write_content_addressed_receipt(receipt_root, receipt)
+        volume.commit()
+        raise
+
+
+def _cpu_smoke_receipt_payload(
+    *,
+    plan_payload: Mapping[str, object],
+    imported: list[dict[str, object]],
+    model_cache_artifact_id: str | None,
+    validated: bool,
+    failure_reason: str | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "stage": "smoke",
+        "hardware": "CPU",
+        "run_id": plan_payload.get("run_id"),
+        "source_hash": plan_payload.get("source_hash"),
+        "dependency_lock_hash": plan_payload.get("dependency_lock_hash"),
+        "bundle_id": plan_payload.get("bundle_id"),
+        "model_revision": plan_payload.get("model_revision"),
+        "model_cache_artifact_id": model_cache_artifact_id,
+        "imports": imported,
+        "validated": validated,
+        "failure_reason": failure_reason,
+    }
+    payload["artifact_id"] = sha256_json(payload)
+    return payload
+
+
+def _write_content_addressed_receipt(
+    receipt_root: Path, payload: Mapping[str, object],
+) -> Path:
+    artifact_id = payload.get("artifact_id")
+    if not _is_sha256(artifact_id):
+        raise ValueError("receipt artifact ID is invalid")
+    expected = sha256_json({key: value for key, value in payload.items() if key != "artifact_id"})
+    if artifact_id != expected:
+        raise ValueError("receipt artifact ID does not match its fields")
+    root = Path(receipt_root)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{artifact_id}.json"
+    content = canonical_json(dict(payload)) + "\n"
+    if path.exists():
+        if path.read_text(encoding="utf-8") != content:
+            raise FileExistsError("content-addressed receipt conflicts with existing bytes")
+        return path
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=root, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+        os.link(temporary, path)
+    except FileExistsError:
+        if not path.is_file() or path.read_text(encoding="utf-8") != content:
+            raise FileExistsError("content-addressed receipt conflicts with existing bytes")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return path
 
 
 def _bundle_file(root: Path, relative_path: str) -> BundleFile:
