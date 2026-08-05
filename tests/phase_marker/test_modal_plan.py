@@ -286,7 +286,8 @@ def test_approval_action_manifest_contains_only_inert_approved_boundaries(
     ):
         approval = modal_plan.action_approval_payload(plan, action=action)
         assert shlex.split(str(actions[key])) == [
-            "modal", "run", f"modal_phase_marker.py::{entrypoint}",
+            "modal", "run", "--env", "main",
+            f"modal_phase_marker.py::{entrypoint}",
             "--approved-run-id", plan.run_id,
             "--acknowledge-budget-usd", "1000",
             "--repo-root", ".",
@@ -373,8 +374,8 @@ def test_stage_a_action_is_derived_only_from_reviewed_dependency_ids(
     assert payload["smoke_receipt_artifact_id"] == smoke_id
     assert payload["model_cache_artifact_id"] == cache_id
     command = shlex.split(payload["external_action"])
-    assert command[:3] == [
-        "modal", "run", "modal_phase_marker.py::run-stage-a"
+    assert command[:5] == [
+        "modal", "run", "--env", "main", "modal_phase_marker.py::run-stage-a"
     ]
     assert command[command.index("--approved-plan-digest") + 1] == payload[
         "plan_digest"
@@ -410,6 +411,7 @@ def test_machine_namespace_binds_the_full_canonical_plan_digest(
     assert plan.run_id == f"{plan.run_label}-plan-{plan.plan_digest}"
     assert modal_plan.pilot_plan_digest(plan) == plan.plan_digest
     assert plan.canonical_dependency_lock_path == "requirements-modal-phase-marker.txt"
+    assert plan.modal_environment == "main"
 
 
 @pytest.mark.parametrize(
@@ -425,6 +427,24 @@ def test_machine_namespace_binds_the_full_canonical_plan_digest(
             id="materialization",
         ),
         pytest.param(lambda plan: replace(plan, bundle_id="d" * 64), id="bundle"),
+        pytest.param(
+            lambda plan: replace(plan, modal_environment="other"),
+            id="modal-environment",
+        ),
+        pytest.param(
+            lambda plan: replace(plan, bundle_manifest_artifact_id="1" * 64),
+            id="bundle-manifest",
+        ),
+        pytest.param(
+            lambda plan: replace(
+                plan,
+                bundle_files=(
+                    replace(plan.bundle_files[0], size=plan.bundle_files[0].size + 1),
+                    *plan.bundle_files[1:],
+                ),
+            ),
+            id="bundle-files",
+        ),
         pytest.param(lambda plan: replace(plan, source_hash="e" * 64), id="source"),
         pytest.param(lambda plan: replace(plan, dependency_lock_hash="f" * 64), id="lock"),
         pytest.param(
@@ -492,6 +512,25 @@ def test_action_approval_digests_cannot_cross_actions_or_stage_a_evidence(
         modal_plan.action_approval_digest(
             plan, action="smoke", smoke_receipt_artifact_id="3" * 64
         )
+
+
+def test_modal_environment_changes_plan_and_action_approval_identities(
+    prepared_artifacts: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if an approval could cross the explicit Modal environment."""
+    plan = _plan(prepared_artifacts)
+    approval_id = modal_plan.action_approval_digest(plan, action="stage-inputs")
+    monkeypatch.setattr(modal_plan, "MODAL_ENVIRONMENT", "other")
+    changed = _plan(prepared_artifacts)
+
+    assert changed.plan_digest != plan.plan_digest
+    assert modal_plan.action_approval_digest(
+        changed, action="stage-inputs"
+    ) != approval_id
+    assert modal_plan.action_approval_payload(
+        changed, action="stage-inputs"
+    )["modal_environment"] == "other"
 
 
 @pytest.mark.parametrize("suffix", [" ", "  ", "\t"])

@@ -19,6 +19,10 @@
 - Stage A estimate is USD 250; its worst-case GPU allocation is 48 H100-hours and approximately USD 189.56 at USD 3.9492 per hour.
 - Preserve the existing `modal_app.py`, `glyph-reasoning-vol`, and all unrelated user changes.
 - Use dedicated volumes `phase-marker-pilot-inputs-v1`, `phase-marker-pilot-model-cache-v1`, and `phase-marker-pilot-runs-v1`.
+- Freeze the Modal environment as `main`, include it in plan/action identities,
+  and emit `--env main` in every command. The operator must independently
+  confirm the active profile and workspace match the reviewed account; the
+  repository makes no live-account claim.
 - Input and model volumes are read-only inside GPU jobs; only the run volume is writable.
 - Never overwrite a canonical input, model snapshot, checkpoint, selection, receipt, or summary.
 - Receipts and logs live outside hashed checkpoint and selection directories.
@@ -1141,11 +1145,11 @@ PHASE_MARKER_RUN_ID="$(./.venv/bin/python -m phase_marker.modal_plan run-id \
 # included in this checked-in plan. Use --resume only after status/recovery review.
 
 # Read-only remote inspection after an authorized run.
-modal run modal_phase_marker_inspect.py::status --run-id "$PHASE_MARKER_RUN_ID"
+modal run --env main modal_phase_marker_inspect.py::status --run-id "$PHASE_MARKER_RUN_ID"
 
 # Explicit local evidence materialization through the standalone zero-compute
 # inspector. The destination must not already exist.
-modal run modal_phase_marker_inspect.py::download-evidence \
+modal run --env main modal_phase_marker_inspect.py::download-evidence \
   --run-id "$PHASE_MARKER_RUN_ID" \
   --destination artifacts/phase-marker-evidence/"$PHASE_MARKER_RUN_ID"
 ```

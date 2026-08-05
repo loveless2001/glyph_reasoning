@@ -8,6 +8,7 @@ import modal
 
 from phase_marker.io import canonical_json
 from phase_marker.modal_inspection import download_evidence_local, status_local
+from phase_marker.modal_plan import MODAL_ENVIRONMENT
 
 
 APP_NAME = "phase-marker-pilot-stage-a-inspect"
@@ -19,7 +20,9 @@ app = modal.App(
     include_source=False,
 )
 runs_volume = modal.Volume.from_name(
-    RUNS_VOLUME_NAME, create_if_missing=False,
+    RUNS_VOLUME_NAME,
+    environment_name=MODAL_ENVIRONMENT,
+    create_if_missing=False,
 ).read_only()
 
 

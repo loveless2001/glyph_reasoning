@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import chdir, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
+import ctypes
+import errno
 import importlib
 import json
 import math
@@ -107,7 +109,10 @@ _PLAN_PAYLOAD_FIELDS = frozenset(
         "source_hash",
         "dependency_lock_hash",
         "canonical_dependency_lock_path",
+        "modal_environment",
         "bundle_id",
+        "bundle_manifest_artifact_id",
+        "bundle_files",
         "resources",
         "jobs",
         "run_label",
@@ -152,6 +157,20 @@ _EXPECTED_PLAN_RESOURCES = {
     "spend_cap_usd": 1_000.0,
 }
 _EXPECTED_PLAN_ARMS = ("semantic", "glyph", "dot", "random", "direct", "filler")
+_SMOKE_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version", "stage", "hardware", "run_id", "source_hash",
+        "dependency_lock_hash", "canonical_dependency_lock_path", "bundle_id",
+        "bundle_manifest_artifact_id", "bundle_files", "modal_environment",
+        "plan_digest", "config_hash", "split_artifact_id",
+        "materialization_artifact_ids", "model_revision",
+        "model_cache_artifact_id", "imports", "validated", "failure_reason",
+        "modal_app_id", "modal_app_name", "modal_function_name",
+        "modal_function_call_id", "modal_input_id", "python_version",
+        "torch_version", "cuda_runtime_version", "cuda_driver_version",
+        "artifact_id",
+    }
+)
 
 
 class VolumeClient(Protocol):
@@ -211,6 +230,9 @@ class AttemptReceipt:
     schema_version: int
     run_id: str
     bundle_id: str
+    bundle_manifest_artifact_id: str
+    bundle_files: tuple[BundleFile, ...]
+    modal_environment: str
     stage: str
     arm: str
     seed: int
@@ -403,6 +425,159 @@ def write_attempt_receipt(run_root: Path, receipt: AttemptReceipt) -> Path:
     return receipt_path
 
 
+@contextmanager
+def _open_directory_path_nofollow(
+    path: Path, *, create: bool = False,
+) -> object:
+    """Open one directory by components without following any symlink."""
+    absolute = Path(os.path.abspath(path))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    current_fd = os.open("/", flags)
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise ValueError(
+                        f"directory path is missing: {absolute}"
+                    ) from None
+                os.mkdir(component, mode=0o755, dir_fd=current_fd)
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except OSError as error:
+                raise ValueError(
+                    f"directory path is symlinked or non-directory: {absolute}"
+                ) from error
+            os.close(current_fd)
+            current_fd = next_fd
+        yield current_fd
+    finally:
+        os.close(current_fd)
+
+
+def _renameat2_noreplace(
+    source_parent_fd: int,
+    source_name: str,
+    destination_parent_fd: int,
+    destination_name: str,
+) -> None:
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOSYS, "atomic no-replace rename is unavailable") from error
+    renameat2.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = renameat2(
+        source_parent_fd,
+        os.fsencode(source_name),
+        destination_parent_fd,
+        os.fsencode(destination_name),
+        1,  # RENAME_NOREPLACE
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, "destination already exists", destination_name)
+    raise OSError(error_number, os.strerror(error_number), destination_name)
+
+
+def _atomic_rename_directory_noreplace_at(
+    *,
+    source_parent_fd: int,
+    source_name: str,
+    destination_parent_fd: int,
+    destination_name: str,
+) -> None:
+    source_before = os.stat(
+        source_name, dir_fd=source_parent_fd, follow_symlinks=False
+    )
+    if not stat.S_ISDIR(source_before.st_mode):
+        raise ValueError("publication source is not a regular directory")
+    try:
+        os.stat(destination_name, dir_fd=destination_parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise FileExistsError("publication destination already exists")
+    _renameat2_noreplace(
+        source_parent_fd, source_name, destination_parent_fd, destination_name
+    )
+    destination_after = os.stat(
+        destination_name, dir_fd=destination_parent_fd, follow_symlinks=False
+    )
+    if (
+        not stat.S_ISDIR(destination_after.st_mode)
+        or (source_before.st_dev, source_before.st_ino)
+        != (destination_after.st_dev, destination_after.st_ino)
+    ):
+        raise OSError("published directory inode changed during canonical promotion")
+
+
+def _write_canonical_json_exclusive_at(
+    directory_fd: int, name: str, payload: Mapping[str, object],
+) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(name, flags, 0o644, dir_fd=directory_fd)
+    try:
+        content = (canonical_json(dict(payload)) + "\n").encode("utf-8")
+        offset = 0
+        while offset < len(content):
+            offset += os.write(descriptor, content[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _read_regular_file_at_fd(directory_fd: int, name: str, *, label: str) -> bytes:
+    descriptor = os.open(
+        name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd
+    )
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} is not a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        content = b"".join(chunks)
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or len(content) != after.st_size
+        ):
+            raise ValueError(f"{label} changed while being read")
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def atomic_publish_directory_noreplace(
+    source: Path, destination: Path, *, create_parents: bool = False,
+) -> Path:
+    """Atomically rename a directory to a new name through no-follow dir FDs."""
+    source_path = Path(os.path.abspath(source))
+    destination_path = Path(os.path.abspath(destination))
+    with _open_directory_path_nofollow(source_path.parent) as source_parent_fd:
+        with _open_directory_path_nofollow(
+            destination_path.parent, create=create_parents
+        ) as destination_parent_fd:
+            _atomic_rename_directory_noreplace_at(
+                source_parent_fd=source_parent_fd,
+                source_name=source_path.name,
+                destination_parent_fd=destination_parent_fd,
+                destination_name=destination_path.name,
+            )
+    return destination_path
+
+
 def promote_validated_output(
     source: Path,
     attempt_root: Path,
@@ -420,66 +595,91 @@ def promote_validated_output(
     source_path = Path(source).resolve()
     if not source_path.is_dir():
         raise ValueError("promotion source is missing or not a directory")
-    target = Path(canonical_root).resolve()
+    target = Path(os.path.abspath(canonical_root))
     root = Path(attempt_root).resolve()
     _validate_promotion_paths(source_path, root, target, receipt)
-    if target.exists():
+    if _lstat_optional(target) is not None:
         raise FileExistsError("canonical output already exists")
-    if _filesystem_device(root) != _filesystem_device(target.parent):
-        raise ValueError("attempt and canonical destinations must share the same filesystem")
     _validate_receipt_outputs(source_path, receipt)
-
-    staged = root / "promotion-staging"
-    if staged.exists():
-        raise FileExistsError("attempt promotion staging already exists")
-    shutil.copytree(source_path, staged, copy_function=shutil.copy2)
-    if _tree_hashes(source_path) != _tree_hashes(staged):
-        raise ValueError("attempt output copy does not match source bytes")
-
-    target.parent.mkdir(parents=True, exist_ok=True)
     lock = target.parent / f".{target.name}.promotion.lock"
     lease = _promotion_lease_payload(receipt, created_at=lease_created_at)
-    try:
-        _write_canonical_json_exclusive(lock, lease)
-    except FileExistsError as error:
-        raise FileExistsError("canonical promotion is already in progress") from error
-    try:
-        if lease_durability_barrier is not None:
-            lease_durability_barrier()
-        if target.exists():
-            raise FileExistsError("canonical output already exists")
-        staged.replace(target)
-    except Exception as error:
-        try:
-            lock.unlink(missing_ok=True)
-        except Exception as lock_error:
-            try:
-                _restore_failed_job_promotion(
-                    error=lock_error,
-                    published=False,
-                    target=target,
-                    attempt_root=root,
-                    lock=lock,
+    with _open_directory_path_nofollow(
+        target.parent, create=True
+    ) as target_parent_fd:
+        with _open_directory_path_nofollow(root) as attempt_fd:
+            if os.fstat(attempt_fd).st_dev != os.fstat(target_parent_fd).st_dev:
+                raise ValueError(
+                    "attempt and canonical destinations must share the same filesystem"
                 )
-            except _JobPublicationRollbackError:
+            try:
+                os.stat(target.name, dir_fd=target_parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError("canonical output already exists")
+            staged = root / "promotion-staging"
+            try:
+                os.stat(staged.name, dir_fd=attempt_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError("attempt promotion staging already exists")
+            shutil.copytree(source_path, staged, copy_function=shutil.copy2)
+            if _tree_hashes(source_path) != _tree_hashes(staged):
+                raise ValueError("attempt output copy does not match source bytes")
+            _validate_receipt_outputs(staged, receipt)
+            try:
+                _write_canonical_json_exclusive_at(
+                    target_parent_fd, lock.name, lease
+                )
+            except FileExistsError as error:
+                raise FileExistsError(
+                    "canonical promotion is already in progress"
+                ) from error
+            published = False
+            try:
+                if lease_durability_barrier is not None:
+                    lease_durability_barrier()
+                _atomic_rename_directory_noreplace_at(
+                    source_parent_fd=attempt_fd,
+                    source_name=staged.name,
+                    destination_parent_fd=target_parent_fd,
+                    destination_name=target.name,
+                )
+                published = True
+                _validate_receipt_outputs(target, receipt)
+            except Exception as error:
+                if published:
+                    _restore_failed_job_promotion(
+                        error=error,
+                        published=True,
+                        target=target,
+                        attempt_root=root,
+                        lock=lock,
+                    )
+                else:
+                    try:
+                        os.unlink(lock.name, dir_fd=target_parent_fd)
+                    except FileNotFoundError:
+                        pass
+                    except Exception as lock_error:
+                        error.add_note(
+                            "promotion lock cleanup also failed: "
+                            f"{type(lock_error).__name__}: {lock_error}"
+                        )
                 raise
-            error.add_note(
-                "promotion lock cleanup also failed: "
-                f"{type(lock_error).__name__}: {lock_error}"
-            )
-        raise
-    if not retain_lease:
-        try:
-            lock.unlink(missing_ok=True)
-        except Exception as error:
-            _restore_failed_job_promotion(
-                error=error,
-                published=True,
-                target=target,
-                attempt_root=root,
-                lock=lock,
-            )
-            raise
+            if not retain_lease:
+                try:
+                    os.unlink(lock.name, dir_fd=target_parent_fd)
+                except Exception as error:
+                    _restore_failed_job_promotion(
+                        error=error,
+                        published=True,
+                        target=target,
+                        attempt_root=root,
+                        lock=lock,
+                    )
+                    raise
     return target
 
 
@@ -488,27 +688,30 @@ def release_promotion_lease(
 ) -> None:
     """Release only the exact authenticated lease owned by a durable receipt."""
     _validate_receipt(receipt)
-    target = Path(canonical_root)
+    target = Path(os.path.abspath(canonical_root))
     lock = target.parent / f".{target.name}.promotion.lock"
-    content = _read_regular_file_at(lock.parent, lock.name, label="promotion lease")
-    lease = load_promotion_lease_payload(content)
-    expected = {
-        "run_id": receipt.run_id,
-        "plan_digest": receipt.plan_digest,
-        "stage": receipt.stage,
-        "arm": receipt.arm,
-        "owner_attempt_id": receipt.attempt_id,
-        "owner_receipt_artifact_id": receipt.artifact_id,
-        "owner_stage_a_action_digest": receipt.stage_a_action_digest,
-        "modal_app_id": receipt.modal_app_id,
-        "modal_app_name": receipt.modal_app_name,
-        "modal_function_name": receipt.modal_function_name,
-        "modal_function_call_id": receipt.modal_function_call_id,
-        "modal_input_id": receipt.modal_input_id,
-    }
-    if any(lease.get(name) != value for name, value in expected.items()):
-        raise ValueError("promotion lease is not owned by the durable receipt")
-    lock.unlink()
+    with _open_directory_path_nofollow(lock.parent) as parent_fd:
+        content = _read_regular_file_at_fd(
+            parent_fd, lock.name, label="promotion lease"
+        )
+        lease = load_promotion_lease_payload(content)
+        expected = {
+            "run_id": receipt.run_id,
+            "plan_digest": receipt.plan_digest,
+            "stage": receipt.stage,
+            "arm": receipt.arm,
+            "owner_attempt_id": receipt.attempt_id,
+            "owner_receipt_artifact_id": receipt.artifact_id,
+            "owner_stage_a_action_digest": receipt.stage_a_action_digest,
+            "modal_app_id": receipt.modal_app_id,
+            "modal_app_name": receipt.modal_app_name,
+            "modal_function_name": receipt.modal_function_name,
+            "modal_function_call_id": receipt.modal_function_call_id,
+            "modal_input_id": receipt.modal_input_id,
+        }
+        if any(lease.get(name) != value for name, value in expected.items()):
+            raise ValueError("promotion lease is not owned by the durable receipt")
+        os.unlink(lock.name, dir_fd=parent_fd)
 
 
 _PROMOTION_LEASE_FIELDS = frozenset(
@@ -880,6 +1083,7 @@ def execute_pilot_job(
                     attempt_id=attempt_id,
                     command=command,
                     cache_artifact_id=cache_manifest.artifact_id,
+                    bundle=bundle,
                     stage_a_approval=approval,
                     observed_gpu=observed_gpu,
                     started=started,
@@ -902,6 +1106,8 @@ def execute_pilot_job(
                     lease_durability_barrier=volume.commit,
                 )
                 published = True
+                failure_stage = "post-promotion-validation"
+                _validate_receipt_outputs(canonical, receipt)
                 failure_stage = "receipt-publication"
                 attempt_receipt_path = _write_attempt_receipt_in_namespace(run, receipt)
                 canonical_receipt_path = _link_canonical_receipt(
@@ -949,6 +1155,7 @@ def execute_pilot_job(
                 attempt_id=attempt_id,
                 command=command,
                 cache_artifact_id=cache_manifest.artifact_id,
+                bundle=bundle,
                 stage_a_approval=approval,
                 observed_gpu=observed_gpu,
                 started=started,
@@ -979,6 +1186,7 @@ def _job_attempt_receipt(
     attempt_id: str,
     command: str,
     cache_artifact_id: str,
+    bundle: InputBundle,
     stage_a_approval: Mapping[str, object],
     observed_gpu: str | None,
     started: datetime,
@@ -995,6 +1203,11 @@ def _job_attempt_receipt(
         schema_version=1,
         run_id=str(plan_payload["run_id"]),
         bundle_id=str(plan_payload["bundle_id"]),
+        bundle_manifest_artifact_id=str(
+            plan_payload["bundle_manifest_artifact_id"]
+        ),
+        bundle_files=bundle.files,
+        modal_environment=str(plan_payload["modal_environment"]),
         stage=stage,
         arm=str(job["arm"]),
         seed=int(job["seed"]),
@@ -1044,9 +1257,7 @@ def _job_attempt_receipt(
         artifact_id="",
         failure_stage=failure_stage,
     )
-    return AttemptReceipt(
-        **{**asdict(receipt), "artifact_id": receipt.recomputed_artifact_id()}
-    )
+    return replace(receipt, artifact_id=receipt.recomputed_artifact_id())
 
 
 def _append_failure_log(log_path: Path, error: Exception) -> None:
@@ -1369,6 +1580,208 @@ def _validated_model_cache(model_root: Path) -> tuple[Path, ModelCacheManifest]:
     return snapshot, manifest
 
 
+def validate_successful_smoke_receipt_payload(
+    smoke: Mapping[str, object],
+    *,
+    plan_payload: Mapping[str, object],
+    approval_payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the exact successful smoke named by one Stage A approval."""
+    _validate_pilot_plan_payload(plan_payload)
+    approval = _validated_stage_a_approval(plan_payload, approval_payload)
+    unsigned = dict(smoke)
+    artifact_id = unsigned.pop("artifact_id", None)
+    imports = smoke.get("imports")
+    provenance = {
+        name: smoke.get(name)
+        for name in {
+            "modal_app_id", "modal_app_name", "modal_function_name",
+            "modal_function_call_id", "modal_input_id", "python_version",
+            "torch_version", "cuda_runtime_version", "cuda_driver_version",
+        }
+    }
+    provenance["runtime_versions"] = imports
+    if (
+        not isinstance(smoke, Mapping)
+        or set(smoke) != _SMOKE_RECEIPT_FIELDS
+        or artifact_id != approval["smoke_receipt_artifact_id"]
+        or artifact_id != sha256_json(unsigned)
+        or smoke.get("schema_version") != 1
+        or smoke.get("stage") != "smoke"
+        or smoke.get("hardware") != "CPU"
+        or smoke.get("run_id") != plan_payload["run_id"]
+        or smoke.get("plan_digest") != plan_payload["plan_digest"]
+        or smoke.get("config_hash") != plan_payload["config_hash"]
+        or smoke.get("split_artifact_id") != plan_payload["split_artifact_id"]
+        or smoke.get("materialization_artifact_ids")
+        != plan_payload["materialization_artifact_ids"]
+        or smoke.get("source_hash") != plan_payload["source_hash"]
+        or smoke.get("dependency_lock_hash")
+        != plan_payload["dependency_lock_hash"]
+        or smoke.get("canonical_dependency_lock_path")
+        != plan_payload["canonical_dependency_lock_path"]
+        or smoke.get("bundle_id") != plan_payload["bundle_id"]
+        or smoke.get("bundle_manifest_artifact_id")
+        != plan_payload["bundle_manifest_artifact_id"]
+        or smoke.get("bundle_files") != plan_payload["bundle_files"]
+        or smoke.get("modal_environment") != plan_payload["modal_environment"]
+        or smoke.get("model_revision") != plan_payload["model_revision"]
+        or smoke.get("model_cache_artifact_id")
+        != approval["model_cache_artifact_id"]
+        or smoke.get("validated") is not True
+        or smoke.get("failure_reason") is not None
+    ):
+        raise ValueError("successful smoke receipt identity is invalid")
+    try:
+        _validate_execution_provenance(provenance, stage="smoke")
+    except (TypeError, ValueError) as error:
+        raise ValueError("successful smoke receipt provenance is invalid") from error
+    return dict(smoke)
+
+
+def validate_stage_a_remote_dependencies(
+    *,
+    plan_payload: Mapping[str, object],
+    approval_payload: Mapping[str, object],
+    input_root: Path,
+    model_root: Path,
+    run_root: Path,
+) -> tuple[InputBundle, ModelCacheManifest, dict[str, object]]:
+    """Revalidate all immutable dependencies from mounted bytes at a remote boundary."""
+    _validate_pilot_plan_payload(plan_payload)
+    approval = _validated_stage_a_approval(plan_payload, approval_payload)
+    bundle_root = Path(input_root) / "bundles" / str(plan_payload["bundle_id"])
+    manifest_bytes = _read_regular_file_at(
+        bundle_root, "bundle-manifest.json", label="input bundle manifest"
+    )
+    if hashlib.sha256(manifest_bytes).hexdigest() != plan_payload[
+        "bundle_manifest_artifact_id"
+    ]:
+        raise ValueError("remote input bundle manifest hash is invalid")
+    bundle = load_input_bundle(bundle_root / "bundle-manifest.json")
+    if (
+        bundle.bundle_id != plan_payload["bundle_id"]
+        or [asdict(item) for item in bundle.files] != plan_payload["bundle_files"]
+    ):
+        raise ValueError("remote input bundle identity is invalid")
+    validate_bundle_at_root(bundle, bundle_root)
+    _snapshot, cache_manifest = _validated_model_cache(model_root)
+    if cache_manifest.artifact_id != approval["model_cache_artifact_id"]:
+        raise ValueError("remote model cache identity is invalid")
+    run = Path(run_root) / "runs" / str(plan_payload["run_id"])
+    provenance_bytes = _read_regular_file_at(
+        run,
+        "provenance/input-bundle-manifest.json",
+        label="run input bundle provenance",
+    )
+    if provenance_bytes != manifest_bytes:
+        raise ValueError("run input bundle provenance bytes are invalid")
+    smoke_id = str(approval["smoke_receipt_artifact_id"])
+    smoke_bytes = _read_regular_file_at(
+        run,
+        f"receipts/smoke/{smoke_id}.json",
+        label="approved smoke receipt",
+    )
+    try:
+        smoke = json.loads(smoke_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("approved smoke receipt is invalid") from error
+    if not isinstance(smoke, Mapping):
+        raise ValueError("approved smoke receipt is invalid")
+    return (
+        bundle,
+        cache_manifest,
+        validate_successful_smoke_receipt_payload(
+            smoke, plan_payload=plan_payload, approval_payload=approval
+        ),
+    )
+
+
+def _read_regular_producer_tree(root: Path) -> dict[str, bytes]:
+    records = _source_output_records(root)
+    if not records:
+        raise ValueError("canonical producer tree is missing")
+    return {
+        relative: _read_regular_file_at(root, relative, label="canonical producer file")
+        for relative, _digest in records
+    }
+
+
+def load_validated_canonical_stage_a_receipts(
+    *,
+    plan_payload: Mapping[str, object],
+    approval_payload: Mapping[str, object],
+    input_root: Path,
+    model_root: Path,
+    run_root: Path,
+    stages: Sequence[str] = ("train", "selection"),
+) -> tuple[dict[str, object], ...]:
+    """Read and semantically validate exact canonical producers and receipts."""
+    bundle, _cache, _smoke = validate_stage_a_remote_dependencies(
+        plan_payload=plan_payload,
+        approval_payload=approval_payload,
+        input_root=input_root,
+        model_root=model_root,
+        run_root=run_root,
+    )
+    approval = _validated_stage_a_approval(plan_payload, approval_payload)
+    jobs = plan_payload["jobs"]
+    assert isinstance(jobs, list)
+    run = Path(run_root) / "runs" / str(plan_payload["run_id"])
+    bundle_root = Path(input_root) / "bundles" / bundle.bundle_id
+    training_files: dict[str, dict[str, bytes]] = {}
+    validated: list[dict[str, object]] = []
+    for stage in stages:
+        if stage not in {"train", "selection"}:
+            raise ValueError("canonical Stage A validation stage is invalid")
+        for job in jobs:
+            assert isinstance(job, Mapping)
+            arm = str(job["arm"])
+            receipt_bytes = _read_regular_file_at(
+                run,
+                f"receipts/canonical/{stage}/{arm}.json",
+                label="canonical Stage A receipt",
+            )
+            try:
+                receipt_payload = json.loads(receipt_bytes.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as error:
+                raise ValueError("canonical Stage A receipt is invalid") from error
+            if not isinstance(receipt_payload, Mapping):
+                raise ValueError("canonical Stage A receipt is invalid")
+            producer_root = run / _producer_relative_path(stage, arm)
+            producer_files = _read_regular_producer_tree(producer_root)
+            receipt = validate_canonical_job_output(
+                receipt_payload=receipt_payload,
+                producer_files=producer_files,
+                plan_payload=plan_payload,
+                job_payload=job,
+                stage=stage,
+            )
+            if (
+                receipt["smoke_receipt_artifact_id"]
+                != approval["smoke_receipt_artifact_id"]
+                or receipt["model_cache_artifact_id"]
+                != approval["model_cache_artifact_id"]
+                or receipt["bundle_manifest_artifact_id"]
+                != approval["bundle_manifest_artifact_id"]
+                or receipt["modal_environment"] != approval["modal_environment"]
+            ):
+                raise ValueError("canonical Stage A receipt approval provenance is invalid")
+            parent = None if stage == "train" else training_files.get(arm)
+            validate_canonical_job_semantics(
+                stage=stage,
+                producer_files=producer_files,
+                canonical_training_files=parent,
+                plan_payload=plan_payload,
+                job_payload=job,
+                local_input_root=bundle_root,
+            )
+            if stage == "train":
+                training_files[arm] = producer_files
+            validated.append(receipt)
+    return tuple(validated)
+
+
 @contextmanager
 def _offline_model_cache(cache_root: Path) -> object:
     values = {
@@ -1449,6 +1862,20 @@ def load_attempt_receipt_payload(payload: Mapping[str, object]) -> AttemptReceip
             raise ValueError("attempt receipt runtime versions are invalid")
         normalized_runtime.append((item["module"], item["version"]))
     normalized["runtime_versions"] = tuple(normalized_runtime)
+    bundle_files = normalized["bundle_files"]
+    if (
+        not isinstance(bundle_files, (list, tuple))
+        or any(
+            not isinstance(item, Mapping)
+            or set(item) != {"path", "size", "sha256"}
+            for item in bundle_files
+        )
+    ):
+        raise ValueError("attempt receipt bundle file records are invalid")
+    normalized["bundle_files"] = tuple(
+        BundleFile(path=item["path"], size=item["size"], sha256=item["sha256"])
+        for item in bundle_files
+    )
     try:
         receipt = AttemptReceipt(**normalized)
     except TypeError as error:
@@ -1478,6 +1905,11 @@ def validate_job_receipt_payload(
     if (
         receipt.run_id != plan_payload["run_id"]
         or receipt.bundle_id != plan_payload["bundle_id"]
+        or receipt.bundle_manifest_artifact_id
+        != plan_payload["bundle_manifest_artifact_id"]
+        or [asdict(item) for item in receipt.bundle_files]
+        != plan_payload["bundle_files"]
+        or receipt.modal_environment != plan_payload["modal_environment"]
         or receipt.stage != stage
         or receipt.arm != job["arm"]
         or receipt.seed != job["seed"]
@@ -1509,6 +1941,9 @@ def validate_job_receipt_payload(
                 != approval["smoke_receipt_artifact_id"]
                 or receipt.model_cache_artifact_id
                 != approval["model_cache_artifact_id"]
+                or receipt.bundle_manifest_artifact_id
+                != approval["bundle_manifest_artifact_id"]
+                or receipt.modal_environment != approval["modal_environment"]
             )
         )
     ):
@@ -1601,8 +2036,10 @@ _STAGE_A_SUMMARY_FIELDS = frozenset(
         "plan_digest",
         "stage_a_action_digest",
         "stage_a_resume",
+        "modal_environment",
         "smoke_receipt_artifact_id",
         "model_cache_artifact_id",
+        "bundle_manifest_artifact_id",
         "receipt_approval_history",
         "training_receipt_ids",
         "selection_receipt_ids",
@@ -1648,10 +2085,14 @@ def validate_stage_a_summary(
         "schema_version": 1,
         "action": "run-stage-a",
         "plan_digest": summary.get("plan_digest"),
+        "modal_environment": summary.get("modal_environment"),
         "approval_digest": summary.get("stage_a_action_digest"),
         "resume": summary.get("stage_a_resume"),
         "smoke_receipt_artifact_id": summary.get("smoke_receipt_artifact_id"),
         "model_cache_artifact_id": summary.get("model_cache_artifact_id"),
+        "bundle_manifest_artifact_id": summary.get(
+            "bundle_manifest_artifact_id"
+        ),
     }
     try:
         validated_approval = _validated_stage_a_approval(
@@ -1679,6 +2120,10 @@ def validate_stage_a_summary(
             != validated_approval["smoke_receipt_artifact_id"]
             or receipt.get("model_cache_artifact_id")
             != validated_approval["model_cache_artifact_id"]
+            or receipt.get("bundle_manifest_artifact_id")
+            != validated_approval["bundle_manifest_artifact_id"]
+            or receipt.get("modal_environment")
+            != validated_approval["modal_environment"]
             for receipt in receipt_matrix
         )
         or summary["training_receipt_ids"] != training_ids
@@ -1838,8 +2283,12 @@ def finalize_stage_a(
         "plan_digest": plan_payload["plan_digest"],
         "stage_a_action_digest": approval["approval_digest"],
         "stage_a_resume": approval["resume"],
+        "modal_environment": approval["modal_environment"],
         "smoke_receipt_artifact_id": approval["smoke_receipt_artifact_id"],
         "model_cache_artifact_id": approval["model_cache_artifact_id"],
+        "bundle_manifest_artifact_id": approval[
+            "bundle_manifest_artifact_id"
+        ],
         "receipt_approval_history": _receipt_approval_history(
             (*training, *selection)
         ),
@@ -1994,6 +2443,7 @@ def _receipt_payload(receipt: AttemptReceipt, *, include_artifact_id: bool) -> d
         {"module": module, "version": version}
         for module, version in receipt.runtime_versions
     ]
+    payload["bundle_files"] = [asdict(item) for item in receipt.bundle_files]
     if not include_artifact_id:
         payload.pop("artifact_id")
     return payload
@@ -2067,6 +2517,7 @@ def _validate_receipt(receipt: AttemptReceipt) -> None:
         _is_sha256(value)
         for value in (
             receipt.bundle_id,
+            receipt.bundle_manifest_artifact_id,
             receipt.command_hash,
             receipt.source_hash,
             receipt.dependency_lock_hash,
@@ -2089,17 +2540,30 @@ def _validate_receipt(receipt: AttemptReceipt) -> None:
         and receipt.expected_outputs == ()
         and receipt.output_hashes == ()
     )
+    bundle_files_valid = (
+        isinstance(receipt.bundle_files, tuple)
+        and tuple(item.path for item in receipt.bundle_files) == INPUT_ALLOWLIST
+        and all(
+            isinstance(item.size, int)
+            and not isinstance(item.size, bool)
+            and item.size > 0
+            and _is_sha256(item.sha256)
+            for item in receipt.bundle_files
+        )
+    )
     failure_stages = {
         "workspace-setup",
         "runtime-validation",
         "command",
         "producer-validation",
         "promotion",
+        "post-promotion-validation",
         "receipt-publication",
         "commit",
     }
     post_command_failure_stages = {
-        "producer-validation", "promotion", "receipt-publication", "commit"
+        "producer-validation", "promotion", "post-promotion-validation",
+        "receipt-publication", "commit",
     }
     expected_function = (
         "run_training_job" if receipt.stage == "train" else "run_selection_job"
@@ -2149,6 +2613,19 @@ def _validate_receipt(receipt: AttemptReceipt) -> None:
         or len(receipt.materialization_artifact_ids) != len(_ARMS)
         or len(set(receipt.materialization_artifact_ids)) != len(_ARMS)
         or receipt.model_revision != QWEN25_7B_TOKENIZER_REVISION
+        or receipt.modal_environment != "main"
+        or not bundle_files_valid
+        or receipt.bundle_id
+        != sha256_json(
+            {
+                "schema_version": 1,
+                "files": [asdict(item) for item in receipt.bundle_files],
+                "artifact_ids": [
+                    receipt.split_artifact_id,
+                    *receipt.materialization_artifact_ids,
+                ],
+            }
+        )
         or not receipt.run_id.endswith(f"-plan-{receipt.plan_digest}")
         or receipt.modal_app_name != "phase-marker-pilot-stage-a"
         or receipt.modal_function_name != expected_function
@@ -2167,6 +2644,8 @@ def _validate_receipt(receipt: AttemptReceipt) -> None:
             resume=receipt.stage_a_resume,
             smoke_receipt_artifact_id=receipt.smoke_receipt_artifact_id,
             model_cache_artifact_id=receipt.model_cache_artifact_id,
+            bundle_manifest_artifact_id=receipt.bundle_manifest_artifact_id,
+            modal_environment=receipt.modal_environment,
         )
         or (receipt.validated is False and receipt.promoted is True)
         or (receipt.failure_reason is not None and not isinstance(receipt.failure_reason, str))
@@ -2222,7 +2701,7 @@ def _validate_promotion_paths(
         raise ValueError("promotion source does not match receipt identity") from error
     source_attempt = source_workspace.parent
     expected_source = (source_attempt / "workspace" / producer).resolve()
-    expected_canonical = (run_root / producer).resolve()
+    expected_canonical = Path(os.path.abspath(run_root / producer))
     if (
         source_workspace.name != "workspace"
         or source_attempt.name != receipt.attempt_id
@@ -2730,7 +3209,9 @@ def _validate_pilot_plan_payload(payload: Mapping[str, object]) -> None:
         payload["source_hash"],
         payload["dependency_lock_hash"],
         payload["bundle_id"],
+        payload["bundle_manifest_artifact_id"],
     )
+    bundle_files = payload["bundle_files"]
     materialization_ids = payload["materialization_artifact_ids"]
     resources = payload["resources"]
     jobs = payload["jobs"]
@@ -2741,11 +3222,55 @@ def _validate_pilot_plan_payload(payload: Mapping[str, object]) -> None:
         or payload["model_revision"] != QWEN25_7B_TOKENIZER_REVISION
         or payload["canonical_dependency_lock_path"]
         != "requirements-modal-phase-marker.txt"
+        or payload["modal_environment"] != "main"
         or not all(_is_sha256(value) for value in hashes)
         or not isinstance(materialization_ids, list)
         or len(materialization_ids) != len(_EXPECTED_PLAN_ARMS)
         or not all(_is_sha256(value) for value in materialization_ids)
         or len(set(materialization_ids)) != len(materialization_ids)
+        or not isinstance(bundle_files, list)
+        or len(bundle_files) != len(INPUT_ALLOWLIST)
+        or any(
+            not isinstance(item, Mapping)
+            or set(item) != {"path", "size", "sha256"}
+            for item in bundle_files
+        )
+        or tuple(item["path"] for item in bundle_files) != INPUT_ALLOWLIST
+        or any(
+            not isinstance(item["size"], int)
+            or isinstance(item["size"], bool)
+            or item["size"] <= 0
+            or not _is_sha256(item["sha256"])
+            for item in bundle_files
+        )
+        or payload["bundle_id"]
+        != sha256_json(
+            {
+                "schema_version": 1,
+                "files": bundle_files,
+                "artifact_ids": [
+                    payload["split_artifact_id"],
+                    *materialization_ids,
+                ],
+            }
+        )
+        or payload["bundle_manifest_artifact_id"]
+        != hashlib.sha256(
+            (
+                canonical_json(
+                    {
+                        "schema_version": 1,
+                        "bundle_id": payload["bundle_id"],
+                        "files": bundle_files,
+                        "artifact_ids": [
+                            payload["split_artifact_id"],
+                            *materialization_ids,
+                        ],
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest()
         or not isinstance(resources, Mapping)
         or set(resources) != _PLAN_RESOURCE_FIELDS
         or dict(resources) != _EXPECTED_PLAN_RESOURCES
@@ -2804,7 +3329,12 @@ def _pilot_plan_payload_digest(payload: Mapping[str, object]) -> str:
                     "path": payload.get("canonical_dependency_lock_path"),
                     "sha256": payload.get("dependency_lock_hash"),
                 },
+                "modal_environment": payload.get("modal_environment"),
                 "bundle_id": payload.get("bundle_id"),
+                "bundle_manifest_artifact_id": payload.get(
+                    "bundle_manifest_artifact_id"
+                ),
+                "bundle_files": payload.get("bundle_files"),
                 "resources": payload.get("resources"),
                 "jobs": payload.get("jobs"),
             }
@@ -2823,13 +3353,17 @@ def validate_action_approval_payload(
 ) -> dict[str, object]:
     """Fail closed unless an approval is exact for this plan and action."""
     _validate_pilot_plan_payload(plan_payload)
-    common = {"schema_version", "action", "plan_digest", "approval_digest"}
+    common = {
+        "schema_version", "action", "plan_digest", "modal_environment",
+        "approval_digest",
+    }
     expected_fields = (
         common
         | {
             "resume",
             "smoke_receipt_artifact_id",
             "model_cache_artifact_id",
+            "bundle_manifest_artifact_id",
         }
         if action == "run-stage-a"
         else common
@@ -2840,12 +3374,15 @@ def validate_action_approval_payload(
         approval_payload["schema_version"] != 1
         or approval_payload["action"] != action
         or approval_payload["plan_digest"] != plan_payload["plan_digest"]
+        or approval_payload["modal_environment"]
+        != plan_payload["modal_environment"]
     ):
         raise ValueError("action approval envelope identity is invalid")
     digest_payload: dict[str, object] = {
         "schema_version": 1,
         "plan_digest": plan_payload["plan_digest"],
         "action": action,
+        "modal_environment": plan_payload["modal_environment"],
     }
     if action == "run-stage-a":
         if (
@@ -2857,6 +3394,8 @@ def validate_action_approval_payload(
             != smoke_receipt_artifact_id
             or approval_payload["model_cache_artifact_id"]
             != model_cache_artifact_id
+            or approval_payload["bundle_manifest_artifact_id"]
+            != plan_payload["bundle_manifest_artifact_id"]
         ):
             raise ValueError("Stage A approval evidence identity is invalid")
         digest_payload.update(
@@ -2864,6 +3403,9 @@ def validate_action_approval_payload(
                 "resume": resume,
                 "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
                 "model_cache_artifact_id": model_cache_artifact_id,
+                "bundle_manifest_artifact_id": plan_payload[
+                    "bundle_manifest_artifact_id"
+                ],
             }
         )
     elif any(
@@ -2885,12 +3427,16 @@ def _stage_a_action_digest(
     resume: bool,
     smoke_receipt_artifact_id: str,
     model_cache_artifact_id: str,
+    bundle_manifest_artifact_id: str,
+    modal_environment: str,
 ) -> str:
     if (
         not _is_sha256(plan_digest)
         or not isinstance(resume, bool)
         or not _is_sha256(smoke_receipt_artifact_id)
         or not _is_sha256(model_cache_artifact_id)
+        or not _is_sha256(bundle_manifest_artifact_id)
+        or modal_environment != "main"
     ):
         raise ValueError("Stage A receipt approval identity is invalid")
     return hashlib.sha256(
@@ -2899,9 +3445,11 @@ def _stage_a_action_digest(
                 "schema_version": 1,
                 "plan_digest": plan_digest,
                 "action": "run-stage-a",
+                "modal_environment": modal_environment,
                 "resume": resume,
                 "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
                 "model_cache_artifact_id": model_cache_artifact_id,
+                "bundle_manifest_artifact_id": bundle_manifest_artifact_id,
             }
         ).encode("utf-8")
     ).hexdigest()
@@ -3264,6 +3812,21 @@ def run_cpu_smoke(
         if bundle.bundle_id != plan_payload["bundle_id"]:
             raise ValueError("CPU smoke bundle identity does not match the plan")
         validate_bundle_at_root(bundle, bundle_root)
+        bundle_manifest_bytes = _read_regular_file_at(
+            bundle_root, "bundle-manifest.json", label="input bundle manifest"
+        )
+        if (
+            hashlib.sha256(bundle_manifest_bytes).hexdigest()
+            != plan_payload["bundle_manifest_artifact_id"]
+            or [asdict(item) for item in bundle.files]
+            != plan_payload["bundle_files"]
+        ):
+            raise ValueError("CPU smoke bundle manifest provenance is invalid")
+        provenance_path = (
+            Path(run_root) / "runs" / str(plan_payload["run_id"])
+            / "provenance" / "input-bundle-manifest.json"
+        )
+        _write_bytes_exclusive_or_equal(provenance_path, bundle_manifest_bytes)
 
         snapshot = (
             Path(model_root)
@@ -3332,6 +3895,11 @@ def _cpu_smoke_receipt_payload(
             "canonical_dependency_lock_path"
         ),
         "bundle_id": plan_payload.get("bundle_id"),
+        "bundle_manifest_artifact_id": plan_payload.get(
+            "bundle_manifest_artifact_id"
+        ),
+        "bundle_files": plan_payload.get("bundle_files"),
+        "modal_environment": plan_payload.get("modal_environment"),
         "model_revision": plan_payload.get("model_revision"),
         "model_cache_artifact_id": model_cache_artifact_id,
         "imports": imported,
@@ -3349,6 +3917,28 @@ def _cpu_smoke_receipt_payload(
     }
     payload["artifact_id"] = sha256_json(payload)
     return payload
+
+
+def _write_bytes_exclusive_or_equal(path: Path, content: bytes) -> Path:
+    """Create immutable provenance bytes, accepting only an identical retry."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=destination.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+        os.link(temporary, destination)
+    except FileExistsError:
+        existing = _read_regular_file_at(
+            destination.parent, destination.name, label="immutable provenance file"
+        )
+        if existing != content:
+            raise FileExistsError("immutable provenance file conflicts with existing bytes")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return destination
 
 
 def _write_content_addressed_receipt(

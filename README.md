@@ -83,6 +83,11 @@ exact string, execute them one at a time, and inspect the result before moving
 to the next boundary. Do not reconstruct shorter commands by dropping the full
 plan or action digest flags.
 
+The frozen Modal environment is `main`, and every generated command includes
+`--env main`. Before executing an authorized command, independently confirm
+that the active Modal profile and workspace are the reviewed account; this
+repository does not claim or discover the live account configuration.
+
 After cache population and CPU smoke, inspect the complete model-cache manifest
 and the exact successful smoke receipt. Only then use their reviewed 64-character
 artifact IDs to derive a prospective Stage A action locally:
@@ -112,10 +117,10 @@ After an authorized action, inspection remains separate:
 ```bash
 
 # Read-only remote inspection after an authorized run.
-modal run modal_phase_marker_inspect.py::status --run-id "$PHASE_MARKER_RUN_ID"
+modal run --env main modal_phase_marker_inspect.py::status --run-id "$PHASE_MARKER_RUN_ID"
 
 # Explicit local write of compact allowlisted evidence after successful status.
-modal run modal_phase_marker_inspect.py::download-evidence --run-id "$PHASE_MARKER_RUN_ID" --destination phase-marker-stage-a-evidence
+modal run --env main modal_phase_marker_inspect.py::download-evidence --run-id "$PHASE_MARKER_RUN_ID" --destination phase-marker-stage-a-evidence
 ```
 
 Stage A requests one H100 per job, permits Modal's automatic H200-compatible

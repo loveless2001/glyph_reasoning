@@ -11,6 +11,7 @@ from pathlib import Path
 import shlex
 
 from phase_marker.modal_artifacts import (
+    BundleFile,
     InputBundle,
     build_input_bundle,
     hash_source_tree,
@@ -33,6 +34,7 @@ _PORTABLE_ARTIFACT_ROOT = Path("artifacts/phase-marker")
 _CANONICAL_DEPENDENCY_LOCK_PATH = "requirements-modal-phase-marker.txt"
 _APPROVED_ACTIONS = frozenset({"stage-inputs", "cache-model", "smoke", "run-stage-a"})
 _SHA256_LENGTH = 64
+MODAL_ENVIRONMENT = "main"
 _MANIFEST_FIELDS = frozenset(
     {
         "kind",
@@ -106,7 +108,10 @@ class PilotPlan:
     source_hash: str
     dependency_lock_hash: str
     canonical_dependency_lock_path: str
+    modal_environment: str
     bundle_id: str
+    bundle_manifest_artifact_id: str
+    bundle_files: tuple[BundleFile, ...]
     resources: StageAResources
     jobs: tuple[PilotJob, ...]
     run_label: str
@@ -179,7 +184,12 @@ def build_pilot_plan(
         source_hash=source_hash,
         dependency_lock_hash=dependency_lock_hash,
         canonical_dependency_lock_path=_CANONICAL_DEPENDENCY_LOCK_PATH,
+        modal_environment=MODAL_ENVIRONMENT,
         bundle_id=bundle.bundle_id,
+        bundle_manifest_artifact_id=hashlib.sha256(
+            (canonical_json(asdict(bundle)) + "\n").encode("utf-8")
+        ).hexdigest(),
+        bundle_files=bundle.files,
         resources=resources,
         jobs=jobs,
         run_label=run_label,
@@ -215,7 +225,10 @@ def pilot_plan_digest(plan: PilotPlan) -> str:
                     "path": plan.canonical_dependency_lock_path,
                     "sha256": plan.dependency_lock_hash,
                 },
+                "modal_environment": plan.modal_environment,
                 "bundle_id": plan.bundle_id,
+                "bundle_manifest_artifact_id": plan.bundle_manifest_artifact_id,
+                "bundle_files": [asdict(item) for item in plan.bundle_files],
                 "resources": asdict(plan.resources),
                 "jobs": [asdict(job) for job in plan.jobs],
             }
@@ -239,6 +252,7 @@ def action_approval_digest(
         "schema_version": 1,
         "plan_digest": plan.plan_digest,
         "action": action,
+        "modal_environment": plan.modal_environment,
     }
     evidence = (resume, smoke_receipt_artifact_id, model_cache_artifact_id)
     if action == "run-stage-a":
@@ -253,6 +267,7 @@ def action_approval_digest(
                 "resume": resume,
                 "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
                 "model_cache_artifact_id": model_cache_artifact_id,
+                "bundle_manifest_artifact_id": plan.bundle_manifest_artifact_id,
             }
         )
     elif any(value is not None for value in evidence):
@@ -280,6 +295,7 @@ def action_approval_payload(
         "schema_version": 1,
         "action": action,
         "plan_digest": plan.plan_digest,
+        "modal_environment": plan.modal_environment,
         "approval_digest": digest,
     }
     if action == "run-stage-a":
@@ -288,6 +304,7 @@ def action_approval_payload(
                 "resume": resume,
                 "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
                 "model_cache_artifact_id": model_cache_artifact_id,
+                "bundle_manifest_artifact_id": plan.bundle_manifest_artifact_id,
             }
         )
     return payload
@@ -306,7 +323,10 @@ def pilot_plan_payload(plan: PilotPlan) -> dict[str, object]:
         "source_hash": plan.source_hash,
         "dependency_lock_hash": plan.dependency_lock_hash,
         "canonical_dependency_lock_path": plan.canonical_dependency_lock_path,
+        "modal_environment": plan.modal_environment,
         "bundle_id": plan.bundle_id,
+        "bundle_manifest_artifact_id": plan.bundle_manifest_artifact_id,
+        "bundle_files": [asdict(item) for item in plan.bundle_files],
         "resources": {
             "hardware": plan.resources.hardware,
             "timeout_seconds": plan.resources.timeout_seconds,
@@ -347,6 +367,8 @@ def approval_action_manifest(plan: PilotPlan) -> dict[str, object]:
         "run_id": plan.run_id,
         "plan_digest": plan.plan_digest,
         "bundle_id": plan.bundle_id,
+        "bundle_manifest_artifact_id": plan.bundle_manifest_artifact_id,
+        "modal_environment": plan.modal_environment,
         "model_revision": plan.model_revision,
         "training_job_count": len(plan.jobs),
         "selection_job_count": len(plan.jobs),
@@ -430,6 +452,8 @@ def approved_stage_a_action_manifest(
         "resume": resume,
         "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
         "model_cache_artifact_id": model_cache_artifact_id,
+        "bundle_manifest_artifact_id": plan.bundle_manifest_artifact_id,
+        "modal_environment": plan.modal_environment,
         "approval": approval,
         "resources": {
             "hardware": plan.resources.hardware,
@@ -461,7 +485,8 @@ def _modal_action_command(
 ) -> str:
     return shlex.join(
         [
-            "modal", "run", f"modal_phase_marker.py::{entrypoint}",
+            "modal", "run", "--env", plan.modal_environment,
+            f"modal_phase_marker.py::{entrypoint}",
             "--approved-run-id", plan.run_id,
             "--acknowledge-budget-usd", "1000",
             "--repo-root", ".",
@@ -643,6 +668,7 @@ def _validate_run_id(plan: PilotPlan) -> None:
     expected_digest = pilot_plan_digest(plan)
     if (
         plan.canonical_dependency_lock_path != _CANONICAL_DEPENDENCY_LOCK_PATH
+        or plan.modal_environment != MODAL_ENVIRONMENT
         or plan.run_label != expected_label
         or plan.plan_digest != expected_digest
         or plan.run_id != f"{expected_label}-plan-{expected_digest}"

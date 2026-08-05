@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-import ctypes
-import errno
 import json
 import math
 import os
@@ -14,10 +12,13 @@ import shlex
 import shutil
 import tempfile
 
+from phase_marker.io import canonical_json
 from phase_marker.modal_artifacts import (
+    INPUT_ALLOWLIST,
     LOCKED_RUNTIME_MODULES,
     VolumeClient,
     load_attempt_receipt_payload,
+    atomic_publish_directory_noreplace,
     sha256_json,
 )
 from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
@@ -57,6 +58,7 @@ _SELECTION_CRITERION = {
 _SMOKE_RECEIPT_FIELDS = frozenset({
     "schema_version", "stage", "hardware", "run_id", "source_hash",
     "dependency_lock_hash", "canonical_dependency_lock_path", "bundle_id",
+    "bundle_manifest_artifact_id", "bundle_files", "modal_environment",
     "plan_digest", "config_hash", "split_artifact_id",
     "materialization_artifact_ids", "model_revision",
     "model_cache_artifact_id", "imports", "validated", "failure_reason",
@@ -201,6 +203,32 @@ def status_local(volume: VolumeClient, *, run_id: str) -> dict[str, object]:
         )
     ):
         errors.append("attempt receipts disagree with the canonical pilot identity")
+    dependency_error: str | None = None
+    advertised_values = shared_values | attempt_values
+    if len(advertised_values) == 1:
+        approved_shared = next(iter(advertised_values))
+        smoke_id = approved_shared[5]
+        smoke_path = f"{run_root}/receipts/smoke/{smoke_id}.json"
+        smoke_bytes = _read_volume_file_optional(volume, smoke_path)
+        try:
+            if smoke_bytes is None:
+                raise ValueError("receipt-referenced smoke receipt is missing")
+            validated_smoke = _validate_smoke_receipt(
+                smoke_bytes,
+                relative_path=f"receipts/smoke/{smoke_id}.json",
+                run_id=run_id,
+                approved_shared=approved_shared,
+            )
+            provenance_bytes = _read_volume_file_optional(
+                volume, f"{run_root}/provenance/input-bundle-manifest.json"
+            )
+            _validate_bundle_provenance(
+                provenance_bytes,
+                smoke=validated_smoke,
+            )
+        except (TypeError, ValueError) as error:
+            dependency_error = str(error)
+            errors.append(f"dependencies: {dependency_error}")
     for arm in _PILOT_ARMS:
         if (
             states["selection"][arm] == "complete"
@@ -236,17 +264,10 @@ def status_local(volume: VolumeClient, *, run_id: str) -> dict[str, object]:
                 raise ValueError("summary names an incomplete canonical receipt matrix")
             if canonical_shared is None:
                 raise ValueError("summary lacks one canonical pilot identity")
-            smoke_id = str(validated_summary["smoke_receipt_artifact_id"])
-            smoke_path = f"{run_root}/receipts/smoke/{smoke_id}.json"
-            smoke_bytes = _read_volume_file_optional(volume, smoke_path)
-            if smoke_bytes is None:
-                raise ValueError("summary-referenced smoke receipt is missing")
-            _validate_smoke_receipt(
-                smoke_bytes,
-                relative_path=f"receipts/smoke/{smoke_id}.json",
-                run_id=run_id,
-                approved_shared=canonical_shared,
-            )
+            if dependency_error is not None:
+                raise ValueError(
+                    f"summary dependencies are invalid: {dependency_error}"
+                )
         except (TypeError, ValueError) as error:
             summary_state = "invalid"
             errors.append(f"summary: {error}")
@@ -357,44 +378,7 @@ def _local_path_exists_nofollow(path: Path) -> bool:
 
 def _publish_directory_noreplace(source: Path, destination: Path) -> None:
     """Atomically publish one directory while preserving every existing name."""
-    try:
-        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
-    except AttributeError as error:
-        raise OSError(
-            errno.ENOSYS,
-            "atomic no-replace directory publication is unavailable",
-            str(destination),
-        ) from error
-    renameat2.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    renameat2.restype = ctypes.c_int
-    ctypes.set_errno(0)
-    result = renameat2(
-        -100,  # AT_FDCWD
-        os.fsencode(source),
-        -100,
-        os.fsencode(destination),
-        1,  # RENAME_NOREPLACE
-    )
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-        raise FileExistsError(
-            error_number,
-            f"evidence destination already exists: {destination}",
-            str(destination),
-        )
-    raise OSError(
-        error_number,
-        os.strerror(error_number),
-        str(destination),
-    )
+    atomic_publish_directory_noreplace(source, destination)
 
 def _require_canonical_run_id(run_id: str) -> None:
     if not isinstance(run_id, str) or _RUN_ID_PATTERN.fullmatch(run_id) is None:
@@ -539,13 +523,15 @@ def _validate_receipt_job_identity(receipt: object, *, run_id: str) -> None:
             "command",
             "producer-validation",
             "promotion",
+            "post-promotion-validation",
             "receipt-publication",
             "commit",
         }
         or (
             exit_status == 0
             and failure_stage not in {
-                "producer-validation", "promotion", "receipt-publication", "commit"
+                "producer-validation", "promotion", "post-promotion-validation",
+                "receipt-publication", "commit",
             }
         )
         or (
@@ -574,6 +560,7 @@ def _is_approved_observed_gpu(value: object) -> bool:
 def _receipt_shared_identity(receipt: object) -> tuple[str, ...]:
     values = (
         getattr(receipt, "bundle_id", None),
+        getattr(receipt, "bundle_manifest_artifact_id", None),
         getattr(receipt, "source_hash", None),
         getattr(receipt, "dependency_lock_hash", None),
         getattr(receipt, "model_cache_artifact_id", None),
@@ -583,9 +570,12 @@ def _receipt_shared_identity(receipt: object) -> tuple[str, ...]:
         getattr(receipt, "split_artifact_id", None),
         *getattr(receipt, "materialization_artifact_ids", ()),
     )
-    if not all(_is_sha256(value) for value in values):
+    if (
+        not all(_is_sha256(value) for value in values)
+        or getattr(receipt, "modal_environment", None) != "main"
+    ):
         raise ValueError("attempt receipt shared identity is invalid")
-    return tuple(str(value) for value in values)
+    return (*tuple(str(value) for value in values), "main")
 
 
 def _validate_status_canonical_output(
@@ -801,7 +791,9 @@ def _validate_status_summary(
     fields = {
         "schema_version", "stage", "run_id", "plan_digest",
         "stage_a_action_digest", "stage_a_resume",
+        "modal_environment",
         "smoke_receipt_artifact_id", "model_cache_artifact_id",
+        "bundle_manifest_artifact_id",
         "receipt_approval_history", "training_receipt_ids",
         "selection_receipt_ids", "behavior_gate_checked_artifact_ids",
         "elapsed_gpu_seconds", "finalizer_provenance", "next_command",
@@ -847,18 +839,28 @@ def _validate_status_summary(
     cache_ids = {
         receipt.get("model_cache_artifact_id") for receipt in receipt_matrix
     }
+    bundle_manifest_ids = {
+        receipt.get("bundle_manifest_artifact_id") for receipt in receipt_matrix
+    }
+    modal_environments = {
+        receipt.get("modal_environment") for receipt in receipt_matrix
+    }
     if (
         len(plan_digests) != 1
         or len(smoke_ids) != 1
         or len(cache_ids) != 1
+        or len(bundle_manifest_ids) != 1
+        or modal_environments != {"main"}
         or not _is_sha256(next(iter(plan_digests), None))
         or not _is_sha256(next(iter(smoke_ids), None))
         or not _is_sha256(next(iter(cache_ids), None))
+        or not _is_sha256(next(iter(bundle_manifest_ids), None))
     ):
         raise ValueError("Stage A summary receipt approval identity is invalid")
     plan_digest = str(next(iter(plan_digests)))
     smoke_id = str(next(iter(smoke_ids)))
     cache_id = str(next(iter(cache_ids)))
+    bundle_manifest_id = str(next(iter(bundle_manifest_ids)))
     summary_resume = summary.get("stage_a_resume")
     if not isinstance(summary_resume, bool):
         raise ValueError("Stage A summary approval mode is invalid")
@@ -867,6 +869,8 @@ def _validate_status_summary(
         resume=summary_resume,
         smoke_receipt_artifact_id=smoke_id,
         model_cache_artifact_id=cache_id,
+        bundle_manifest_artifact_id=bundle_manifest_id,
+        modal_environment="main",
     )
     expected_approval_history = _status_receipt_approval_history(receipt_matrix)
     provenance = summary.get("finalizer_provenance")
@@ -887,8 +891,10 @@ def _validate_status_summary(
         or summary.get("plan_digest") != plan_digest
         or not run_id.endswith(f"-plan-{plan_digest}")
         or summary.get("stage_a_action_digest") != expected_action_digest
+        or summary.get("modal_environment") != "main"
         or summary.get("smoke_receipt_artifact_id") != smoke_id
         or summary.get("model_cache_artifact_id") != cache_id
+        or summary.get("bundle_manifest_artifact_id") != bundle_manifest_id
         or summary.get("receipt_approval_history") != expected_approval_history
         or summary.get("training_receipt_ids") != training_ids
         or summary.get("selection_receipt_ids") != selection_ids
@@ -939,12 +945,16 @@ def _status_stage_a_action_digest(
     resume: bool,
     smoke_receipt_artifact_id: str,
     model_cache_artifact_id: str,
+    bundle_manifest_artifact_id: str,
+    modal_environment: str,
 ) -> str:
     if (
         not _is_sha256(plan_digest)
         or not isinstance(resume, bool)
         or not _is_sha256(smoke_receipt_artifact_id)
         or not _is_sha256(model_cache_artifact_id)
+        or not _is_sha256(bundle_manifest_artifact_id)
+        or modal_environment != "main"
     ):
         raise ValueError("Stage A approval identity is invalid")
     return sha256_json(
@@ -952,9 +962,11 @@ def _status_stage_a_action_digest(
             "schema_version": 1,
             "plan_digest": plan_digest,
             "action": "run-stage-a",
+            "modal_environment": modal_environment,
             "resume": resume,
             "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
             "model_cache_artifact_id": model_cache_artifact_id,
+            "bundle_manifest_artifact_id": bundle_manifest_artifact_id,
         }
     )
 
@@ -982,6 +994,10 @@ def _status_receipt_approval_history(
             model_cache_artifact_id=str(
                 receipt.get("model_cache_artifact_id")
             ),
+            bundle_manifest_artifact_id=str(
+                receipt.get("bundle_manifest_artifact_id")
+            ),
+            modal_environment=str(receipt.get("modal_environment")),
         )
         if (
             digest != expected
@@ -1103,6 +1119,8 @@ def _evidence_relative_path(
     parts = candidate.parts
     if relative == "stage-a-summary.json":
         return relative
+    if relative == "provenance/input-bundle-manifest.json":
+        return relative
     if (
         len(parts) == 4
         and parts[:2] == ("receipts", "canonical")
@@ -1168,25 +1186,57 @@ def _validate_smoke_receipt(
     unsigned = dict(smoke)
     artifact_id = unsigned.pop("artifact_id", None)
     imports = smoke.get("imports")
+    bundle_files = smoke.get("bundle_files")
+    artifact_ids = [
+        smoke.get("split_artifact_id"),
+        *(smoke.get("materialization_artifact_ids") or []),
+    ]
+    bundle_payload = {
+        "schema_version": 1,
+        "files": bundle_files,
+        "artifact_ids": artifact_ids,
+    }
+    bundle_manifest_payload = {
+        "schema_version": 1,
+        "bundle_id": smoke.get("bundle_id"),
+        "files": bundle_files,
+        "artifact_ids": artifact_ids,
+    }
     if (
-        len(approved_shared) != 8 + len(_PILOT_ARMS)
+        len(approved_shared) != 10 + len(_PILOT_ARMS)
         or set(smoke) != _SMOKE_RECEIPT_FIELDS
         or smoke.get("schema_version") != 1
         or smoke.get("stage") != "smoke"
         or smoke.get("hardware") != "CPU"
         or smoke.get("run_id") != run_id
-        or smoke.get("plan_digest") != approved_shared[5]
-        or smoke.get("config_hash") != approved_shared[6]
-        or smoke.get("split_artifact_id") != approved_shared[7]
-        or smoke.get("materialization_artifact_ids") != list(approved_shared[8:])
-        or smoke.get("source_hash") != approved_shared[1]
-        or smoke.get("dependency_lock_hash") != approved_shared[2]
+        or smoke.get("plan_digest") != approved_shared[6]
+        or smoke.get("config_hash") != approved_shared[7]
+        or smoke.get("split_artifact_id") != approved_shared[8]
+        or smoke.get("materialization_artifact_ids")
+        != list(approved_shared[9:-1])
+        or smoke.get("source_hash") != approved_shared[2]
+        or smoke.get("dependency_lock_hash") != approved_shared[3]
         or smoke.get("canonical_dependency_lock_path")
         != "requirements-modal-phase-marker.txt"
         or smoke.get("bundle_id") != approved_shared[0]
+        or smoke.get("bundle_manifest_artifact_id") != approved_shared[1]
+        or smoke.get("modal_environment") != approved_shared[-1]
+        or not isinstance(bundle_files, list)
+        or len(bundle_files) != len(INPUT_ALLOWLIST)
+        or any(
+            not isinstance(item, Mapping)
+            or set(item) != {"path", "size", "sha256"}
+            for item in bundle_files
+        )
+        or tuple(item["path"] for item in bundle_files) != INPUT_ALLOWLIST
+        or smoke.get("bundle_id") != sha256_json(bundle_payload)
+        or smoke.get("bundle_manifest_artifact_id")
+        != _sha256_bytes(
+            (canonical_json(bundle_manifest_payload) + "\n").encode("utf-8")
+        )
         or smoke.get("model_revision") != QWEN25_7B_TOKENIZER_REVISION
-        or smoke.get("model_cache_artifact_id") != approved_shared[3]
-        or artifact_id != approved_shared[4]
+        or smoke.get("model_cache_artifact_id") != approved_shared[4]
+        or artifact_id != approved_shared[5]
         or not isinstance(imports, list)
         or any(
             not isinstance(item, Mapping)
@@ -1226,6 +1276,30 @@ def _validate_smoke_receipt(
     return smoke
 
 
+def _validate_bundle_provenance(
+    content: bytes | None, *, smoke: Mapping[str, object],
+) -> dict[str, object]:
+    if content is None:
+        raise ValueError("input bundle provenance is missing")
+    payload = _decode_json_object(content, "input bundle provenance")
+    expected = {
+        "schema_version": 1,
+        "bundle_id": smoke.get("bundle_id"),
+        "files": smoke.get("bundle_files"),
+        "artifact_ids": [
+            smoke.get("split_artifact_id"),
+            *(smoke.get("materialization_artifact_ids") or []),
+        ],
+    }
+    if (
+        payload != expected
+        or _sha256_bytes(content) != smoke.get("bundle_manifest_artifact_id")
+        or content != (canonical_json(expected) + "\n").encode("utf-8")
+    ):
+        raise ValueError("input bundle provenance bytes are invalid")
+    return payload
+
+
 def _validate_downloaded_advertised_hashes(contents: Mapping[str, bytes]) -> None:
     summary = contents.get("stage-a-summary.json")
     if summary is None:
@@ -1263,10 +1337,23 @@ def _validate_downloaded_advertised_hashes(contents: Mapping[str, bytes]) -> Non
     }
     expected_smoke_path = f"receipts/smoke/{referenced_smoke_id}.json"
     if (
-        referenced_smoke_id != approved_shared[4]
+        referenced_smoke_id != approved_shared[5]
         or smoke_paths != {expected_smoke_path}
     ):
         raise ValueError("downloaded evidence lacks its exact approved smoke receipt")
+    smoke_content = contents.get(expected_smoke_path)
+    if smoke_content is None:
+        raise ValueError("downloaded evidence lacks its exact approved smoke receipt")
+    validated_smoke = _validate_smoke_receipt(
+        smoke_content,
+        relative_path=expected_smoke_path,
+        run_id=run_id,
+        approved_shared=approved_shared,
+    )
+    _validate_bundle_provenance(
+        contents.get("provenance/input-bundle-manifest.json"),
+        smoke=validated_smoke,
+    )
     attempt_receipts: dict[str, object] = {}
     for path, content in contents.items():
         if path.startswith("receipts/attempts/"):

@@ -44,6 +44,8 @@ from phase_marker.modal_artifacts import (
     validate_canonical_job_semantics,
     validate_action_approval_payload,
     validate_job_receipt_payload,
+    validate_stage_a_remote_dependencies,
+    load_validated_canonical_stage_a_receipts,
     validate_stage_a_summary,
     sha256_json,
 )
@@ -54,6 +56,7 @@ from phase_marker.modal_inspection import (
     status_local,
 )
 from phase_marker.modal_plan import (
+    MODAL_ENVIRONMENT,
     PilotPlan,
     action_approval_payload,
     build_pilot_plan,
@@ -116,6 +119,7 @@ _SELECTION_CRITERION = {
 _SMOKE_RECEIPT_FIELDS = frozenset({
     "schema_version", "stage", "hardware", "run_id", "source_hash",
     "dependency_lock_hash", "canonical_dependency_lock_path", "bundle_id",
+    "bundle_manifest_artifact_id", "bundle_files", "modal_environment",
     "plan_digest", "config_hash", "split_artifact_id",
     "materialization_artifact_ids", "model_revision",
     "model_cache_artifact_id", "imports", "validated", "failure_reason",
@@ -128,6 +132,9 @@ CODE_ROOT = Path("/opt/glyph_reasoning")
 INPUT_MOUNT_ROOT = Path("/mnt/inputs")
 MODEL_MOUNT_ROOT = Path("/mnt/model")
 RUN_MOUNT_ROOT = Path("/mnt/runs")
+JOB_INPUT_MOUNT_ROOT = Path("/inputs")
+JOB_MODEL_MOUNT_ROOT = Path("/model-cache")
+JOB_RUN_MOUNT_ROOT = Path("/runs")
 LOCKED_RUNTIME_IMPORTS = (
     "accelerate",
     "datasets",
@@ -189,6 +196,7 @@ class StageADependencyEvidence:
     bundle_id: str
     model_cache_artifact_id: str
     smoke_receipt_artifact_id: str
+    bundle_manifest_artifact_id: str
     smoke_receipt: dict[str, object]
 
 
@@ -197,9 +205,15 @@ app = modal.App(
     tags=_BASE_TAGS,
     include_source=False,
 )
-inputs_volume = modal.Volume.from_name(VOLUME_NAMES[0], create_if_missing=False)
-model_volume = modal.Volume.from_name(VOLUME_NAMES[1], create_if_missing=False)
-runs_volume = modal.Volume.from_name(VOLUME_NAMES[2], create_if_missing=False)
+inputs_volume = modal.Volume.from_name(
+    VOLUME_NAMES[0], environment_name=MODAL_ENVIRONMENT, create_if_missing=False
+)
+model_volume = modal.Volume.from_name(
+    VOLUME_NAMES[1], environment_name=MODAL_ENVIRONMENT, create_if_missing=False
+)
+runs_volume = modal.Volume.from_name(
+    VOLUME_NAMES[2], environment_name=MODAL_ENVIRONMENT, create_if_missing=False
+)
 
 GPU_VOLUMES = {
     "/inputs": inputs_volume.read_only(),
@@ -352,9 +366,23 @@ def finalize_stage_a_remote(remote_payload: Mapping[str, object]) -> dict[str, o
         smoke_receipt_artifact_id=approval.get("smoke_receipt_artifact_id"),
         model_cache_artifact_id=approval.get("model_cache_artifact_id"),
     )
+    runs_volume.reload()
+    canonical_receipts = load_validated_canonical_stage_a_receipts(
+        plan_payload=plan_payload,
+        approval_payload=approval,
+        input_root=JOB_INPUT_MOUNT_ROOT,
+        model_root=JOB_MODEL_MOUNT_ROOT,
+        run_root=JOB_RUN_MOUNT_ROOT,
+    )
+    supplied = tuple(receipts)
+    if len(supplied) != len(canonical_receipts) or any(
+        not isinstance(item, Mapping) or dict(item) != canonical
+        for item, canonical in zip(supplied, canonical_receipts, strict=True)
+    ):
+        raise ValueError("coordinator receipts do not match canonical Stage A bytes")
     return finalize_stage_a(
         plan_payload=plan_payload,
-        receipts=receipts,
+        receipts=canonical_receipts,
         input_root=Path("/inputs"),
         model_root=Path("/model-cache"),
         run_root=Path("/runs"),
@@ -458,6 +486,24 @@ def _execute_job(stage: str, job_payload: dict[str, object]) -> dict[str, object
             else None
         ),
     )
+    runs_volume.reload()
+    if stage == "selection":
+        load_validated_canonical_stage_a_receipts(
+            plan_payload=plan,
+            approval_payload=approval,
+            input_root=JOB_INPUT_MOUNT_ROOT,
+            model_root=JOB_MODEL_MOUNT_ROOT,
+            run_root=JOB_RUN_MOUNT_ROOT,
+            stages=("train",),
+        )
+    else:
+        validate_stage_a_remote_dependencies(
+            plan_payload=plan,
+            approval_payload=approval,
+            input_root=JOB_INPUT_MOUNT_ROOT,
+            model_root=JOB_MODEL_MOUNT_ROOT,
+            run_root=JOB_RUN_MOUNT_ROOT,
+        )
     function_name = "run_training_job" if stage == "train" else "run_selection_job"
     return execute_pilot_job(
         stage=stage,
@@ -576,6 +622,8 @@ def run_stage_a_local(
         != dependency_evidence.smoke_receipt_artifact_id
         or existing.summary.get("model_cache_artifact_id")
         != dependency_evidence.model_cache_artifact_id
+        or existing.summary.get("bundle_manifest_artifact_id")
+        != dependency_evidence.bundle_manifest_artifact_id
     ):
         raise ValueError(
             "completed Stage A summary does not bind the approved dependencies"
@@ -592,6 +640,10 @@ def run_stage_a_local(
                 "approval_digest": validated_approval["approval_digest"],
                 "smoke_receipt_artifact_id": dependency_evidence.smoke_receipt_artifact_id,
                 "model_cache_artifact_id": dependency_evidence.model_cache_artifact_id,
+                "bundle_manifest_artifact_id": (
+                    dependency_evidence.bundle_manifest_artifact_id
+                ),
+                "modal_environment": plan.modal_environment,
                 "recoveries": list(existing.recoveries),
                 "missing_training": [
                     {"arm": job.arm, "command": job.training_command}
@@ -614,7 +666,8 @@ def run_stage_a_local(
                     "spend_cap_usd": plan.resources.spend_cap_usd,
                 },
             }
-        )
+        ),
+        flush=True,
     )
     if existing.summary is not None and not existing.recoveries:
         return dict(existing.summary)
@@ -830,10 +883,23 @@ def preflight_stage_a_dependencies(
         artifact_id=smoke_receipt_artifact_id,
         model_cache_artifact_id=model_cache_artifact_id,
     )
+    provenance_path = (
+        f"/runs/{plan.run_id}/provenance/input-bundle-manifest.json"
+    )
+    provenance_bytes = _read_volume_file_optional(runs_client, provenance_path)
+    expected_manifest = (canonical_json(asdict(bundle)) + "\n").encode("utf-8")
+    if (
+        provenance_bytes != expected_manifest
+        or _sha256_bytes(expected_manifest) != plan.bundle_manifest_artifact_id
+        or smoke.get("bundle_manifest_artifact_id")
+        != plan.bundle_manifest_artifact_id
+    ):
+        raise ValueError("Stage A input bundle provenance is invalid")
     return StageADependencyEvidence(
         bundle_id=bundle.bundle_id,
         model_cache_artifact_id=model_cache_artifact_id,
         smoke_receipt_artifact_id=smoke_receipt_artifact_id,
+        bundle_manifest_artifact_id=plan.bundle_manifest_artifact_id,
         smoke_receipt=smoke,
     )
 
@@ -877,6 +943,11 @@ def _validate_successful_smoke_receipt(
         or smoke.get("canonical_dependency_lock_path")
         != plan.canonical_dependency_lock_path
         or smoke.get("bundle_id") != plan.bundle_id
+        or smoke.get("bundle_manifest_artifact_id")
+        != plan.bundle_manifest_artifact_id
+        or smoke.get("bundle_files")
+        != [asdict(item) for item in plan.bundle_files]
+        or smoke.get("modal_environment") != plan.modal_environment
         or smoke.get("model_revision") != plan.model_revision
         or smoke.get("model_cache_artifact_id") != model_cache_artifact_id
         or smoke.get("validated") is not True
@@ -1127,7 +1198,11 @@ def _preflight_stage_a_namespace(
         for job in plan.jobs
     }
     summary_path = f"{run_root}/stage-a-summary.json"
-    expected = {*producer_roots, *receipt_paths, *promotion_locks, summary_path}
+    provenance_path = f"{run_root}/provenance/input-bundle-manifest.json"
+    expected = {
+        *producer_roots, *receipt_paths, *promotion_locks, summary_path,
+        provenance_path,
+    }
     ignored_prefixes = (
         f"{run_root}/attempts/",
         f"{run_root}/receipts/attempts/",
@@ -2274,11 +2349,12 @@ def _create_authorized_volume(
         "stage-inputs": VOLUME_NAMES[0],
         "cache-model": VOLUME_NAMES[1],
         "smoke": VOLUME_NAMES[2],
-        "run-stage-a": VOLUME_NAMES[2],
     }.get(action)
     if name != expected_name:
         raise ValueError("volume creation target is not authorized for this action")
-    volume = modal.Volume.from_name(name, create_if_missing=True)
+    volume = modal.Volume.from_name(
+        name, environment_name=MODAL_ENVIRONMENT, create_if_missing=True
+    )
     volume.hydrate()
     return volume
 
@@ -2551,15 +2627,6 @@ def run_stage_a(
         resume=resume,
         smoke_receipt_artifact_id=smoke_receipt_artifact_id,
         model_cache_artifact_id=model_cache_artifact_id,
-    )
-    _create_authorized_volume(
-        VOLUME_NAMES[2],
-        plan_payload=pilot_plan_payload(plan),
-        approval_payload=approval,
-        action="run-stage-a",
-    )
-    apply_approved_app_tags(
-        plan, approval_payload=approval, action="run-stage-a"
     )
     result = run_stage_a_local(
         plan,

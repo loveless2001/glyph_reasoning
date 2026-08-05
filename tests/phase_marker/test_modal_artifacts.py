@@ -816,13 +816,41 @@ def receipt_fixture(**changes: object) -> AttemptReceipt:
     smoke_receipt_artifact_id = "9" * 64
     stage_a_resume = False
     started_at = datetime.now(timezone.utc)
+    materialization_ids = tuple(f"{value:x}" * 64 for value in range(3, 9))
+    bundle_files = tuple(
+        modal_artifacts.BundleFile(path, 1, "a" * 64)
+        for path in modal_artifacts.INPUT_ALLOWLIST
+    )
+    bundle_id = modal_artifacts.sha256_json(
+        {
+            "schema_version": 1,
+            "files": [asdict(item) for item in bundle_files],
+            "artifact_ids": ["2" * 64, *materialization_ids],
+        }
+    )
+    bundle_manifest_artifact_id = hashlib.sha256(
+        (
+            canonical_json(
+                {
+                    "schema_version": 1,
+                    "bundle_id": bundle_id,
+                    "files": [asdict(item) for item in bundle_files],
+                    "artifact_ids": ["2" * 64, *materialization_ids],
+                }
+            )
+            + "\n"
+        ).encode()
+    ).hexdigest()
     fields: dict[str, object] = {
         "schema_version": 1,
         "run_id": (
             "pilot-s42-cfg-12345678-split-22222222-src-cccccccccccc-plan-"
             + "1" * 64
         ),
-        "bundle_id": "a" * 64,
+        "bundle_id": bundle_id,
+        "bundle_manifest_artifact_id": bundle_manifest_artifact_id,
+        "bundle_files": bundle_files,
+        "modal_environment": "main",
         "stage": "train",
         "arm": "glyph",
         "seed": 42,
@@ -837,6 +865,8 @@ def receipt_fixture(**changes: object) -> AttemptReceipt:
             resume=stage_a_resume,
             smoke_receipt_artifact_id=smoke_receipt_artifact_id,
             model_cache_artifact_id=cache_artifact_id,
+            bundle_manifest_artifact_id=bundle_manifest_artifact_id,
+            modal_environment="main",
         ),
         "stage_a_resume": stage_a_resume,
         "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
@@ -855,9 +885,7 @@ def receipt_fixture(**changes: object) -> AttemptReceipt:
         "plan_digest": plan_digest,
         "config_hash": "1" * 64,
         "split_artifact_id": "2" * 64,
-        "materialization_artifact_ids": tuple(
-            f"{value:x}" * 64 for value in range(3, 9)
-        ),
+        "materialization_artifact_ids": materialization_ids,
         "model_revision": QWEN25_7B_TOKENIZER_REVISION,
         "modal_app_id": "ap-test",
         "modal_app_name": "phase-marker-pilot-stage-a",
@@ -1418,17 +1446,17 @@ def test_promotion_lock_cleanup_failure_rolls_publication_back_to_quarantine(
     (source / "adapter.bin").write_bytes(b"frozen adapter bytes")
     canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
     lock = canonical.parent / ".glyph.promotion.lock"
-    original_unlink = Path.unlink
+    original_unlink = os.unlink
     failed = False
 
-    def fail_once(path: Path, *args: object, **kwargs: object) -> None:
+    def fail_once(path: object, *args: object, **kwargs: object) -> None:
         nonlocal failed
-        if path == lock and not failed:
+        if path == lock.name and kwargs.get("dir_fd") is not None and not failed:
             failed = True
             raise OSError("injected promotion lock cleanup failure")
         original_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", fail_once)
+    monkeypatch.setattr(os, "unlink", fail_once)
 
     with pytest.raises(OSError, match="lock cleanup"):
         promote_validated_output(source, attempt, canonical, receipt)
@@ -1553,6 +1581,70 @@ def test_failed_output_copy_keeps_staging_quarantined(
     assert (attempt / "promotion-staging/adapter.bin").read_bytes() == b"adapter"
 
 
+def test_promotion_rejects_source_mutation_immediately_before_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a raced source copy could escape the immutable receipt."""
+    receipt = _receipt_for_file("adapter.bin", b"approved bytes")
+    attempt = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = (
+        attempt / "workspace"
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    )
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"approved bytes")
+    canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    real_copytree = shutil.copytree
+
+    def mutate_then_copy(source_root: Path, destination: Path, **kwargs: object) -> Path:
+        (Path(source_root) / "adapter.bin").write_bytes(b"unapproved raced bytes")
+        return real_copytree(source_root, destination, **kwargs)
+
+    monkeypatch.setattr(shutil, "copytree", mutate_then_copy)
+
+    with pytest.raises(ValueError, match="receipt output hash"):
+        promote_validated_output(source, attempt, canonical, receipt)
+
+    assert not canonical.exists()
+    assert (
+        attempt / "promotion-staging/adapter.bin"
+    ).read_bytes() == b"unapproved raced bytes"
+
+
+def test_promotion_rejects_staged_mutation_immediately_before_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if canonical bytes could change after staged receipt validation."""
+    receipt = _receipt_for_file("adapter.bin", b"approved bytes")
+    attempt = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = (
+        attempt / "workspace"
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    )
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"approved bytes")
+    canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    real_rename = modal_artifacts._atomic_rename_directory_noreplace_at
+
+    def mutate_then_rename(**kwargs: object) -> None:
+        (attempt / "promotion-staging/adapter.bin").write_bytes(
+            b"unapproved after validation"
+        )
+        real_rename(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        modal_artifacts, "_atomic_rename_directory_noreplace_at", mutate_then_rename
+    )
+
+    with pytest.raises(ValueError, match="receipt output hash"):
+        promote_validated_output(source, attempt, canonical, receipt)
+
+    assert not canonical.exists()
+    assert (
+        attempt / "failed-promotion/adapter.bin"
+    ).read_bytes() == b"unapproved after validation"
+
+
 def test_workspace_metadata_rejects_another_arm_command(
     repo_fixture: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1651,7 +1743,7 @@ def test_promotion_rejects_different_filesystem_before_staging(tmp_path: Path) -
     other_filesystem = tmp_path / "runs/artifacts"
     other_filesystem.symlink_to("/proc", target_is_directory=True)
 
-    with pytest.raises(ValueError, match="same filesystem"):
+    with pytest.raises(ValueError, match="same filesystem|symlink"):
         promote_validated_output(
             source, attempt,
             other_filesystem / "phase-marker/checkpoints/pilot/seed-42/glyph", receipt,
@@ -2295,17 +2387,203 @@ def test_job_lease_durability_failure_aborts_before_promotion_and_records_failur
     assert not canonical.exists()
     assert not canonical_receipt.exists()
     assert len(failed) == 1
-    receipt = json.loads(failed[0].read_text(encoding="utf-8"))
-    assert receipt["validated"] is False and receipt["promoted"] is False
-    assert "RuntimeError: injected first commit failure" in receipt["failure_reason"]
-    attempt = next((run / "attempts").iterdir())
-    assert not (attempt / "failed-publication").exists()
+    receipt_payload = json.loads(failed[0].read_text(encoding="utf-8"))
+    assert receipt_payload["validated"] is False and receipt_payload["promoted"] is False
+    assert "RuntimeError: injected first commit failure" in receipt_payload["failure_reason"]
+    failed_attempt = next((run / "attempts").iterdir())
+    assert not (failed_attempt / "failed-publication").exists()
     assert not (
         canonical.parent / f".{canonical.name}.promotion.lock"
     ).exists()
-    assert not (attempt / "workspace").exists()
-    assert not list(attempt.rglob("bundle-manifest.json"))
+    assert not (failed_attempt / "workspace").exists()
+    assert not list(failed_attempt.rglob("bundle-manifest.json"))
     assert volume.commit_count == 2
+
+
+def test_job_post_promotion_mismatch_quarantines_and_commits_failure_receipt(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if outer canonical revalidation could lose rollback evidence."""
+    code_root = Path(__file__).resolve().parents[2]
+    input_root = tmp_path / "inputs"
+    model_root = tmp_path / "model-cache"
+    run_root = tmp_path / "runs"
+    ephemeral_root = tmp_path / "ephemeral"
+    ephemeral_root.mkdir()
+    bundle = _stage_job_inputs(repo_fixture, input_root)
+    _stage_job_model(qwen_snapshot, model_root)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[5]
+
+    def fake_subprocess(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[0] == "nvidia-smi":
+            return SimpleNamespace(returncode=0, stdout="NVIDIA H100 80GB HBM3\n")
+        workspace = Path(str(kwargs["cwd"]))
+        output = workspace / argv[argv.index("--output-dir") + 1]
+        output.mkdir(parents=True)
+        (output / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+        (output / "adapter_model.safetensors").write_bytes(b"adapter")
+        (output / "run-manifest.json").write_text("{}\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0)
+
+    canonical = (
+        run_root / "runs" / plan.run_id
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/filler"
+    )
+    real_validate = modal_artifacts._validate_receipt_outputs
+    canonical_checks = 0
+
+    def mutate_before_outer_validation(root: Path, receipt: AttemptReceipt) -> None:
+        nonlocal canonical_checks
+        if Path(root) == canonical:
+            canonical_checks += 1
+            if canonical_checks == 2:
+                (canonical / "adapter_model.safetensors").write_bytes(
+                    b"unapproved after promotion"
+                )
+        real_validate(root, receipt)
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess)
+    monkeypatch.setattr(
+        modal_artifacts, "_validate_receipt_outputs", mutate_before_outer_validation
+    )
+    volume = CommitVolume()
+
+    with pytest.raises(ValueError, match="receipt output hash"):
+        modal_artifacts.execute_pilot_job(
+            stage="train",
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            job_payload=asdict(job),
+            code_root=code_root,
+            input_root=input_root,
+            model_root=model_root,
+            run_root=run_root,
+            volume=volume,
+            stage_a_approval=_stage_a_approval_for_model(plan, model_root),
+            execution_provenance=_execution_provenance("train", "post-promotion-fail"),
+            ephemeral_root=ephemeral_root,
+            environ={"CUDA_VISIBLE_DEVICES": "0"},
+            producer_validator=lambda *_: None,
+            bf16_probe=lambda: True,
+        )
+
+    run = run_root / "runs" / plan.run_id
+    assert canonical_checks == 2
+    assert not canonical.exists()
+    assert not (run / "receipts/canonical/train/filler.json").exists()
+    attempt = next((run / "attempts").iterdir())
+    assert (
+        attempt / "failed-publication/producer/adapter_model.safetensors"
+    ).read_bytes() == b"unapproved after promotion"
+    assert (attempt / "failed-publication/promotion.lock").is_file()
+    receipts = list((run / "receipts/attempts").glob("*.json"))
+    assert len(receipts) == 1
+    failed = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert failed["failure_stage"] == "post-promotion-validation"
+    assert failed["validated"] is False and failed["promoted"] is False
+    assert volume.commit_count == 2
+
+
+def test_promotion_never_replaces_a_late_empty_destination_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt = _receipt_for_file("adapter.bin", b"adapter")
+    attempt = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = attempt / "workspace/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"adapter")
+    canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    original_rename = modal_artifacts._renameat2_noreplace
+
+    def race_rename(
+        source_parent_fd: int, source_name: str,
+        destination_parent_fd: int, destination_name: str,
+    ) -> None:
+        os.mkdir(destination_name, dir_fd=destination_parent_fd)
+        original_rename(
+            source_parent_fd, source_name, destination_parent_fd, destination_name
+        )
+
+    monkeypatch.setattr(modal_artifacts, "_renameat2_noreplace", race_rename)
+    with pytest.raises(FileExistsError):
+        promote_validated_output(source, attempt, canonical, receipt)
+    assert canonical.is_dir()
+    assert not (canonical / "adapter.bin").exists()
+
+
+def test_promotion_rejects_dangling_destination_symlink_without_redirect(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt_for_file("adapter.bin", b"adapter")
+    attempt = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = attempt / "workspace/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"adapter")
+    canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    canonical.parent.mkdir(parents=True)
+    outside = tmp_path / "outside/missing"
+    canonical.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(FileExistsError):
+        promote_validated_output(source, attempt, canonical, receipt)
+    assert canonical.is_symlink()
+    assert not outside.exists()
+
+
+def test_promotion_rejects_symlinked_canonical_parent_without_external_write(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt_for_file("adapter.bin", b"adapter")
+    attempt = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = attempt / "workspace/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"adapter")
+    external = tmp_path / "external"
+    external.mkdir()
+    redirected = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42"
+    redirected.parent.mkdir(parents=True)
+    redirected.symlink_to(external, target_is_directory=True)
+    canonical = redirected / "glyph"
+
+    with pytest.raises(ValueError, match="symlink|canonical"):
+        promote_validated_output(source, attempt, canonical, receipt)
+    assert not (external / "glyph").exists()
+
+
+def test_promotion_detects_post_rename_target_inode_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt = _receipt_for_file("adapter.bin", b"adapter")
+    attempt = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = attempt / "workspace/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"adapter")
+    canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    original_rename = modal_artifacts._renameat2_noreplace
+
+    def replace_after_rename(
+        source_parent_fd: int, source_name: str,
+        destination_parent_fd: int, destination_name: str,
+    ) -> None:
+        original_rename(
+            source_parent_fd, source_name, destination_parent_fd, destination_name
+        )
+        os.rename(
+            destination_name, "attacker-stolen", src_dir_fd=destination_parent_fd,
+            dst_dir_fd=destination_parent_fd,
+        )
+        os.mkdir(destination_name, dir_fd=destination_parent_fd)
+
+    monkeypatch.setattr(
+        modal_artifacts, "_renameat2_noreplace", replace_after_rename
+    )
+    with pytest.raises(OSError, match="inode changed"):
+        promote_validated_output(source, attempt, canonical, receipt)
+    assert canonical.is_dir() and not any(canonical.iterdir())
+    assert (canonical.parent / "attacker-stolen/adapter.bin").is_file()
 
 
 def test_job_publication_commit_failure_quarantines_uncommitted_pair_and_lease(
@@ -2461,6 +2739,9 @@ def _finalizer_receipt_payload(
         schema_version=1,
         run_id=plan.run_id,
         bundle_id=plan.bundle_id,
+        bundle_manifest_artifact_id=plan.bundle_manifest_artifact_id,
+        bundle_files=plan.bundle_files,
+        modal_environment=plan.modal_environment,
         stage=stage,
         arm=job.arm,
         seed=42,
@@ -2518,6 +2799,7 @@ def _finalizer_receipt_payload(
         {"module": module, "version": version}
         for module, version in receipt.runtime_versions
     ]
+    payload["bundle_files"] = [asdict(item) for item in receipt.bundle_files]
     return payload
 
 

@@ -172,10 +172,14 @@ class FakeVolumeMount:
 
 
 class FakeVolume:
-    def __init__(self, modal: FakeModal, name: str, create_if_missing: bool) -> None:
+    def __init__(
+        self, modal: FakeModal, name: str, create_if_missing: bool,
+        environment_name: str | None,
+    ) -> None:
         self._modal = modal
         self.name = name
         self.create_if_missing = create_if_missing
+        self.environment_name = environment_name
         self.read_only_calls = 0
         self.read_only_handle = FakeVolumeMount(self)
 
@@ -329,11 +333,20 @@ class FakeModal(ModuleType):
         self.declaration_calls.append(("Image.from_registry", base, {"add_python": add_python}))
         return image
 
-    def _from_name(self, name: str, *, create_if_missing: bool) -> FakeVolume:
-        volume = FakeVolume(self, name, create_if_missing)
+    def _from_name(
+        self, name: str, *, create_if_missing: bool,
+        environment_name: str | None = None,
+    ) -> FakeVolume:
+        volume = FakeVolume(self, name, create_if_missing, environment_name)
         self.volumes.append(volume)
         self.declaration_calls.append(
-            ("Volume.from_name", name, {"create_if_missing": create_if_missing})
+            (
+                "Volume.from_name", name,
+                {
+                    "create_if_missing": create_if_missing,
+                    "environment_name": environment_name,
+                },
+            )
         )
         return volume
 
@@ -502,6 +515,12 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
     assert imported_adapter.GPU == "H100"
     assert imported_adapter.GPU_TIMEOUT_SECONDS == 14_400
     assert imported_adapter.MAX_GPU_CONTAINERS == 2
+    assert imported_adapter.INPUT_MOUNT_ROOT == Path("/mnt/inputs")
+    assert imported_adapter.MODEL_MOUNT_ROOT == Path("/mnt/model")
+    assert imported_adapter.RUN_MOUNT_ROOT == Path("/mnt/runs")
+    assert imported_adapter.JOB_INPUT_MOUNT_ROOT == Path("/inputs")
+    assert imported_adapter.JOB_MODEL_MOUNT_ROOT == Path("/model-cache")
+    assert imported_adapter.JOB_RUN_MOUNT_ROOT == Path("/runs")
     assert "glyph-reasoning-vol" not in imported_adapter.source_text
     assert "/vol/work" not in imported_adapter.source_text
 
@@ -517,6 +536,7 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
     assert [(volume.name, volume.create_if_missing) for volume in fake.volumes] == [
         *((name, False) for name in imported_adapter.VOLUME_NAMES),
     ]
+    assert {volume.environment_name for volume in fake.volumes} == {"main"}
     assert not hasattr(imported_adapter, "inspection_runs_volume")
 
     assert len(fake.images) == 1
@@ -644,6 +664,7 @@ def test_inspection_adapter_declares_no_compute_capability(
         ("phase-marker-pilot-runs-v1", False),
     ]
     declared = fake.volumes[0]
+    assert declared.environment_name == "main"
     assert declared.read_only_calls == 1
     assert adapter.runs_volume is declared.read_only_handle
     assert adapter.runs_volume.read_only is True
@@ -808,6 +829,46 @@ def test_direct_gpu_remote_call_requires_stage_a_evidence_bound_approval(
         )
 
 
+def test_run_stage_a_entrypoint_has_no_create_tag_or_remote_on_failed_preflight(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    bundle = build_input_bundle(pilot_repo)
+    approval = modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=False,
+        smoke_receipt_artifact_id="3" * 64,
+        model_cache_artifact_id="4" * 64,
+    )
+    monkeypatch.setattr(
+        imported_adapter, "_build_operator_context", lambda _root: (bundle, plan)
+    )
+    monkeypatch.setattr(
+        imported_adapter,
+        "run_stage_a_local",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError("Stage A smoke receipt is missing")
+        ),
+    )
+    initial_volume_count = len(imported_adapter.fake_modal.volumes)
+
+    with pytest.raises(ValueError, match="smoke receipt is missing"):
+        imported_adapter.run_stage_a(
+            repo_root=str(pilot_repo),
+            approved_run_id=plan.run_id,
+            acknowledge_budget_usd=1_000,
+            approved_plan_digest=plan.plan_digest,
+            approved_action_digest=str(approval["approval_digest"]),
+            smoke_receipt_artifact_id="3" * 64,
+            model_cache_artifact_id="4" * 64,
+        )
+    assert len(imported_adapter.fake_modal.volumes) == initial_volume_count
+    assert imported_adapter.fake_modal.rpc_calls == []
+
+
 @pytest.mark.parametrize("entrypoint", ("stage_inputs", "cache_model", "smoke"))
 def test_operator_action_digest_is_required_before_any_external_boundary(
     imported_adapter: ModuleType,
@@ -946,6 +1007,17 @@ def test_gpu_job_wrappers_forward_one_approved_payload_to_the_exact_stage(
         return {"stage": kwargs["stage"]}
 
     monkeypatch.setattr(imported_adapter, "execute_pilot_job", execute)
+    monkeypatch.setattr(imported_adapter, "runs_volume", RecordingVolume())
+    monkeypatch.setattr(
+        imported_adapter,
+        "validate_stage_a_remote_dependencies",
+        lambda **_: None,
+    )
+    monkeypatch.setattr(
+        imported_adapter,
+        "load_validated_canonical_stage_a_receipts",
+        lambda **_: (),
+    )
     provenance = _adapter_execution_provenance("train")
     monkeypatch.setattr(
         imported_adapter,
@@ -995,6 +1067,12 @@ def test_cpu_finalizer_wrapper_forwards_receipts_without_loading_weights(
         return {"stopped_before_behavior": True}
 
     monkeypatch.setattr(imported_adapter, "finalize_stage_a", finalize, raising=False)
+    monkeypatch.setattr(imported_adapter, "runs_volume", RecordingVolume())
+    monkeypatch.setattr(
+        imported_adapter,
+        "load_validated_canonical_stage_a_receipts",
+        lambda **_: tuple(receipts),
+    )
     provenance = _adapter_execution_provenance("finalizer")
     monkeypatch.setattr(
         imported_adapter,
@@ -1925,6 +2003,9 @@ def _stage_a_test_dependency_evidence(
         "dependency_lock_hash": plan.dependency_lock_hash,
         "canonical_dependency_lock_path": plan.canonical_dependency_lock_path,
         "bundle_id": plan.bundle_id,
+        "bundle_manifest_artifact_id": plan.bundle_manifest_artifact_id,
+        "bundle_files": [asdict(item) for item in plan.bundle_files],
+        "modal_environment": plan.modal_environment,
         "model_revision": plan.model_revision,
         "model_cache_artifact_id": manifest["artifact_id"],
         "imports": [
@@ -1968,6 +2049,9 @@ def _stage_a_receipt(
         schema_version=1,
         run_id=plan.run_id,
         bundle_id=plan.bundle_id,
+        bundle_manifest_artifact_id=plan.bundle_manifest_artifact_id,
+        bundle_files=plan.bundle_files,
+        modal_environment=plan.modal_environment,
         stage=stage,
         arm=job.arm,
         seed=job.seed,
@@ -2025,6 +2109,7 @@ def _stage_a_receipt(
         {"module": module, "version": version}
         for module, version in receipt.runtime_versions
     ]
+    payload["bundle_files"] = [asdict(item) for item in receipt.bundle_files]
     return payload
 
 
@@ -2074,6 +2159,12 @@ class StageAMapFunction:
                         result["model_cache_artifact_id"] = approval[
                             "model_cache_artifact_id"
                         ]
+                        result["bundle_manifest_artifact_id"] = approval[
+                            "bundle_manifest_artifact_id"
+                        ]
+                        result["modal_environment"] = approval[
+                            "modal_environment"
+                        ]
                         unsigned = dict(result)
                         unsigned.pop("artifact_id")
                         result["artifact_id"] = modal_artifacts.sha256_json(unsigned)
@@ -2110,11 +2201,15 @@ class StageAFinalizer:
                 "plan_digest": approval["plan_digest"],
                 "stage_a_action_digest": approval["approval_digest"],
                 "stage_a_resume": approval["resume"],
+                "modal_environment": approval["modal_environment"],
                 "smoke_receipt_artifact_id": approval[
                     "smoke_receipt_artifact_id"
                 ],
                 "model_cache_artifact_id": approval[
                     "model_cache_artifact_id"
+                ],
+                "bundle_manifest_artifact_id": approval[
+                    "bundle_manifest_artifact_id"
                 ],
                 "receipt_approval_history": modal_artifacts._receipt_approval_history(
                     receipts
@@ -2218,6 +2313,10 @@ def _stage_a_dependency_kwargs(
     ] = (canonical_json(manifest) + "\n").encode("utf-8")
     model = RecordingVolume(model_files)
     smoke_id = str(smoke["artifact_id"])
+    bundle_manifest = (canonical_json(asdict(bundle)) + "\n").encode("utf-8")
+    runs.files[
+        f"/runs/{plan.run_id}/provenance/input-bundle-manifest.json"
+    ] = bundle_manifest
     runs.files[
         f"/runs/{plan.run_id}/receipts/smoke/{smoke_id}.json"
     ] = (canonical_json(smoke) + "\n").encode("utf-8")
@@ -2479,6 +2578,9 @@ def _canonical_stage_a_files(
         schema_version=1,
         run_id=plan.run_id,
         bundle_id=plan.bundle_id,
+        bundle_manifest_artifact_id=plan.bundle_manifest_artifact_id,
+        bundle_files=plan.bundle_files,
+        modal_environment=plan.modal_environment,
         stage=stage,
         arm=job.arm,
         seed=42,
@@ -2538,6 +2640,9 @@ def _canonical_stage_a_files(
         {"module": module, "version": version}
         for module, version in receipt.runtime_versions
     ]
+    receipt_payload["bundle_files"] = [
+        asdict(item) for item in receipt.bundle_files
+    ]
     files = {
         f"{producer}/{path}": content for path, content in producer_files.items()
     }
@@ -2557,6 +2662,290 @@ def _canonical_stage_a_publications(
         files_by_arm[job.arm] = files
         receipts[job.arm] = receipt
     return files_by_arm, receipts
+
+
+def _write_direct_remote_mounts(
+    plan: modal_plan.PilotPlan,
+    pilot_repo: Path,
+    root: Path,
+    *,
+    include_training: bool,
+    include_selection: bool = False,
+) -> tuple[Path, Path, Path, dict[str, object], list[dict[str, object]]]:
+    """Materialize one complete, self-derived direct-call dependency envelope."""
+    input_root = root / "inputs"
+    model_root = root / "model-cache"
+    run_root = root / "runs"
+    bundle = build_input_bundle(pilot_repo)
+    bundle_root = input_root / "bundles" / bundle.bundle_id
+    for item in bundle.files:
+        destination = bundle_root / item.path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((pilot_repo / item.path).read_bytes())
+    bundle_manifest = (canonical_json(asdict(bundle)) + "\n").encode("utf-8")
+    (bundle_root / "bundle-manifest.json").write_bytes(bundle_manifest)
+
+    snapshot = (
+        model_root / "canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots"
+        / plan.model_revision
+    )
+    snapshot.mkdir(parents=True)
+    model_payloads = {
+        "config.json": {
+            "architectures": ["Qwen2ForCausalLM"], "hidden_size": 3584,
+            "intermediate_size": 18944, "model_type": "qwen2",
+            "num_attention_heads": 28, "num_hidden_layers": 28,
+            "num_key_value_heads": 4, "vocab_size": 152064,
+        },
+        "generation_config.json": {
+            "bos_token_id": 151643, "eos_token_id": 151645,
+            "pad_token_id": 151643,
+        },
+        "tokenizer.json": {
+            "version": "1.0",
+            "added_tokens": [{"id": 0, "content": "<|endoftext|>"}],
+            "normalizer": {"type": "NFC"},
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": []},
+            "post_processor": {"type": "ByteLevel"},
+            "decoder": {"type": "ByteLevel"},
+            "model": {
+                "type": "BPE", "vocab": {"<|endoftext|>": 0, "t": 1, "o": 2, "to": 3},
+                "merges": ["t o"],
+            },
+        },
+        "tokenizer_config.json": {
+            "tokenizer_class": "Qwen2Tokenizer",
+            "chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+            "model_max_length": 131072,
+        },
+        "model.safetensors.index.json": {
+            "metadata": {"total_size": 8},
+            "weight_map": {
+                "model.layers.0.weight": "model-00001-of-00002.safetensors",
+                "model.layers.1.weight": "model-00002-of-00002.safetensors",
+            },
+        },
+    }
+    for name, payload in model_payloads.items():
+        (snapshot / name).write_text(json.dumps(payload), encoding="utf-8")
+    (snapshot / "model-00001-of-00002.safetensors").write_bytes(b"first\n")
+    (snapshot / "model-00002-of-00002.safetensors").write_bytes(b"second\n")
+    cache_manifest = build_model_cache_manifest(snapshot)
+    (snapshot.parent / f"{plan.model_revision}.manifest.json").write_text(
+        canonical_json(asdict(cache_manifest)) + "\n", encoding="utf-8"
+    )
+
+    run = run_root / "runs" / plan.run_id
+    provenance = run / "provenance/input-bundle-manifest.json"
+    provenance.parent.mkdir(parents=True)
+    provenance.write_bytes(bundle_manifest)
+    _files, _old_manifest, smoke = _stage_a_test_dependency_evidence(plan)
+    smoke = dict(smoke)
+    smoke["model_cache_artifact_id"] = cache_manifest.artifact_id
+    smoke.pop("artifact_id")
+    smoke["artifact_id"] = modal_artifacts.sha256_json(smoke)
+    smoke_path = run / f"receipts/smoke/{smoke['artifact_id']}.json"
+    smoke_path.parent.mkdir(parents=True)
+    smoke_path.write_text(canonical_json(smoke) + "\n", encoding="utf-8")
+    approval = modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=False,
+        smoke_receipt_artifact_id=str(smoke["artifact_id"]),
+        model_cache_artifact_id=cache_manifest.artifact_id,
+    )
+    canonical_receipts: list[dict[str, object]] = []
+    for stage, enabled in (("train", include_training), ("selection", include_selection)):
+        if not enabled:
+            continue
+        for job in plan.jobs:
+            files, receipt = _canonical_stage_a_files(plan, job, stage)
+            receipt = dict(receipt)
+            receipt["model_cache_artifact_id"] = cache_manifest.artifact_id
+            receipt["smoke_receipt_artifact_id"] = smoke["artifact_id"]
+            receipt["stage_a_action_digest"] = approval["approval_digest"]
+            receipt["bundle_manifest_artifact_id"] = plan.bundle_manifest_artifact_id
+            receipt["modal_environment"] = plan.modal_environment
+            receipt.pop("artifact_id")
+            receipt["artifact_id"] = modal_artifacts.sha256_json(receipt)
+            for remote_path, content in files.items():
+                destination = run_root / remote_path.lstrip("/")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if "/receipts/canonical/" in remote_path:
+                    destination.write_text(canonical_json(receipt) + "\n", encoding="utf-8")
+                else:
+                    destination.write_bytes(content)
+            canonical_receipts.append(receipt)
+    return input_root, model_root, run_root, approval, canonical_receipts
+
+
+@pytest.mark.parametrize("damage", ("missing", "corrupt"))
+def test_direct_training_remote_aborts_before_fake_gpu_body_when_smoke_invalid(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    input_root, model_root, run_root, approval, _ = _write_direct_remote_mounts(
+        plan, pilot_repo, tmp_path / "direct", include_training=False
+    )
+    smoke_path = next((run_root / "runs" / plan.run_id / "receipts/smoke").iterdir())
+    if damage == "missing":
+        smoke_path.unlink()
+    else:
+        smoke_path.write_bytes(b"{}\n")
+    calls: list[object] = []
+    monkeypatch.setattr(imported_adapter, "runs_volume", RecordingVolume())
+    monkeypatch.setattr(imported_adapter, "execute_pilot_job", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(imported_adapter, "JOB_INPUT_MOUNT_ROOT", input_root)
+    monkeypatch.setattr(imported_adapter, "JOB_MODEL_MOUNT_ROOT", model_root)
+    monkeypatch.setattr(imported_adapter, "JOB_RUN_MOUNT_ROOT", run_root)
+    job = asdict(plan.jobs[0])
+    job["expected_outputs"] = list(job["expected_outputs"])
+    with pytest.raises(ValueError, match="smoke"):
+        imported_adapter.run_training_job.local(
+            {"plan": modal_plan.pilot_plan_payload(plan), "job": job, "approval": approval}
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("arm", ("semantic", "glyph", "dot", "random", "direct", "filler"))
+@pytest.mark.parametrize("damage", ("missing", "corrupt", "approval"))
+def test_direct_selection_remote_aborts_if_any_training_is_invalid(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arm: str,
+    damage: str,
+) -> None:
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    input_root, model_root, run_root, approval, _ = _write_direct_remote_mounts(
+        plan, pilot_repo, tmp_path / "direct", include_training=True
+    )
+    run = run_root / "runs" / plan.run_id
+    receipt_path = run / f"receipts/canonical/train/{arm}.json"
+    if damage == "missing":
+        receipt_path.unlink()
+    elif damage == "corrupt":
+        producer = run / f"artifacts/phase-marker/checkpoints/pilot/seed-42/{arm}"
+        next(path for path in producer.rglob("*") if path.is_file()).write_bytes(b"corrupt")
+    else:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["smoke_receipt_artifact_id"] = "d" * 64
+        receipt["stage_a_action_digest"] = modal_artifacts._stage_a_action_digest(
+            plan_digest=plan.plan_digest,
+            resume=False,
+            smoke_receipt_artifact_id="d" * 64,
+            model_cache_artifact_id=str(approval["model_cache_artifact_id"]),
+            bundle_manifest_artifact_id=plan.bundle_manifest_artifact_id,
+            modal_environment=plan.modal_environment,
+        )
+        receipt.pop("artifact_id")
+        receipt["artifact_id"] = modal_artifacts.sha256_json(receipt)
+        receipt_path.write_text(canonical_json(receipt) + "\n", encoding="utf-8")
+    calls: list[object] = []
+    monkeypatch.setattr(imported_adapter, "runs_volume", RecordingVolume())
+    monkeypatch.setattr(imported_adapter, "execute_pilot_job", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(imported_adapter, "JOB_INPUT_MOUNT_ROOT", input_root)
+    monkeypatch.setattr(imported_adapter, "JOB_MODEL_MOUNT_ROOT", model_root)
+    monkeypatch.setattr(imported_adapter, "JOB_RUN_MOUNT_ROOT", run_root)
+    monkeypatch.setattr(modal_artifacts, "validate_canonical_job_semantics", lambda **_: None)
+    job = asdict(plan.jobs[0])
+    job["expected_outputs"] = list(job["expected_outputs"])
+    with pytest.raises(ValueError):
+        imported_adapter.run_selection_job.local(
+            {"plan": modal_plan.pilot_plan_payload(plan), "job": job, "approval": approval}
+        )
+    assert calls == []
+
+
+def test_direct_selection_remote_validates_all_six_training_parents_before_body(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    input_root, model_root, run_root, approval, _ = _write_direct_remote_mounts(
+        plan, pilot_repo, tmp_path / "direct", include_training=True
+    )
+    semantic: list[str] = []
+    bodies: list[dict[str, object]] = []
+    monkeypatch.setattr(imported_adapter, "runs_volume", RecordingVolume())
+    monkeypatch.setattr(imported_adapter, "JOB_INPUT_MOUNT_ROOT", input_root)
+    monkeypatch.setattr(imported_adapter, "JOB_MODEL_MOUNT_ROOT", model_root)
+    monkeypatch.setattr(imported_adapter, "JOB_RUN_MOUNT_ROOT", run_root)
+    monkeypatch.setattr(
+        modal_artifacts,
+        "validate_canonical_job_semantics",
+        lambda **kwargs: semantic.append(str(kwargs["job_payload"]["arm"])),
+    )
+    monkeypatch.setattr(
+        imported_adapter,
+        "_collect_modal_execution_provenance",
+        lambda _name: _adapter_execution_provenance("selection"),
+    )
+    monkeypatch.setattr(
+        imported_adapter,
+        "execute_pilot_job",
+        lambda **kwargs: bodies.append(dict(kwargs)) or {"ok": True},
+    )
+    job = asdict(plan.jobs[0])
+    job["expected_outputs"] = list(job["expected_outputs"])
+
+    assert imported_adapter.run_selection_job.local(
+        {"plan": modal_plan.pilot_plan_payload(plan), "job": job, "approval": approval}
+    ) == {"ok": True}
+    assert semantic == [job.arm for job in plan.jobs]
+    assert len(bodies) == 1
+
+
+def test_direct_finalizer_rejects_forged_results_without_canonical_receipt(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    input_root, model_root, run_root, approval, receipts = _write_direct_remote_mounts(
+        plan,
+        pilot_repo,
+        tmp_path / "direct",
+        include_training=True,
+        include_selection=True,
+    )
+    missing = (
+        run_root / "runs" / plan.run_id
+        / "receipts/canonical/selection/filler.json"
+    )
+    missing.unlink()
+    finalizer_calls: list[object] = []
+    monkeypatch.setattr(imported_adapter, "runs_volume", RecordingVolume())
+    monkeypatch.setattr(imported_adapter, "JOB_INPUT_MOUNT_ROOT", input_root)
+    monkeypatch.setattr(imported_adapter, "JOB_MODEL_MOUNT_ROOT", model_root)
+    monkeypatch.setattr(imported_adapter, "JOB_RUN_MOUNT_ROOT", run_root)
+    monkeypatch.setattr(modal_artifacts, "validate_canonical_job_semantics", lambda **_: None)
+    monkeypatch.setattr(
+        imported_adapter,
+        "finalize_stage_a",
+        lambda **kwargs: finalizer_calls.append(kwargs) or {},
+    )
+
+    with pytest.raises(ValueError, match="canonical Stage A receipt"):
+        imported_adapter.finalize_stage_a_remote.local(
+            {
+                "plan": modal_plan.pilot_plan_payload(plan),
+                "approval": approval,
+                "receipts": receipts,
+            }
+        )
+    assert finalizer_calls == []
+    assert not (
+        run_root / "runs" / plan.run_id / "stage-a-summary.json"
+    ).exists()
 
 
 def _publishing_stage_a_function(
@@ -2632,8 +3021,12 @@ def _stage_a_summary(
         "plan_digest": plan.plan_digest,
         "stage_a_action_digest": first["stage_a_action_digest"],
         "stage_a_resume": first["stage_a_resume"],
+        "modal_environment": first["modal_environment"],
         "smoke_receipt_artifact_id": first["smoke_receipt_artifact_id"],
         "model_cache_artifact_id": first["model_cache_artifact_id"],
+        "bundle_manifest_artifact_id": first[
+            "bundle_manifest_artifact_id"
+        ],
         "receipt_approval_history": modal_artifacts._receipt_approval_history(
             receipt_matrix
         ),
@@ -2741,6 +3134,57 @@ def test_stage_a_validates_all_training_before_selection_and_stops(
         *(("canonical-validated", "train", job.arm) for job in plan.jobs),
         *(("canonical-validated", "selection", job.arm) for job in plan.jobs),
     ]
+
+
+def test_stage_a_flushes_complete_plan_before_first_tag_or_remote_call(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume_events: list[tuple[object, ...]] = []
+    side_effects: list[tuple[object, ...]] = []
+    runs = StageARunsClient({}, volume_events)
+    training, training_receipts = _publishing_stage_a_function(
+        plan, "train", side_effects, runs
+    )
+    selection, selection_receipts = _publishing_stage_a_function(
+        plan, "selection", side_effects, runs
+    )
+    finalizer = StageAFinalizer(
+        _stage_a_summary(plan, training_receipts, selection_receipts), side_effects
+    )
+    monkeypatch.setattr(
+        imported_adapter, "validate_canonical_job_semantics", lambda **_: None
+    )
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda *_args, **_kwargs: side_effects.append(("tags",)),
+    )
+
+    def record_print(*args: object, **kwargs: object) -> None:
+        payload = json.loads(str(args[0]))
+        side_effects.append(("plan-print", kwargs.get("flush"), payload["operation"]))
+
+    monkeypatch.setattr(builtins, "print", record_print)
+    imported_adapter.run_stage_a_local(
+        plan,
+        approved_run_id=plan.run_id,
+        budget_acknowledged=True,
+        resume=False,
+        training_function=training,
+        selection_function=selection,
+        finalizer_function=finalizer,
+        runs_client=runs,
+        **_stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False),
+    )
+    external = [
+        event for event in side_effects
+        if event[0] in {"plan-print", "tags", "train", "selection", "finalizer"}
+    ]
+    assert external[0] == ("plan-print", True, "run-stage-a")
+    assert external[1] == ("tags",)
 
 
 @pytest.mark.parametrize("completed_stage", ("train", "selection"))
@@ -3613,6 +4057,28 @@ def test_initial_stage_a_refuses_summary_or_unexpected_canonical_namespace(
     assert training.calls == [] and selection.calls == [] and finalizer.calls == []
 
 
+def _status_dependency_files(plan: modal_plan.PilotPlan) -> dict[str, bytes]:
+    _cache_files, _cache_manifest, smoke = _stage_a_test_dependency_evidence(plan)
+    smoke_id = str(smoke["artifact_id"])
+    bundle_manifest = {
+        "schema_version": 1,
+        "bundle_id": plan.bundle_id,
+        "files": [asdict(item) for item in plan.bundle_files],
+        "artifact_ids": [
+            plan.split_artifact_id,
+            *plan.materialization_artifact_ids,
+        ],
+    }
+    return {
+        f"/runs/{plan.run_id}/provenance/input-bundle-manifest.json": (
+            canonical_json(bundle_manifest) + "\n"
+        ).encode("utf-8"),
+        f"/runs/{plan.run_id}/receipts/smoke/{smoke_id}.json": (
+            canonical_json(smoke) + "\n"
+        ).encode("utf-8"),
+    }
+
+
 def _complete_status_volume(
     plan: modal_plan.PilotPlan,
 ) -> tuple[StageARunsClient, dict[str, dict[str, object]], dict[str, dict[str, object]]]:
@@ -3629,11 +4095,7 @@ def _complete_status_volume(
     files[f"/runs/{plan.run_id}/stage-a-summary.json"] = (
         canonical_json(summary) + "\n"
     ).encode("utf-8")
-    _cache_files, _cache_manifest, smoke = _stage_a_test_dependency_evidence(plan)
-    smoke_id = str(smoke["artifact_id"])
-    files[f"/runs/{plan.run_id}/receipts/smoke/{smoke_id}.json"] = (
-        canonical_json(smoke) + "\n"
-    ).encode("utf-8")
+    files.update(_status_dependency_files(plan))
     return StageARunsClient(files, events), training, selection
 
 
@@ -3654,6 +4116,85 @@ def test_status_reads_validated_receipts_and_producer_manifests_without_mutation
     assert result["valid"] is True
     assert volume.files == before
     assert not any(event[0] in {"batch_upload", "commit", "reload"} for event in volume.events)
+
+
+@pytest.mark.parametrize("tamper", ("path", "size", "hash", "order"))
+def test_status_rejects_ordered_bundle_file_record_tampering(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tamper: str,
+) -> None:
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    path = f"/runs/{plan.run_id}/receipts/canonical/train/semantic.json"
+    receipt = json.loads(volume.files[path])
+    records = list(receipt["bundle_files"])
+    if tamper == "path":
+        records[0] = {**records[0], "path": "configs/other.toml"}
+    elif tamper == "size":
+        records[0] = {**records[0], "size": records[0]["size"] + 1}
+    elif tamper == "hash":
+        records[0] = {**records[0], "sha256": "d" * 64}
+    else:
+        records[0], records[1] = records[1], records[0]
+    receipt["bundle_files"] = records
+    receipt.pop("artifact_id")
+    receipt["artifact_id"] = modal_artifacts.sha256_json(receipt)
+    volume.files[path] = (canonical_json(receipt) + "\n").encode("utf-8")
+
+    result = imported_adapter.status_local(volume, run_id=plan.run_id)
+    assert result["training"]["semantic"] == "invalid"
+    assert result["valid"] is False
+
+
+def test_status_and_evidence_require_exact_bundle_manifest_provenance(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+) -> None:
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    provenance = f"/runs/{plan.run_id}/provenance/input-bundle-manifest.json"
+    volume.files.pop(provenance)
+
+    result = imported_adapter.status_local(volume, run_id=plan.run_id)
+    assert result["summary"] == "invalid"
+    assert result["valid"] is False
+    with pytest.raises(ValueError, match="validated complete"):
+        imported_adapter.download_evidence_local(
+            volume, run_id=plan.run_id, destination=tmp_path / "evidence"
+        )
+
+
+@pytest.mark.parametrize(
+    "damage", ("missing-smoke", "missing-provenance", "missing-both", "corrupt-provenance")
+)
+def test_partial_status_requires_receipt_advertised_smoke_and_provenance(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    damage: str,
+) -> None:
+    """Would fail if summary absence hid missing shared dependency evidence."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    volume.files.pop(f"/runs/{plan.run_id}/stage-a-summary.json")
+    provenance = f"/runs/{plan.run_id}/provenance/input-bundle-manifest.json"
+    smoke = next(
+        path for path in volume.files
+        if path.startswith(f"/runs/{plan.run_id}/receipts/smoke/")
+    )
+    if damage in {"missing-smoke", "missing-both"}:
+        volume.files.pop(smoke)
+    if damage in {"missing-provenance", "missing-both"}:
+        volume.files.pop(provenance)
+    elif damage == "corrupt-provenance":
+        volume.files[provenance] = b"{}\n"
+
+    result = imported_adapter.status_local(volume, run_id=plan.run_id)
+
+    assert result["summary"] == "pending"
+    assert result["valid"] is False
+    assert result["errors"]
 
 
 def test_status_validates_mixed_fresh_and_resume_receipt_approval_history(
@@ -3998,6 +4539,7 @@ def test_status_rejects_invalid_successful_attempt_execution_evidence(
             canonical_json(receipt) + "\n"
         ).encode("utf-8")
     }
+    files.update(_status_dependency_files(plan))
 
     result = imported_adapter.status_local(
         StageARunsClient(files, []), run_id=plan.run_id
@@ -4024,6 +4566,7 @@ def test_status_accepts_successful_h200_attempt_execution_evidence(
             canonical_json(receipt) + "\n"
         ).encode("utf-8")
     }
+    files.update(_status_dependency_files(plan))
 
     result = imported_adapter.status_local(
         StageARunsClient(files, []), run_id=plan.run_id
@@ -4084,6 +4627,7 @@ def test_status_accepts_approved_failed_attempt_gpu_evidence(
             canonical_json(receipt) + "\n"
         ).encode("utf-8")
     }
+    files.update(_status_dependency_files(plan))
 
     result = imported_adapter.status_local(
         StageARunsClient(files, []), run_id=plan.run_id
@@ -4326,7 +4870,8 @@ def test_download_evidence_is_atomic_and_strictly_allowlisted(
     )
 
     assert destination.is_dir()
-    assert len(downloaded) == 62
+    assert len(downloaded) == 63
+    assert (destination / "provenance/input-bundle-manifest.json").is_file()
     relative = {path.relative_to(destination).as_posix() for path in downloaded}
     assert "stage-a-summary.json" in relative
     assert sum(path.endswith("run-manifest.json") for path in relative) == 6
