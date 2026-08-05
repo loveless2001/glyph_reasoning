@@ -1059,6 +1059,8 @@ def execute_pilot_job(
     log_path = attempt_root / "logs" / f"{stage}.log"
     canonical = run / _producer_relative_path(stage, str(job["arm"]))
     command_env = dict(os.environ if environ is None else environ)
+    if "CUDA_VISIBLE_DEVICES" not in command_env:
+        command_env["CUDA_VISIBLE_DEVICES"] = "0"
     ephemeral = Path(ephemeral_root).resolve()
     observed_gpu: str | None = None
     exit_status = 1
