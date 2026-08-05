@@ -6,7 +6,7 @@
 
 **Architecture:** Keep `_preflight_stage_a_namespace` as the single canonical-path gate. Represent each approved ignored namespace as an exact normalized root, then accept only that root or a slash-delimited descendant; extend the adapter test fixture locally so tests can reproduce Modal's mixture of directory and file entries without changing the default fake-volume contract.
 
-**Tech Stack:** Python 3.11, pytest, Modal Volume-compatible `listdir` entries, existing phase-marker plan and adapter helpers.
+**Tech Stack:** Python 3.12, pytest, Modal Volume-compatible `listdir` entries, existing phase-marker plan and adapter helpers.
 
 ## Global Constraints
 
@@ -133,7 +133,8 @@ def test_stage_a_namespace_rejects_unapproved_modal_directory_entries(
 Run:
 
 ```bash
-pytest -q tests/phase_marker/test_modal_adapter.py \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ./.venv/bin/pytest -q \
+  tests/phase_marker/test_modal_adapter.py \
   -k 'stage_a_namespace_accepts_approved_modal_directory_entries or stage_a_namespace_rejects_unapproved_modal_directory_entries'
 ```
 
@@ -168,7 +169,8 @@ Do not change the `expected` set, ancestor/descendant comparison, summary handli
 Run:
 
 ```bash
-pytest -q tests/phase_marker/test_modal_adapter.py \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ./.venv/bin/pytest -q \
+  tests/phase_marker/test_modal_adapter.py \
   -k 'stage_a_namespace_accepts_approved_modal_directory_entries or stage_a_namespace_rejects_unapproved_modal_directory_entries'
 ```
 
@@ -179,7 +181,8 @@ Expected: `8 passed`, with no deselected test failing during collection.
 Run:
 
 ```bash
-pytest -q tests/phase_marker/test_modal_adapter.py
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ./.venv/bin/pytest -q \
+  tests/phase_marker/test_modal_adapter.py
 ```
 
 Expected: all adapter tests pass.
@@ -189,7 +192,7 @@ Expected: all adapter tests pass.
 Run:
 
 ```bash
-pytest -q
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ./.venv/bin/pytest -q tests
 ```
 
 Expected: all tests pass, with only the repository's previously known skip if it remains applicable.
