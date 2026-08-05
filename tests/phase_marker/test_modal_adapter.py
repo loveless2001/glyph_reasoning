@@ -1032,7 +1032,7 @@ def test_authorized_volume_creation_revalidates_the_exact_action_approval(
 def test_stage_a_job_resources_and_mount_permissions_are_exact(
     imported_adapter: ModuleType,
 ) -> None:
-    """Would fail if either Stage A job could exceed or bypass the approved H100 envelope."""
+    """Would fail if Stage A requested an invalid disk quota or bypassed its envelope."""
     declarations = {
         name: options
         for (kind, options), (_, name) in zip(
@@ -1054,7 +1054,7 @@ def test_stage_a_job_resources_and_mount_permissions_are_exact(
             key: options[key]
             for key in (
                 "gpu", "timeout", "startup_timeout", "max_containers",
-                "retries", "ephemeral_disk",
+                "retries",
             )
         } == {
             "gpu": "H100",
@@ -1062,8 +1062,8 @@ def test_stage_a_job_resources_and_mount_permissions_are_exact(
             "startup_timeout": 1_200,
             "max_containers": 2,
             "retries": 0,
-            "ephemeral_disk": 80 * 1024,
         }
+        assert "ephemeral_disk" not in options
         assert set(options["volumes"]) == {"/inputs", "/model-cache", "/runs"}
         assert options["volumes"]["/inputs"].volume is imported_adapter.inputs_volume
         assert options["volumes"]["/inputs"].read_only is True

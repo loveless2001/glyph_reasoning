@@ -81,7 +81,6 @@ GPU = "H100"
 GPU_TIMEOUT_SECONDS = 14_400
 MAX_GPU_CONTAINERS = 2
 GPU_STARTUP_TIMEOUT_SECONDS = 1_200
-GPU_EPHEMERAL_DISK_MIB = 80 * 1024
 MODEL_CACHE_CPU = 4.0
 MODEL_CACHE_MEMORY_MIB = 32_768
 MODEL_CACHE_TIMEOUT_SECONDS = 7_200
@@ -339,7 +338,6 @@ def smoke_remote(remote_payload: dict[str, object]) -> dict[str, object]:
     startup_timeout=1_200,
     max_containers=2,
     retries=0,
-    ephemeral_disk=80 * 1024,
     volumes=GPU_VOLUMES,
 )
 def run_training_job(job_payload: dict[str, object]) -> dict[str, object]:
@@ -354,7 +352,6 @@ def run_training_job(job_payload: dict[str, object]) -> dict[str, object]:
     startup_timeout=1_200,
     max_containers=2,
     retries=0,
-    ephemeral_disk=80 * 1024,
     volumes=GPU_VOLUMES,
 )
 def run_selection_job(job_payload: dict[str, object]) -> dict[str, object]:
