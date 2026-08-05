@@ -2835,9 +2835,11 @@ def test_stage_a_cpu_preflight_completes_before_tags_or_gpu(
     (
         "exception",
         "extra-field",
+        "missing-field",
         "wrong-schema-type",
         "wrong-run",
         "wrong-bundle",
+        "wrong-manifest",
         "wrong-model",
         "wrong-smoke",
     ),
@@ -2865,12 +2867,16 @@ def test_stage_a_rejects_invalid_cpu_preflight_evidence(
         result = dict(original.result)
         if fault == "extra-field":
             result["unexpected"] = True
+        elif fault == "missing-field":
+            result.pop("smoke_receipt")
         elif fault == "wrong-schema-type":
             result["schema_version"] = True
         elif fault == "wrong-run":
             result["run_id"] = "wrong-run"
         elif fault == "wrong-bundle":
             result["bundle_id"] = "0" * 64
+        elif fault == "wrong-manifest":
+            result["bundle_manifest_artifact_id"] = "0" * 64
         elif fault == "wrong-model":
             result["model_cache_artifact_id"] = "0" * 64
         else:
