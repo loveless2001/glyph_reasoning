@@ -621,6 +621,32 @@ def test_exclusive_bytes_refuses_to_unlink_replaced_destination(
     assert destination.exists()
 
 
+def test_exclusive_bytes_retries_transient_created_identity_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a transient identity read poisoned an uncommitted destination."""
+    destination = tmp_path / "evidence.json"
+    real_fstat = os.fstat
+    identity_calls = 0
+
+    def fail_first_target_fstat(descriptor: int) -> os.stat_result:
+        nonlocal identity_calls
+        if os.readlink(f"/proc/self/fd/{descriptor}") == str(destination):
+            identity_calls += 1
+            if identity_calls == 1:
+                raise OSError("injected transient fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(os, "fstat", fail_first_target_fstat)
+
+    modal_artifacts._write_bytes_exclusive_or_equal(
+        destination, b"complete evidence"
+    )
+
+    assert identity_calls == 2
+    assert destination.read_bytes() == b"complete evidence"
+
+
 @pytest.mark.parametrize(
     "failure_stage",
     ("during-manifest-publication", "after-publication", "during-final-validation"),

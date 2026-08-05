@@ -2017,6 +2017,63 @@ def test_cpu_smoke_refuses_commit_if_partial_evidence_cleanup_fails(
     assert not list((run_root / f"runs/{plan.run_id}/receipts/smoke").glob("*.json"))
 
 
+def test_cpu_smoke_refuses_commit_if_evidence_identity_is_unavailable(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if an unidentified evidence path could reach volume.commit()."""
+    plan, input_root, model_root, run_root = _prepare_smoke_roots(pilot_repo, tmp_path)
+
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda _name: SimpleNamespace(__version__="locked-test-version"),
+    )
+    monkeypatch.setattr(imported_adapter, "CODE_ROOT", pilot_repo)
+    monkeypatch.setattr(imported_adapter, "INPUT_MOUNT_ROOT", input_root)
+    monkeypatch.setattr(imported_adapter, "MODEL_MOUNT_ROOT", model_root)
+    monkeypatch.setattr(imported_adapter, "RUN_MOUNT_ROOT", run_root)
+    run_volume = CommitOnlyVolume()
+    monkeypatch.setattr(imported_adapter, "smoke_runs_volume", run_volume)
+    monkeypatch.setattr(
+        imported_adapter,
+        "_collect_modal_execution_provenance",
+        lambda _name: _adapter_execution_provenance("smoke"),
+    )
+
+    provenance_path = (
+        run_root / f"runs/{plan.run_id}/provenance/input-bundle-manifest.json"
+    )
+    real_fstat = os.fstat
+    identity_calls = 0
+
+    def reject_provenance_identity(descriptor: int) -> os.stat_result:
+        nonlocal identity_calls
+        if os.readlink(f"/proc/self/fd/{descriptor}") == str(provenance_path):
+            identity_calls += 1
+            raise OSError("injected persistent fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(os, "fstat", reject_provenance_identity)
+
+    with pytest.raises(
+        modal_artifacts._EvidencePublicationCleanupError,
+        match="evidence cleanup failed",
+    ) as captured:
+        imported_adapter.smoke_remote.local({
+            "plan": modal_plan.pilot_plan_payload(plan),
+            "approval": modal_plan.action_approval_payload(plan, action="smoke"),
+        })
+
+    assert identity_calls == 2
+    assert isinstance(captured.value.__cause__, OSError)
+    assert "persistent fstat failure" in str(captured.value.__cause__)
+    assert run_volume.commit_count == 0
+    assert not list((run_root / f"runs/{plan.run_id}/receipts/smoke").glob("*.json"))
+
+
 def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
     imported_adapter: ModuleType,
     pilot_repo: Path,

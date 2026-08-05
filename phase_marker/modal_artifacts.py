@@ -533,8 +533,17 @@ def _write_bytes_exclusive_at(
 ) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
     descriptor: int | None = os.open(name, flags, 0o644, dir_fd=directory_fd)
-    created = os.fstat(descriptor)
+    created: os.stat_result | None = None
+    identity_failures: list[str] = []
     try:
+        try:
+            created = os.fstat(descriptor)
+        except OSError as identity_error:
+            identity_failures.append(
+                f"initial fstat failed: {type(identity_error).__name__}: "
+                f"{identity_error}"
+            )
+            created = os.fstat(descriptor)
         offset = 0
         while offset < len(content):
             offset += os.write(descriptor, content[offset:])
@@ -553,26 +562,37 @@ def _write_bytes_exclusive_at(
                 cleanup_failures.append(
                     f"close failed: {type(close_error).__name__}: {close_error}"
                 )
-        try:
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        except OSError as stat_error:
+        if created is None:
+            cleanup_failures.extend(identity_failures)
             cleanup_failures.append(
-                f"stat failed: {type(stat_error).__name__}: {stat_error}"
+                "unlink refused: evidence destination identity unavailable"
             )
         else:
-            if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino):
+            try:
+                current = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as stat_error:
                 cleanup_failures.append(
-                    "unlink refused: evidence destination identity changed"
+                    f"stat failed: {type(stat_error).__name__}: {stat_error}"
                 )
             else:
-                try:
-                    os.unlink(name, dir_fd=directory_fd)
-                except OSError as unlink_error:
+                if (current.st_dev, current.st_ino) != (
+                    created.st_dev, created.st_ino
+                ):
                     cleanup_failures.append(
-                        f"unlink failed: {type(unlink_error).__name__}: {unlink_error}"
+                        "unlink refused: evidence destination identity changed"
                     )
+                else:
+                    try:
+                        os.unlink(name, dir_fd=directory_fd)
+                    except OSError as unlink_error:
+                        cleanup_failures.append(
+                            "unlink failed: "
+                            f"{type(unlink_error).__name__}: {unlink_error}"
+                        )
         if cleanup_failures:
             compound = _EvidencePublicationCleanupError(
                 "immutable evidence cleanup failed; refusing durable commit"
