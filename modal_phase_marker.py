@@ -718,7 +718,6 @@ def run_stage_a_local(
             or recovery_result.get("quarantined") != list(existing.recoveries)
         ):
             raise ValueError("Stage A recovery result is invalid")
-        runs_client.reload()
         recovered = _preflight_stage_a_outputs(
             plan, resume=True, runs_client=runs_client
         )
@@ -759,7 +758,6 @@ def run_stage_a_local(
             )
     _require_complete_receipt_matrix(training_receipts, plan, "training")
 
-    runs_client.reload()
     training_receipts = _revalidate_completed_stage_outputs(
         plan,
         stage="train",
@@ -795,7 +793,6 @@ def run_stage_a_local(
             )
     _require_complete_receipt_matrix(selection_receipts, plan, "selection")
 
-    runs_client.reload()
     selection_receipts = _revalidate_completed_stage_outputs(
         plan,
         stage="selection",
@@ -847,11 +844,6 @@ def preflight_stage_a_dependencies(
         model_cache_artifact_id
     ):
         raise ValueError("Stage A dependency artifact identities are invalid")
-    # Modal volume reads are snapshot-based.  Cross an explicit reload barrier
-    # before validating the exact dependency bytes named by this approval.
-    inputs_client.reload()
-    model_client.reload()
-    runs_client.reload()
     bundle = build_input_bundle(_plan_repo_root(plan))
     staging = preflight_inputs_local(
         bundle,

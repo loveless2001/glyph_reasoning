@@ -251,6 +251,13 @@ class RecordingVolume:
         self.files.update(pending)
 
 
+class LocalBatchVolume(RecordingVolume):
+    """Outside-App Volume reads must not use the mounted-filesystem reload API."""
+
+    def reload(self) -> None:
+        raise AssertionError("local Volume batch clients cannot reload mounts")
+
+
 class CommitOnlyVolume:
     def __init__(self) -> None:
         self.commit_count = 0
@@ -2617,7 +2624,6 @@ def _publish_stage_a_result(
 class EmptyStageARunsClient:
     def __init__(self, events: list[tuple[object, ...]]) -> None:
         self.events = events
-        self.reload_count = 0
 
     def read_file(self, path: str) -> list[bytes]:
         self.events.append(("read_file", path))
@@ -2629,8 +2635,7 @@ class EmptyStageARunsClient:
         raise FileNotFoundError(path)
 
     def reload(self) -> None:
-        self.reload_count += 1
-        self.events.append(("reload", self.reload_count))
+        raise AssertionError("local Volume batch clients cannot reload mounts")
 
 
 class StageARunsClient(RecordingVolume):
@@ -2639,11 +2644,9 @@ class StageARunsClient(RecordingVolume):
     ) -> None:
         super().__init__(files)
         self.events = events
-        self.reload_count = 0
 
     def reload(self) -> None:
-        self.reload_count += 1
-        self.events.append(("reload", self.reload_count))
+        raise AssertionError("local Volume batch clients cannot reload mounts")
 
 
 def _stage_a_dependency_kwargs(
@@ -2654,7 +2657,7 @@ def _stage_a_dependency_kwargs(
     resume: bool,
 ) -> dict[str, object]:
     bundle = build_input_bundle(pilot_repo)
-    inputs = RecordingVolume(_bundle_volume_files(bundle, pilot_repo))
+    inputs = LocalBatchVolume(_bundle_volume_files(bundle, pilot_repo))
     file_contents, manifest, smoke = _stage_a_test_dependency_evidence(plan)
     model_cache_artifact_id = str(manifest["artifact_id"])
     snapshot_root = (
@@ -2669,7 +2672,7 @@ def _stage_a_dependency_kwargs(
         "/canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots/"
         f"{plan.model_revision}.manifest.json"
     ] = (canonical_json(manifest) + "\n").encode("utf-8")
-    model = RecordingVolume(model_files)
+    model = LocalBatchVolume(model_files)
     smoke_id = str(smoke["artifact_id"])
     bundle_manifest = (canonical_json(asdict(bundle)) + "\n").encode("utf-8")
     runs.files[
@@ -2700,7 +2703,7 @@ def test_stage_a_dependency_preflight_binds_exact_bundle_cache_and_smoke(
 ) -> None:
     """Would fail if H100 approval could name unreviewed staged evidence."""
     plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
-    runs = RecordingVolume()
+    runs = LocalBatchVolume()
     kwargs = _stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False)
 
     evidence = imported_adapter.preflight_stage_a_dependencies(
@@ -3478,7 +3481,6 @@ def test_stage_a_validates_all_training_before_selection_and_stops(
     assert len(training.calls) == 6
     assert len(selection.calls) == 6
     assert len(finalizer.calls) == 1
-    assert runs.reload_count == 3
     assert summary["stopped_before_behavior"] is True
     assert summary == finalizer.summary
     first_gpu = min(index for index, event in enumerate(events) if event[0] in {"train", "selection"})
