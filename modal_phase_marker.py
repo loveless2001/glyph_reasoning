@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import errno
@@ -2297,7 +2298,7 @@ def apply_approved_app_tags(
     action: str,
 ) -> None:
     """Attach a validated full run identity immediately before an approved run."""
-    _validate_tag_plan(plan)
+    run_tag = _modal_run_tag(plan)
     validate_action_approval_payload(
         plan_payload=pilot_plan_payload(plan),
         approval_payload=approval_payload,
@@ -2322,7 +2323,7 @@ def apply_approved_app_tags(
     }.get(action)
     if action_app is None:
         raise ValueError("Modal app tag action is invalid")
-    action_app.set_tags({**_BASE_TAGS, "run-id": plan.run_id})
+    action_app.set_tags({**_BASE_TAGS, "run-id": run_tag})
 
 
 def _validate_operator_action_approval(
@@ -2785,6 +2786,18 @@ def _validate_tag_plan(plan: PilotPlan) -> None:
         or any(job.seed != plan.seed for job in plan.jobs)
     ):
         raise ValueError("app tags require the approved resource and job envelope")
+
+
+def _modal_run_tag(plan: PilotPlan) -> str:
+    """Encode the full plan identity within Modal's 63-character tag limit."""
+    _validate_tag_plan(plan)
+    encoded = base64.urlsafe_b64encode(
+        bytes.fromhex(plan.plan_digest)
+    ).decode("ascii").rstrip("=")
+    value = f"s42-{encoded}"
+    if len(value) > 63 or re.fullmatch(r"[A-Za-z0-9._-]+", value) is None:
+        raise ValueError("app run tag is invalid")
+    return value
 
 
 def _validate_operator_approval(

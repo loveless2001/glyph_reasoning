@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import base64
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta
@@ -312,6 +313,11 @@ class FakeApp:
     def set_tags(self, tags: dict[str, str]) -> None:
         if self._modal.importing:
             raise AssertionError("adapter attempted a client RPC during import")
+        if any(
+            len(value) > 63 or re.fullmatch(r"[A-Za-z0-9._-]+", value) is None
+            for value in tags.values()
+        ):
+            raise ValueError("invalid Modal tag value")
         copied = dict(tags)
         self._modal.rpc_calls.append(("set_tags", copied))
         self.tags = copied
@@ -1188,12 +1194,17 @@ def test_apply_approved_app_tags_validates_before_the_client_rpc(
         plan, approval_payload=approval, action="stage-inputs"
     )
 
+    encoded_plan = base64.urlsafe_b64encode(
+        bytes.fromhex(plan.plan_digest)
+    ).decode("ascii").rstrip("=")
     expected_tags = {
         "experiment": "phase-marker",
         "run-kind": "pilot",
         "seed": "42",
-        "run-id": plan.run_id,
+        "run-id": f"s42-{encoded_plan}",
     }
+    assert len(expected_tags["run-id"]) <= 63
+    assert base64.urlsafe_b64decode(encoded_plan + "=").hex() == plan.plan_digest
     assert fake.rpc_calls == [("set_tags", expected_tags)]
     assert imported_adapter.stage_inputs_app.tags == expected_tags
 
