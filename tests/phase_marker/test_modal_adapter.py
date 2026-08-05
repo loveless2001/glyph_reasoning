@@ -1998,12 +1998,20 @@ def test_cpu_smoke_refuses_commit_if_partial_evidence_cleanup_fails(
     monkeypatch.setattr(os, "write", fail_second_write)
     monkeypatch.setattr(os, "unlink", fail_provenance_cleanup)
 
-    with pytest.raises(RuntimeError, match="evidence cleanup failed"):
+    with pytest.raises(
+        modal_artifacts._EvidencePublicationCleanupError,
+        match="evidence cleanup failed",
+    ) as captured:
         imported_adapter.smoke_remote.local({
             "plan": modal_plan.pilot_plan_payload(plan),
             "approval": modal_plan.action_approval_payload(plan, action="smoke"),
         })
 
+    assert isinstance(captured.value.__cause__, OSError)
+    assert "injected evidence write failure" in str(captured.value.__cause__)
+    notes = getattr(captured.value, "__notes__", [])
+    assert any("original failure: OSError" in note for note in notes)
+    assert any("unlink failed: OSError" in note for note in notes)
     assert cleanup_attempted is True
     assert run_volume.commit_count == 0
     assert not list((run_root / f"runs/{plan.run_id}/receipts/smoke").glob("*.json"))

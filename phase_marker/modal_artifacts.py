@@ -533,30 +533,46 @@ def _write_bytes_exclusive_at(
 ) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
     descriptor: int | None = os.open(name, flags, 0o644, dir_fd=directory_fd)
+    created = os.fstat(descriptor)
     try:
         offset = 0
         while offset < len(content):
             offset += os.write(descriptor, content[offset:])
         os.fsync(descriptor)
-        os.close(descriptor)
+        descriptor_to_close = descriptor
         descriptor = None
+        os.close(descriptor_to_close)
     except BaseException as error:
         cleanup_failures: list[str] = []
         if descriptor is not None:
+            descriptor_to_close = descriptor
+            descriptor = None
             try:
-                os.close(descriptor)
+                os.close(descriptor_to_close)
             except OSError as close_error:
                 cleanup_failures.append(
                     f"close failed: {type(close_error).__name__}: {close_error}"
                 )
         try:
-            os.unlink(name, dir_fd=directory_fd)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
             pass
-        except OSError as unlink_error:
+        except OSError as stat_error:
             cleanup_failures.append(
-                f"unlink failed: {type(unlink_error).__name__}: {unlink_error}"
+                f"stat failed: {type(stat_error).__name__}: {stat_error}"
             )
+        else:
+            if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino):
+                cleanup_failures.append(
+                    "unlink refused: evidence destination identity changed"
+                )
+            else:
+                try:
+                    os.unlink(name, dir_fd=directory_fd)
+                except OSError as unlink_error:
+                    cleanup_failures.append(
+                        f"unlink failed: {type(unlink_error).__name__}: {unlink_error}"
+                    )
         if cleanup_failures:
             compound = _EvidencePublicationCleanupError(
                 "immutable evidence cleanup failed; refusing durable commit"

@@ -560,6 +560,67 @@ def test_exclusive_bytes_fsync_failure_removes_destination(
     assert not destination.exists()
 
 
+def test_exclusive_bytes_close_failure_does_not_retry_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a failed close could target a subsequently reused descriptor."""
+    destination = tmp_path / "receipt.json"
+    real_close = os.close
+    close_calls = 0
+
+    def close_then_report_failure(descriptor: int) -> None:
+        nonlocal close_calls
+        if os.readlink(f"/proc/self/fd/{descriptor}") != str(destination):
+            real_close(descriptor)
+            return
+        close_calls += 1
+        if close_calls > 1:
+            raise AssertionError("descriptor close was retried")
+        real_close(descriptor)
+        raise OSError("injected close failure")
+
+    monkeypatch.setattr(os, "close", close_then_report_failure)
+
+    with pytest.raises(OSError, match="injected close failure"):
+        modal_artifacts._write_bytes_exclusive_or_equal(
+            destination, b"complete receipt"
+        )
+
+    assert close_calls == 1
+    assert not destination.exists()
+
+
+def test_exclusive_bytes_refuses_to_unlink_replaced_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if cleanup could unlink a concurrent writer's replacement."""
+    destination = tmp_path / "evidence.json"
+    real_stat = os.stat
+
+    def fail_write(_descriptor: int, _content: bytes) -> int:
+        raise OSError("injected write failure")
+
+    def report_replaced_identity(
+        path: object, *args: object, **kwargs: object,
+    ) -> object:
+        if path == destination.name and kwargs.get("dir_fd") is not None:
+            return SimpleNamespace(st_dev=-1, st_ino=-1)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "write", fail_write)
+    monkeypatch.setattr(os, "stat", report_replaced_identity)
+
+    with pytest.raises(
+        modal_artifacts._EvidencePublicationCleanupError,
+        match="evidence cleanup failed",
+    ):
+        modal_artifacts._write_bytes_exclusive_or_equal(
+            destination, b"complete evidence"
+        )
+
+    assert destination.exists()
+
+
 @pytest.mark.parametrize(
     "failure_stage",
     ("during-manifest-publication", "after-publication", "during-final-validation"),
