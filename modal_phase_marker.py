@@ -2278,7 +2278,7 @@ def _read_volume_file_optional(client: VolumeClient, path: str) -> bytes | None:
 def _list_volume_files_optional(client: VolumeClient, path: str) -> tuple[object, ...]:
     try:
         return tuple(client.listdir(path, recursive=True))
-    except FileNotFoundError:
+    except (FileNotFoundError, modal.exception.NotFoundError):
         return ()
 
 

@@ -2737,6 +2737,18 @@ class StageARunsClient(RecordingVolume):
         raise AssertionError("local Volume batch clients cannot reload mounts")
 
 
+class ModalMissingStageARunsClient(StageARunsClient):
+    """Stage A client with Modal's missing-directory listing behavior."""
+
+    def listdir(
+        self, path: str, *, recursive: bool = False,
+    ) -> list[SimpleNamespace]:
+        entries = super().listdir(path, recursive=recursive)
+        if not entries:
+            raise FakeModalNotFoundError("No such file or directory")
+        return entries
+
+
 class DirectoryListingStageARunsClient(StageARunsClient):
     """Stage A client that includes explicit Modal-style directory entries."""
 
@@ -3670,7 +3682,7 @@ def _stage_a_summary(
     return payload
 
 
-def test_stage_a_validates_all_training_before_selection_and_stops(
+def test_stage_a_with_modal_missing_producer_roots_validates_and_stops(
     imported_adapter: ModuleType,
     pilot_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3678,7 +3690,7 @@ def test_stage_a_validates_all_training_before_selection_and_stops(
     """Would fail if selection overlapped training validation or behavior was invoked."""
     plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
     events: list[tuple[object, ...]] = []
-    runs = StageARunsClient({}, events)
+    runs = ModalMissingStageARunsClient({}, events)
     training, training_results = _publishing_stage_a_function(
         plan, "train", events, runs
     )
@@ -3749,6 +3761,25 @@ def test_stage_a_validates_all_training_before_selection_and_stops(
         *(("canonical-validated", "train", job.arm) for job in plan.jobs),
         *(("canonical-validated", "selection", job.arm) for job in plan.jobs),
     ]
+
+
+def test_optional_volume_listing_propagates_non_not_found(
+    imported_adapter: ModuleType,
+) -> None:
+    """Would fail if service or permission failures were treated as empty state."""
+
+    class PermissionDeniedVolume:
+        def listdir(
+            self, path: str, *, recursive: bool = False,
+        ) -> list[SimpleNamespace]:
+            assert path == "/runs/approved"
+            assert recursive is True
+            raise PermissionError("listing denied")
+
+    with pytest.raises(PermissionError, match="listing denied"):
+        imported_adapter._list_volume_files_optional(
+            PermissionDeniedVolume(), "/runs/approved"
+        )
 
 
 def test_stage_a_flushes_complete_plan_before_first_tag_or_remote_call(
