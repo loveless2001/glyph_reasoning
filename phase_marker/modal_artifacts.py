@@ -5,10 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import chdir, contextmanager
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import hashlib
-import ctypes
-import errno
 import importlib
 import json
 import math
@@ -57,7 +55,6 @@ _PILOT_KIND = "pilot"
 _PILOT_SEED = 42
 _WORKSPACE_METADATA = "workspace-metadata.json"
 _DEFAULT_EPHEMERAL_JOB_ROOT = Path("/tmp/phase-marker-pilot")
-PROMOTION_STALE_GRACE_SECONDS = 3_600
 LOCKED_RUNTIME_MODULES = (
     "accelerate",
     "datasets",
@@ -182,10 +179,6 @@ class VolumeClient(Protocol):
 
 class _CachePublicationRollbackError(RuntimeError):
     """A visible cache publication could not be restored to quarantine."""
-
-
-class _JobPublicationRollbackError(RuntimeError):
-    """A visible job publication could not be restored to its attempt."""
 
 
 class _EvidencePublicationCleanupError(RuntimeError):
@@ -403,24 +396,6 @@ def run_exact_command(
     return int(result.returncode)
 
 
-def write_attempt_receipt(run_root: Path, receipt: AttemptReceipt) -> Path:
-    """Atomically persist a verified receipt outside attempt outputs and checkpoints."""
-    _validate_receipt(receipt)
-    root = Path(run_root).resolve()
-    receipt_path = root / "receipts" / f"{receipt.attempt_id}.json"
-    payload = (
-        canonical_json(_receipt_payload(receipt, include_artifact_id=True)) + "\n"
-    ).encode("utf-8")
-    try:
-        with _open_directory_path_nofollow(
-            receipt_path.parent, create=True
-        ) as parent_fd:
-            _write_bytes_exclusive_at(parent_fd, receipt_path.name, payload)
-    except FileExistsError as error:
-        raise FileExistsError("attempt receipt already exists") from error
-    return receipt_path
-
-
 @contextmanager
 def _open_directory_path_nofollow(
     path: Path, *, create: bool = False,
@@ -451,52 +426,6 @@ def _open_directory_path_nofollow(
         os.close(current_fd)
 
 
-def _renameat2_noreplace(
-    source_parent_fd: int,
-    source_name: str,
-    destination_parent_fd: int,
-    destination_name: str,
-) -> None:
-    try:
-        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
-    except AttributeError as error:
-        raise OSError(errno.ENOSYS, "atomic no-replace rename is unavailable") from error
-    renameat2.argtypes = (
-        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
-    )
-    renameat2.restype = ctypes.c_int
-    ctypes.set_errno(0)
-    result = renameat2(
-        source_parent_fd,
-        os.fsencode(source_name),
-        destination_parent_fd,
-        os.fsencode(destination_name),
-        1,  # RENAME_NOREPLACE
-    )
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-        raise FileExistsError(error_number, "destination already exists", destination_name)
-    if error_number in {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
-        try:
-            os.stat(
-                destination_name,
-                dir_fd=destination_parent_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            os.rename(
-                source_name,
-                destination_name,
-                src_dir_fd=source_parent_fd,
-                dst_dir_fd=destination_parent_fd,
-            )
-            return
-        raise FileExistsError(error_number, "destination already exists", destination_name)
-    raise OSError(error_number, os.strerror(error_number), destination_name)
-
-
 def _atomic_rename_directory_noreplace_at(
     *,
     source_parent_fd: int,
@@ -515,8 +444,11 @@ def _atomic_rename_directory_noreplace_at(
         pass
     else:
         raise FileExistsError("publication destination already exists")
-    _renameat2_noreplace(
-        source_parent_fd, source_name, destination_parent_fd, destination_name
+    os.rename(
+        source_name,
+        destination_name,
+        src_dir_fd=source_parent_fd,
+        dst_dir_fd=destination_parent_fd,
     )
     destination_after = os.stat(
         destination_name, dir_fd=destination_parent_fd, follow_symlinks=False
@@ -614,33 +546,6 @@ def _write_bytes_exclusive_at(
         raise
 
 
-def _read_regular_file_at_fd(directory_fd: int, name: str, *, label: str) -> bytes:
-    descriptor = os.open(
-        name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd
-    )
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"{label} is not a regular file")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        after = os.fstat(descriptor)
-        content = b"".join(chunks)
-        if (
-            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-            or len(content) != after.st_size
-        ):
-            raise ValueError(f"{label} changed while being read")
-        return content
-    finally:
-        os.close(descriptor)
-
-
 def atomic_publish_directory_noreplace(
     source: Path, destination: Path, *, create_parents: bool = False,
 ) -> Path:
@@ -665,12 +570,8 @@ def promote_validated_output(
     attempt_root: Path,
     canonical_root: Path,
     receipt: AttemptReceipt,
-    *,
-    lease_created_at: datetime | None = None,
-    retain_lease: bool = False,
-    lease_durability_barrier: Callable[[], None] | None = None,
 ) -> Path:
-    """Copy an accepted output into its attempt namespace, then atomically promote it."""
+    """Copy one validated output tree into its immutable canonical location."""
     _validate_receipt(receipt)
     if receipt.exit_status != 0 or not receipt.validated:
         raise ValueError("promotion requires a validated successful receipt")
@@ -683,341 +584,17 @@ def promote_validated_output(
     if _lstat_optional(target) is not None:
         raise FileExistsError("canonical output already exists")
     _validate_receipt_outputs(source_path, receipt)
-    lock = target.parent / f".{target.name}.promotion.lock"
-    lease = _promotion_lease_payload(receipt, created_at=lease_created_at)
-    with _open_directory_path_nofollow(
-        target.parent, create=True
-    ) as target_parent_fd:
-        with _open_directory_path_nofollow(root) as attempt_fd:
-            if os.fstat(attempt_fd).st_dev != os.fstat(target_parent_fd).st_dev:
-                raise ValueError(
-                    "attempt and canonical destinations must share the same filesystem"
-                )
-            try:
-                os.stat(target.name, dir_fd=target_parent_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
-                raise FileExistsError("canonical output already exists")
-            staged = root / "promotion-staging"
-            try:
-                os.stat(staged.name, dir_fd=attempt_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
-                raise FileExistsError("attempt promotion staging already exists")
-            shutil.copytree(source_path, staged, copy_function=shutil.copy2)
-            if _tree_hashes(source_path) != _tree_hashes(staged):
-                raise ValueError("attempt output copy does not match source bytes")
-            _validate_receipt_outputs(staged, receipt)
-            try:
-                _write_canonical_json_exclusive_at(
-                    target_parent_fd, lock.name, lease
-                )
-            except FileExistsError as error:
-                raise FileExistsError(
-                    "canonical promotion is already in progress"
-                ) from error
-            published = False
-            try:
-                if lease_durability_barrier is not None:
-                    lease_durability_barrier()
-                _atomic_rename_directory_noreplace_at(
-                    source_parent_fd=attempt_fd,
-                    source_name=staged.name,
-                    destination_parent_fd=target_parent_fd,
-                    destination_name=target.name,
-                )
-                published = True
-                _validate_receipt_outputs(target, receipt)
-            except Exception as error:
-                if published:
-                    _restore_failed_job_promotion(
-                        error=error,
-                        published=True,
-                        target=target,
-                        attempt_root=root,
-                        lock=lock,
-                    )
-                else:
-                    try:
-                        os.unlink(lock.name, dir_fd=target_parent_fd)
-                    except FileNotFoundError:
-                        pass
-                    except Exception as lock_error:
-                        error.add_note(
-                            "promotion lock cleanup also failed: "
-                            f"{type(lock_error).__name__}: {lock_error}"
-                        )
-                raise
-            if not retain_lease:
-                try:
-                    os.unlink(lock.name, dir_fd=target_parent_fd)
-                except Exception as error:
-                    _restore_failed_job_promotion(
-                        error=error,
-                        published=True,
-                        target=target,
-                        attempt_root=root,
-                        lock=lock,
-                    )
-                    raise
+
+    staged = root / "promotion-staging"
+    if staged.exists():
+        raise FileExistsError("attempt promotion staging already exists")
+    shutil.copytree(source_path, staged, copy_function=shutil.copy2)
+    if _tree_hashes(source_path) != _tree_hashes(staged):
+        raise ValueError("attempt output copy does not match source bytes")
+    _validate_receipt_outputs(staged, receipt)
+    atomic_publish_directory_noreplace(staged, target, create_parents=True)
+    _validate_receipt_outputs(target, receipt)
     return target
-
-
-def release_promotion_lease(
-    canonical_root: Path, receipt: AttemptReceipt,
-) -> None:
-    """Release only the exact authenticated lease owned by a durable receipt."""
-    _validate_receipt(receipt)
-    target = Path(os.path.abspath(canonical_root))
-    lock = target.parent / f".{target.name}.promotion.lock"
-    with _open_directory_path_nofollow(lock.parent) as parent_fd:
-        content = _read_regular_file_at_fd(
-            parent_fd, lock.name, label="promotion lease"
-        )
-        lease = load_promotion_lease_payload(content)
-        expected = {
-            "run_id": receipt.run_id,
-            "plan_digest": receipt.plan_digest,
-            "stage": receipt.stage,
-            "arm": receipt.arm,
-            "owner_attempt_id": receipt.attempt_id,
-            "owner_receipt_artifact_id": receipt.artifact_id,
-            "owner_stage_a_action_digest": receipt.stage_a_action_digest,
-            "modal_app_id": receipt.modal_app_id,
-            "modal_app_name": receipt.modal_app_name,
-            "modal_function_name": receipt.modal_function_name,
-            "modal_function_call_id": receipt.modal_function_call_id,
-            "modal_input_id": receipt.modal_input_id,
-        }
-        if any(lease.get(name) != value for name, value in expected.items()):
-            raise ValueError("promotion lease is not owned by the durable receipt")
-        os.unlink(lock.name, dir_fd=parent_fd)
-
-
-_PROMOTION_LEASE_FIELDS = frozenset(
-    {
-        "schema_version",
-        "kind",
-        "run_id",
-        "plan_digest",
-        "stage",
-        "arm",
-        "owner_attempt_id",
-        "owner_receipt_artifact_id",
-        "owner_stage_a_action_digest",
-        "producer_path",
-        "receipt_path",
-        "lease_path",
-        "modal_app_id",
-        "modal_app_name",
-        "modal_function_name",
-        "modal_function_call_id",
-        "modal_input_id",
-        "owner_started_at",
-        "owner_timeout_seconds",
-        "lease_created_at",
-        "stale_grace_seconds",
-        "recover_after",
-        "artifact_id",
-    }
-)
-
-
-def _promotion_lease_payload(
-    receipt: AttemptReceipt, *, created_at: datetime | None = None,
-) -> dict[str, object]:
-    """Build the exact self-authenticating owner lease for one promotion."""
-    _validate_receipt(receipt)
-    created = datetime.now(timezone.utc) if created_at is None else created_at
-    if created.tzinfo is None or created.utcoffset() is None:
-        raise ValueError("promotion lease clock must be timezone-aware")
-    created = created.astimezone(timezone.utc)
-    try:
-        owner_started = datetime.fromisoformat(receipt.started_at).astimezone(
-            timezone.utc
-        )
-    except (TypeError, ValueError) as error:
-        raise ValueError("promotion lease owner start time is invalid") from error
-    recover_after = owner_started + timedelta(
-        seconds=receipt.timeout_seconds + PROMOTION_STALE_GRACE_SECONDS
-    )
-    if created < owner_started or created >= recover_after:
-        raise ValueError("promotion lease creation time is outside its owner deadline")
-    producer_path = (
-        f"/runs/{receipt.run_id}/"
-        f"{_producer_relative_path(receipt.stage, receipt.arm).as_posix()}"
-    )
-    receipt_path = (
-        f"/runs/{receipt.run_id}/receipts/canonical/"
-        f"{receipt.stage}/{receipt.arm}.json"
-    )
-    lease_path = (
-        f"{PurePosixPath(producer_path).parent}/"
-        f".{receipt.arm}.promotion.lock"
-    )
-    payload: dict[str, object] = {
-        "schema_version": 1,
-        "kind": "stage-a-promotion-lease",
-        "run_id": receipt.run_id,
-        "plan_digest": receipt.plan_digest,
-        "stage": receipt.stage,
-        "arm": receipt.arm,
-        "owner_attempt_id": receipt.attempt_id,
-        "owner_receipt_artifact_id": receipt.artifact_id,
-        "owner_stage_a_action_digest": receipt.stage_a_action_digest,
-        "producer_path": producer_path,
-        "receipt_path": receipt_path,
-        "lease_path": lease_path,
-        "modal_app_id": receipt.modal_app_id,
-        "modal_app_name": receipt.modal_app_name,
-        "modal_function_name": receipt.modal_function_name,
-        "modal_function_call_id": receipt.modal_function_call_id,
-        "modal_input_id": receipt.modal_input_id,
-        "owner_started_at": owner_started.isoformat(timespec="microseconds"),
-        "owner_timeout_seconds": receipt.timeout_seconds,
-        "lease_created_at": created.isoformat(timespec="microseconds"),
-        "stale_grace_seconds": PROMOTION_STALE_GRACE_SECONDS,
-        "recover_after": recover_after.isoformat(timespec="microseconds"),
-    }
-    payload["artifact_id"] = sha256_json(payload)
-    return payload
-
-
-def load_promotion_lease_payload(content: bytes) -> dict[str, object]:
-    """Parse and authenticate one exact Stage-A promotion lease."""
-    if not isinstance(content, bytes):
-        raise TypeError("promotion lease content must be bytes")
-    try:
-        payload = json.loads(content.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError("promotion lease is malformed") from error
-    if not isinstance(payload, Mapping) or set(payload) != _PROMOTION_LEASE_FIELDS:
-        raise ValueError("promotion lease fields are invalid")
-    unsigned = dict(payload)
-    artifact_id = unsigned.pop("artifact_id", None)
-    try:
-        owner_started = datetime.fromisoformat(str(payload["owner_started_at"]))
-        created = datetime.fromisoformat(str(payload["lease_created_at"]))
-        recover_after = datetime.fromisoformat(str(payload["recover_after"]))
-    except (TypeError, ValueError) as error:
-        raise ValueError("promotion lease timestamps are invalid") from error
-    identity_values = (
-        payload.get("run_id"),
-        payload.get("stage"),
-        payload.get("arm"),
-        payload.get("owner_attempt_id"),
-        payload.get("producer_path"),
-        payload.get("receipt_path"),
-        payload.get("lease_path"),
-        payload.get("modal_app_id"),
-        payload.get("modal_app_name"),
-        payload.get("modal_function_name"),
-        payload.get("modal_function_call_id"),
-        payload.get("modal_input_id"),
-    )
-    try:
-        owner_uuid = uuid.UUID(str(payload.get("owner_attempt_id")))
-    except (AttributeError, TypeError, ValueError) as error:
-        raise ValueError("promotion lease owner attempt is invalid") from error
-    run_id = str(payload.get("run_id"))
-    stage = str(payload.get("stage"))
-    arm = str(payload.get("arm"))
-    expected_producer = (
-        f"/runs/{run_id}/{_producer_relative_path(stage, arm).as_posix()}"
-        if stage in {"train", "selection"} and arm in _ARMS
-        else ""
-    )
-    expected_receipt = f"/runs/{run_id}/receipts/canonical/{stage}/{arm}.json"
-    expected_lease = (
-        f"{PurePosixPath(expected_producer).parent}/.{arm}.promotion.lock"
-        if expected_producer
-        else ""
-    )
-    if (
-        payload.get("schema_version") != 1
-        or payload.get("kind") != "stage-a-promotion-lease"
-        or not _is_sha256(payload.get("plan_digest"))
-        or not _is_sha256(payload.get("owner_receipt_artifact_id"))
-        or not _is_sha256(payload.get("owner_stage_a_action_digest"))
-        or payload.get("stage") not in {"train", "selection"}
-        or payload.get("arm") not in _ARMS
-        or owner_uuid.version != 4
-        or str(owner_uuid) != payload.get("owner_attempt_id")
-        or payload.get("producer_path") != expected_producer
-        or payload.get("receipt_path") != expected_receipt
-        or payload.get("lease_path") != expected_lease
-        or not all(
-            isinstance(value, str)
-            and bool(value)
-            and "\n" not in value
-            and "\r" not in value
-            for value in identity_values
-        )
-        or payload.get("modal_app_name") != "phase-marker-pilot-stage-a"
-        or payload.get("modal_function_name")
-        != (
-            "run_training_job"
-            if payload.get("stage") == "train"
-            else "run_selection_job"
-        )
-        or any(
-            value.tzinfo is None
-            or value.utcoffset() != timedelta(0)
-            for value in (owner_started, created, recover_after)
-        )
-        or payload.get("owner_started_at")
-        != owner_started.isoformat(timespec="microseconds")
-        or payload.get("lease_created_at")
-        != created.isoformat(timespec="microseconds")
-        or payload.get("recover_after")
-        != recover_after.isoformat(timespec="microseconds")
-        or payload.get("owner_timeout_seconds") != 14_400
-        or payload.get("stale_grace_seconds") != PROMOTION_STALE_GRACE_SECONDS
-        or recover_after - owner_started
-        != timedelta(seconds=14_400 + PROMOTION_STALE_GRACE_SECONDS)
-        or not (owner_started <= created < recover_after)
-        or not _is_sha256(artifact_id)
-        or artifact_id != sha256_json(unsigned)
-    ):
-        raise ValueError("promotion lease identity is invalid")
-    return dict(payload)
-
-
-def _restore_failed_job_promotion(
-    *,
-    error: Exception,
-    published: bool,
-    target: Path,
-    attempt_root: Path,
-    lock: Path,
-) -> None:
-    failures: list[str] = []
-    if published:
-        try:
-            target.replace(Path(attempt_root) / "failed-promotion")
-        except Exception as rollback_error:
-            failures.append(
-                "producer rollback failed: "
-                f"{type(rollback_error).__name__}: {rollback_error}"
-            )
-    if lock.exists():
-        try:
-            lock.replace(Path(attempt_root) / "failed-promotion.lock")
-        except Exception as rollback_error:
-            failures.append(
-                "lock quarantine failed: "
-                f"{type(rollback_error).__name__}: {rollback_error}"
-            )
-    if failures:
-        compound = _JobPublicationRollbackError(
-            "job publication rollback failed; refusing to commit ambiguous state"
-        )
-        compound.add_note(f"original failure: {type(error).__name__}: {error}")
-        for failure in failures:
-            compound.add_note(failure)
-        raise compound from error
 
 
 def execute_pilot_job(
@@ -1186,8 +763,6 @@ def execute_pilot_job(
                     attempt_root,
                     canonical,
                     receipt,
-                    retain_lease=True,
-                    lease_durability_barrier=volume.commit,
                 )
                 published = True
                 failure_stage = "post-promotion-validation"
@@ -1200,9 +775,6 @@ def execute_pilot_job(
                 failure_stage = "commit"
                 volume.commit()
                 durably_published = True
-                failure_stage = "lease-release"
-                release_promotion_lease(canonical, receipt)
-                volume.commit()
                 return _receipt_payload(receipt, include_artifact_id=True)
             except Exception:
                 if producer.is_dir():
@@ -1212,18 +784,14 @@ def execute_pilot_job(
                         failed_records = ()
                 raise
     except Exception as error:
-        if isinstance(
-            error,
-            (_JobPublicationRollbackError, _EvidencePublicationCleanupError),
-        ):
+        if isinstance(error, _EvidencePublicationCleanupError):
             _append_failure_log(log_path, error)
             raise
         if durably_published:
             _append_failure_log(log_path, error)
             error.add_note(
                 "canonical producer and receipts were durably committed; "
-                "lease cleanup durability is uncertain, so inspect status and "
-                "use expiry-safe recovery if the authenticated lease remains"
+                "inspect status before retrying"
             )
             raise
         try:
@@ -1373,9 +941,6 @@ def _quarantine_failed_job_publication(
         attempt_receipt_path.replace(quarantine / "success-receipt.json")
     if published:
         canonical.replace(quarantine / "producer")
-        promotion_lease = canonical.parent / f".{canonical.name}.promotion.lock"
-        if promotion_lease.exists():
-            promotion_lease.replace(quarantine / "promotion.lock")
 
 
 def _validate_stage_job_payload(
@@ -2833,16 +2398,6 @@ def _make_tree_read_only(root: Path) -> None:
     path.chmod(0o555)
 
 
-def _filesystem_device(path: Path) -> int:
-    candidate = Path(path)
-    while not candidate.exists():
-        parent = candidate.parent
-        if parent == candidate:
-            raise ValueError("filesystem root is missing")
-        candidate = parent
-    return candidate.stat().st_dev
-
-
 def _approved_command_argv(command: str) -> list[str]:
     if not isinstance(command, str) or not command:
         raise ValueError("approved command is required")
@@ -4165,27 +3720,12 @@ def read_regular_file_at(
     return _read_regular_file_at(Path(root), relative_path, label=label)
 
 
-def _bundle_file(root: Path, relative_path: str) -> BundleFile:
-    content = _read_regular_file_at(
-        Path(root).resolve(), relative_path, label="required input bundle file"
-    )
-    return _bundle_file_from_bytes(relative_path, content)
-
-
 def _bundle_file_from_bytes(relative_path: str, content: bytes) -> BundleFile:
     if not content:
         raise ValueError(f"required input bundle file is empty: {relative_path}")
     return BundleFile(
         relative_path, len(content), hashlib.sha256(content).hexdigest()
     )
-
-
-def _manifest_artifact_id(path: Path) -> str:
-    target = Path(path)
-    content = _read_regular_file_at(
-        target.parent.resolve(), target.name, label="bundle manifest"
-    )
-    return _manifest_artifact_id_from_bytes(str(path), content)
 
 
 def _manifest_artifact_id_from_bytes(label: str, content: bytes) -> str:

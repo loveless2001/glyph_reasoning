@@ -198,7 +198,7 @@ def _run_stage_a(monkeypatch, plan, *, existing_training=None):
     monkeypatch.setattr(
         adapter,
         "_preflight_stage_a_outputs",
-        lambda *a, **k: adapter.StageAPreflight(existing_training, {}, None, ()),
+        lambda *a, **k: adapter.StageAPreflight(existing_training, {}, None),
     )
     monkeypatch.setattr(adapter, "apply_approved_app_tags", lambda *a, **k: None)
     monkeypatch.setattr(
