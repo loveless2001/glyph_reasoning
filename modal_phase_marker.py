@@ -278,6 +278,7 @@ gpu_image = (
         "mkdir -p /opt/glyph_reasoning/.venv/bin",
         "ln -sf /usr/local/bin/python /opt/glyph_reasoning/.venv/bin/python",
     )
+    .workdir("/opt/glyph_reasoning")
 )
 cpu_image = gpu_image
 

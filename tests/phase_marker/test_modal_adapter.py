@@ -165,6 +165,10 @@ class FakeImage:
         self.operations.append(("run_commands", *commands))
         return self
 
+    def workdir(self, path: str) -> FakeImage:
+        self.operations.append(("workdir", path))
+        return self
+
 
 class FakeVolumeMount:
     def __init__(self, volume: FakeVolume) -> None:
@@ -601,6 +605,7 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
             "mkdir -p /opt/glyph_reasoning/.venv/bin",
             "ln -sf /usr/local/bin/python /opt/glyph_reasoning/.venv/bin/python",
         ),
+        ("workdir", "/opt/glyph_reasoning"),
     ]
     assert imported_adapter._ignore_unhashed_phase_source(Path("planner.py")) is False
     assert imported_adapter._ignore_unhashed_phase_source(Path("notes.txt")) is True
@@ -806,6 +811,30 @@ def _declared_compute_image_python_paths(image: FakeImage) -> tuple[str, ...]:
             if local_path.suffix == ".py":
                 selected.add(local_path.as_posix())
     return tuple(sorted(selected))
+
+
+def _compute_image_can_import_top_level_module(
+    image: FakeImage, module_name: str,
+) -> bool:
+    runtime_workdir = PurePosixPath("/")
+    remote_python_files: set[PurePosixPath] = set()
+    for operation in image.operations:
+        if operation[0] == "add_local_file":
+            remote_path = PurePosixPath(str(operation[2]))
+            if remote_path.suffix == ".py":
+                remote_python_files.add(remote_path)
+        elif operation[0] == "workdir":
+            runtime_workdir = PurePosixPath(str(operation[1]))
+    return runtime_workdir / f"{module_name}.py" in remote_python_files
+
+
+def test_compute_image_can_import_declared_remote_function_module(
+    imported_adapter: ModuleType,
+) -> None:
+    """Would fail if Modal cannot import the module owning remote functions."""
+    assert _compute_image_can_import_top_level_module(
+        imported_adapter.gpu_image, "modal_phase_marker"
+    )
 
 
 def test_compute_image_python_set_exactly_matches_source_hash_set(
