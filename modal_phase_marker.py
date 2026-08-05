@@ -67,6 +67,11 @@ from phase_marker.token_audit import QWEN25_7B_TOKENIZER_REVISION
 
 
 APP_NAME = "phase-marker-pilot-stage-a"
+STAGE_INPUTS_APP_NAME = "phase-marker-pilot-stage-inputs"
+CACHE_MODEL_APP_NAME = "phase-marker-pilot-cache-model"
+# Preserve the certified runtime provenance name while isolating the selected
+# smoke graph in a distinct App object.
+SMOKE_APP_NAME = APP_NAME
 # linux/amd64 manifest for nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04.
 BASE_IMAGE = (
     "nvidia/cuda@sha256:61f6c08f2b59036cb935e56d1e31a6b64e3ae2c7ddb86d33fa0b044c7917b719"
@@ -205,6 +210,21 @@ app = modal.App(
     tags=_BASE_TAGS,
     include_source=False,
 )
+stage_inputs_app = modal.App(
+    STAGE_INPUTS_APP_NAME,
+    tags=_BASE_TAGS,
+    include_source=False,
+)
+cache_model_app = modal.App(
+    CACHE_MODEL_APP_NAME,
+    tags=_BASE_TAGS,
+    include_source=False,
+)
+smoke_app = modal.App(
+    SMOKE_APP_NAME,
+    tags=_BASE_TAGS,
+    include_source=False,
+)
 inputs_volume = modal.Volume.from_name(
     VOLUME_NAMES[0], environment_name=MODAL_ENVIRONMENT, create_if_missing=False
 )
@@ -213,6 +233,12 @@ model_volume = modal.Volume.from_name(
 )
 runs_volume = modal.Volume.from_name(
     VOLUME_NAMES[2], environment_name=MODAL_ENVIRONMENT, create_if_missing=False
+)
+cache_model_volume = modal.Volume.from_name(
+    VOLUME_NAMES[1], environment_name=MODAL_ENVIRONMENT, create_if_missing=True
+)
+smoke_runs_volume = modal.Volume.from_name(
+    VOLUME_NAMES[2], environment_name=MODAL_ENVIRONMENT, create_if_missing=True
 )
 
 GPU_VOLUMES = {
@@ -255,13 +281,13 @@ gpu_image = (
 cpu_image = gpu_image
 
 
-@app.function(
+@cache_model_app.function(
     image=cpu_image,
     cpu=MODEL_CACHE_CPU,
     memory=MODEL_CACHE_MEMORY_MIB,
     timeout=MODEL_CACHE_TIMEOUT_SECONDS,
     retries=0,
-    volumes={"/model-cache": model_volume},
+    volumes={"/model-cache": cache_model_volume},
 )
 def cache_model_remote(remote_payload: dict[str, object]) -> dict[str, object]:
     """Populate the pinned model cache without allocating a GPU."""
@@ -271,11 +297,11 @@ def cache_model_remote(remote_payload: dict[str, object]) -> dict[str, object]:
     return cache_model_to_volume(
         plan_payload=plan_payload,
         cache_root=Path("/model-cache"),
-        volume=model_volume,
+        volume=cache_model_volume,
     )
 
 
-@app.function(
+@smoke_app.function(
     image=cpu_image,
     cpu=SMOKE_CPU,
     memory=SMOKE_MEMORY_MIB,
@@ -284,7 +310,7 @@ def cache_model_remote(remote_payload: dict[str, object]) -> dict[str, object]:
     volumes={
         "/mnt/inputs": inputs_volume.read_only(),
         "/mnt/model": model_volume.read_only(),
-        "/mnt/runs": runs_volume,
+        "/mnt/runs": smoke_runs_volume,
     },
 )
 def smoke_remote(remote_payload: dict[str, object]) -> dict[str, object]:
@@ -298,7 +324,7 @@ def smoke_remote(remote_payload: dict[str, object]) -> dict[str, object]:
         input_root=INPUT_MOUNT_ROOT,
         model_root=MODEL_MOUNT_ROOT,
         run_root=RUN_MOUNT_ROOT,
-        volume=runs_volume,
+        volume=smoke_runs_volume,
         runtime_imports=LOCKED_RUNTIME_IMPORTS,
         execution_provenance=_collect_modal_execution_provenance("smoke_remote"),
     )
@@ -547,7 +573,9 @@ def _collect_modal_execution_provenance(function_name: str) -> dict[str, object]
             timeout=10,
         ).stdout.strip()
     )
-    app_id = getattr(app, "app_id", None)
+    runtime_app = smoke_app if function_name == "smoke_remote" else app
+    runtime_app_name = SMOKE_APP_NAME if function_name == "smoke_remote" else APP_NAME
+    app_id = getattr(runtime_app, "app_id", None)
     function_call_id = modal.current_function_call_id()
     input_id = modal.current_input_id()
     values = (app_id, function_call_id, input_id, torch_version, torch_cuda, driver)
@@ -555,7 +583,7 @@ def _collect_modal_execution_provenance(function_name: str) -> dict[str, object]
         raise RuntimeError("Modal execution provenance is unavailable")
     return {
         "modal_app_id": app_id,
-        "modal_app_name": APP_NAME,
+        "modal_app_name": runtime_app_name,
         "modal_function_name": function_name,
         "modal_function_call_id": function_call_id,
         "modal_input_id": input_id,
@@ -952,7 +980,7 @@ def _validate_successful_smoke_receipt(
         or smoke.get("model_cache_artifact_id") != model_cache_artifact_id
         or smoke.get("validated") is not True
         or smoke.get("failure_reason") is not None
-        or smoke.get("modal_app_name") != APP_NAME
+        or smoke.get("modal_app_name") != SMOKE_APP_NAME
         or smoke.get("modal_function_name") != "smoke_remote"
         or any(
             not isinstance(smoke.get(field), str)
@@ -2286,7 +2314,15 @@ def apply_approved_app_tags(
             else None
         ),
     )
-    app.set_tags({**_BASE_TAGS, "run-id": plan.run_id})
+    action_app = {
+        "stage-inputs": stage_inputs_app,
+        "cache-model": cache_model_app,
+        "smoke": smoke_app,
+        "run-stage-a": app,
+    }.get(action)
+    if action_app is None:
+        raise ValueError("Modal app tag action is invalid")
+    action_app.set_tags({**_BASE_TAGS, "run-id": plan.run_id})
 
 
 def _validate_operator_action_approval(
@@ -2450,7 +2486,7 @@ def _apply_input_staging_plan(
 
 
 
-@app.local_entrypoint(name="stage-inputs")
+@stage_inputs_app.local_entrypoint(name="stage-inputs")
 def stage_inputs(
     approved_run_id: str,
     acknowledge_budget_usd: float = 0.0,
@@ -2472,23 +2508,40 @@ def stage_inputs(
         approved_plan_digest=approved_plan_digest,
         approved_action_digest=approved_action_digest,
     )
-    staging_plan = preflight_inputs_local(
-        bundle,
-        inputs_volume,
-        approved_run_id=approved_run_id,
-        plan=plan,
-        budget_acknowledged=budget_acknowledged,
-    )
+    writable_volume: object | None = None
+    try:
+        staging_plan = preflight_inputs_local(
+            bundle,
+            inputs_volume,
+            approved_run_id=approved_run_id,
+            plan=plan,
+            budget_acknowledged=budget_acknowledged,
+        )
+    except modal.exception.NotFoundError:
+        writable_volume = _create_authorized_volume(
+            VOLUME_NAMES[0],
+            plan_payload=pilot_plan_payload(plan),
+            approval_payload=approval,
+            action="stage-inputs",
+        )
+        staging_plan = preflight_inputs_local(
+            bundle,
+            writable_volume,
+            approved_run_id=approved_run_id,
+            plan=plan,
+            budget_acknowledged=budget_acknowledged,
+        )
     print(canonical_json(_staging_plan_payload(staging_plan, plan, approval)))
     if not staging_plan.upload_required:
         print(canonical_json({"bundle_id": bundle.bundle_id, "uploaded": False}))
         return
-    writable_volume = _create_authorized_volume(
-        VOLUME_NAMES[0],
-        plan_payload=pilot_plan_payload(plan),
-        approval_payload=approval,
-        action="stage-inputs",
-    )
+    if writable_volume is None:
+        writable_volume = _create_authorized_volume(
+            VOLUME_NAMES[0],
+            plan_payload=pilot_plan_payload(plan),
+            approval_payload=approval,
+            action="stage-inputs",
+        )
     apply_approved_app_tags(
         plan, approval_payload=approval, action="stage-inputs"
     )
@@ -2496,7 +2549,7 @@ def stage_inputs(
     print(canonical_json(result))
 
 
-@app.local_entrypoint(name="cache-model")
+@cache_model_app.local_entrypoint(name="cache-model")
 def cache_model(
     approved_run_id: str,
     acknowledge_budget_usd: float = 0.0,
@@ -2547,7 +2600,7 @@ def cache_model(
     _print_remote_result(result)
 
 
-@app.local_entrypoint(name="smoke")
+@smoke_app.local_entrypoint(name="smoke")
 def smoke(
     approved_run_id: str,
     acknowledge_budget_usd: float = 0.0,

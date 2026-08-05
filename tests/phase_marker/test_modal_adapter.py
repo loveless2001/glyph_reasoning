@@ -171,6 +171,10 @@ class FakeVolumeMount:
         self.read_only = True
 
 
+class FakeModalNotFoundError(Exception):
+    pass
+
+
 class FakeVolume:
     def __init__(
         self, modal: FakeModal, name: str, create_if_missing: bool,
@@ -264,6 +268,8 @@ class FakeApp:
         self.tags = dict(tags)
         self.include_source = include_source
         self.remote_functions: dict[str, FakeRemoteFunction] = {}
+        self.function_options: dict[str, dict[str, object]] = {}
+        self.local_entrypoints: list[str] = []
 
     def function(self, **options: object) -> Callable[[Callable[..., object]], FakeRemoteFunction]:
         self._modal.declaration_calls.append(("function", dict(options)))
@@ -271,6 +277,7 @@ class FakeApp:
         def decorate(function: Callable[..., object]) -> FakeRemoteFunction:
             remote = FakeRemoteFunction(self._modal, function)
             self.remote_functions[function.__name__] = remote
+            self.function_options[function.__name__] = dict(options)
             self._modal.declaration_calls.append(("function_decorated", function.__name__))
             return remote
 
@@ -282,10 +289,25 @@ class FakeApp:
         self._modal.declaration_calls.append(("local_entrypoint", dict(options)))
 
         def decorate(function: Callable[..., object]) -> Callable[..., object]:
+            self.local_entrypoints.append(function.__name__)
             self._modal.declaration_calls.append(("local_entrypoint_decorated", function.__name__))
             return function
 
         return decorate
+
+    def initialize(self, existing_volumes: set[str]) -> None:
+        """Model Modal's selected-app resource hydration boundary."""
+        for options in self.function_options.values():
+            volumes = options.get("volumes", {})
+            assert isinstance(volumes, dict)
+            for mount in volumes.values():
+                volume = mount.volume if isinstance(mount, FakeVolumeMount) else mount
+                assert isinstance(volume, FakeVolume)
+                if volume.name in existing_volumes:
+                    continue
+                if not volume.create_if_missing:
+                    raise FileNotFoundError(volume.name)
+                existing_volumes.add(volume.name)
 
     def set_tags(self, tags: dict[str, str]) -> None:
         if self._modal.importing:
@@ -312,6 +334,7 @@ class FakeModal(ModuleType):
         self.App = self._app
         self.Image = SimpleNamespace(from_registry=self._from_registry)
         self.Volume = SimpleNamespace(from_name=self._from_name)
+        self.exception = SimpleNamespace(NotFoundError=FakeModalNotFoundError)
 
     def _app(
         self,
@@ -526,15 +549,17 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
 
     fake = imported_adapter.fake_modal
     assert fake.rpc_calls == []
-    assert len(fake.apps) == 1
-    assert imported_adapter.app.include_source is False
-    assert imported_adapter.app.tags == {
+    assert len(fake.apps) == 4
+    assert all(candidate.include_source is False for candidate in fake.apps)
+    assert all(candidate.tags == {
         "experiment": "phase-marker",
         "run-kind": "pilot",
         "seed": "42",
-    }
+    } for candidate in fake.apps)
     assert [(volume.name, volume.create_if_missing) for volume in fake.volumes] == [
         *((name, False) for name in imported_adapter.VOLUME_NAMES),
+        (imported_adapter.VOLUME_NAMES[1], True),
+        (imported_adapter.VOLUME_NAMES[2], True),
     ]
     assert {volume.environment_name for volume in fake.volumes} == {"main"}
     assert not hasattr(imported_adapter, "inspection_runs_volume")
@@ -607,7 +632,7 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
         "memory": 32_768,
         "timeout": 7_200,
         "retries": 0,
-        "volumes": {"/model-cache": imported_adapter.model_volume},
+        "volumes": {"/model-cache": imported_adapter.cache_model_volume},
     }
     smoke_options = next(
         call[1] for call in fake.declaration_calls
@@ -622,11 +647,9 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
     assert smoke_options["retries"] == 0
     assert smoke_options["volumes"]["/mnt/inputs"].read_only is True
     assert smoke_options["volumes"]["/mnt/model"].read_only is True
-    assert smoke_options["volumes"]["/mnt/runs"] is imported_adapter.runs_volume
+    assert smoke_options["volumes"]["/mnt/runs"] is imported_adapter.smoke_runs_volume
 
     assert set(imported_adapter.app.remote_functions) == {
-        "cache_model_remote",
-        "smoke_remote",
         "run_training_job",
         "run_selection_job",
         "finalize_stage_a_remote",
@@ -642,6 +665,43 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
     assert "plan" not in [
         call[1] for call in fake.declaration_calls if call[0] == "local_entrypoint_decorated"
     ]
+
+
+def test_bootstrap_apps_initialize_in_order_from_an_empty_volume_namespace(
+    imported_adapter: ModuleType,
+) -> None:
+    """Would fail if an action app hydrates a volume owned by a later action."""
+    existing: set[str] = set()
+
+    imported_adapter.stage_inputs_app.initialize(existing)
+    assert existing == set()
+    assert imported_adapter.stage_inputs_app.local_entrypoints == ["stage_inputs"]
+    assert imported_adapter.stage_inputs_app.remote_functions == {}
+
+    # The stage-input entrypoint creates this volume only after validating the
+    # operator-bound action digest. Model that completed boundary before cache.
+    existing.add(imported_adapter.VOLUME_NAMES[0])
+    imported_adapter.cache_model_app.initialize(existing)
+    assert existing == set(imported_adapter.VOLUME_NAMES[:2])
+    assert imported_adapter.cache_model_app.local_entrypoints == ["cache_model"]
+    assert set(imported_adapter.cache_model_app.remote_functions) == {
+        "cache_model_remote"
+    }
+
+    imported_adapter.smoke_app.initialize(existing)
+    assert existing == set(imported_adapter.VOLUME_NAMES)
+    assert imported_adapter.smoke_app.local_entrypoints == ["smoke"]
+    assert set(imported_adapter.smoke_app.remote_functions) == {"smoke_remote"}
+
+    imported_adapter.app.initialize(existing)
+    assert existing == set(imported_adapter.VOLUME_NAMES)
+    assert imported_adapter.app.local_entrypoints == ["run_stage_a"]
+    assert set(imported_adapter.app.remote_functions) == {
+        "run_training_job",
+        "run_selection_job",
+        "finalize_stage_a_remote",
+        "recover_stage_a_orphans_remote",
+    }
 
 
 def test_inspection_adapter_declares_no_compute_capability(
@@ -759,15 +819,22 @@ def test_compute_image_python_set_exactly_matches_source_hash_set(
     assert hash_source_tree(REPO_ROOT) == modal_artifacts.sha256_json(records)
 
 
-def test_all_module_global_volume_handles_are_noncreating_and_gpu_helper_is_absent(
+def test_only_action_scoped_bootstrap_handles_can_create_volumes(
     imported_adapter: ModuleType,
 ) -> None:
-    """Would fail if import or a read path retained volume-creation authority."""
-    assert imported_adapter.fake_modal.volumes
-    assert all(
-        volume.create_if_missing is False
-        for volume in imported_adapter.fake_modal.volumes
-    )
+    """Would fail if Stage A or a read path retained volume-creation authority."""
+    creating = {
+        volume for volume in imported_adapter.fake_modal.volumes
+        if volume.create_if_missing
+    }
+    assert creating == {
+        imported_adapter.cache_model_volume,
+        imported_adapter.smoke_runs_volume,
+    }
+    for options in imported_adapter.app.function_options.values():
+        for mount in options.get("volumes", {}).values():
+            volume = mount.volume if isinstance(mount, FakeVolumeMount) else mount
+            assert volume not in creating
     assert not hasattr(imported_adapter, "gpu_resources")
 
 
@@ -1128,7 +1195,7 @@ def test_apply_approved_app_tags_validates_before_the_client_rpc(
         "run-id": plan.run_id,
     }
     assert fake.rpc_calls == [("set_tags", expected_tags)]
-    assert imported_adapter.app.tags == expected_tags
+    assert imported_adapter.stage_inputs_app.tags == expected_tags
 
 
 def test_pure_python_plan_cli_does_not_import_or_call_modal(
@@ -1524,6 +1591,54 @@ def test_stage_entrypoint_tags_only_after_read_only_preflight_then_narrow_apply(
     assert output[1] == {"bundle_id": bundle.bundle_id, "uploaded": True}
 
 
+def test_stage_entrypoint_resolves_its_authorized_volume_before_remote_preflight(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Would fail if first-run staging reads a no-create handle before bootstrap."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    writable = RecordingVolume()
+    events: list[str] = []
+
+    class MissingVolume:
+        def listdir(self, *_args: object, **_kwargs: object) -> object:
+            raise FakeModalNotFoundError("input volume is absent")
+
+    def create(name: str, **kwargs: object) -> RecordingVolume:
+        assert name == imported_adapter.VOLUME_NAMES[0]
+        assert kwargs["action"] == "stage-inputs"
+        events.append("create")
+        return writable
+
+    monkeypatch.setattr(
+        imported_adapter, "_build_operator_context", lambda _root: (bundle, plan)
+    )
+    monkeypatch.setattr(imported_adapter, "inputs_volume", MissingVolume())
+    monkeypatch.setattr(imported_adapter, "_create_authorized_volume", create)
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda *_args, **_kwargs: events.append("tags"),
+    )
+
+    imported_adapter.stage_inputs(
+        repo_root=str(pilot_repo),
+        approved_run_id=plan.run_id,
+        acknowledge_budget_usd=1_000,
+        **_operator_approval_kwargs(plan, action="stage-inputs"),
+    )
+
+    assert events == ["create", "tags"]
+    assert [event[0] for event in writable.events] == ["listdir", "batch_upload"]
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {
+        "bundle_id": bundle.bundle_id,
+        "uploaded": True,
+    }
+
+
 def _write_smoke_model_cache(model_root: Path) -> tuple[Path, Path]:
     snapshot = (
         model_root / "canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots"
@@ -1644,7 +1759,7 @@ def test_cpu_smoke_validates_imports_source_bundle_and_cache_without_loading_mod
     monkeypatch.setattr(imported_adapter, "MODEL_MOUNT_ROOT", model_root)
     monkeypatch.setattr(imported_adapter, "RUN_MOUNT_ROOT", run_root)
     run_volume = CommitOnlyVolume()
-    monkeypatch.setattr(imported_adapter, "runs_volume", run_volume)
+    monkeypatch.setattr(imported_adapter, "smoke_runs_volume", run_volume)
     monkeypatch.setattr(
         imported_adapter,
         "_collect_modal_execution_provenance",
@@ -1694,7 +1809,7 @@ def test_cpu_smoke_persists_content_addressed_failure_and_reraises(
     monkeypatch.setattr(imported_adapter, "MODEL_MOUNT_ROOT", model_root)
     monkeypatch.setattr(imported_adapter, "RUN_MOUNT_ROOT", run_root)
     run_volume = CommitOnlyVolume()
-    monkeypatch.setattr(imported_adapter, "runs_volume", run_volume)
+    monkeypatch.setattr(imported_adapter, "smoke_runs_volume", run_volume)
     monkeypatch.setattr(
         imported_adapter,
         "_collect_modal_execution_provenance",
