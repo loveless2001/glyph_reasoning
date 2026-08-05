@@ -75,26 +75,47 @@ PHASE_MARKER_RUN_ID="$(./.venv/bin/python -m phase_marker.modal_plan run-id \
   --dependency-lock requirements-modal-phase-marker.txt
 ```
 
-The commands below are examples for an approval handoff. Every `modal run`
-crosses an external boundary and is not an offline dry run. Do not execute them
-without fresh authorization for the exact frozen run ID and stated budget:
+The plan's `action_manifest.external_actions` contains exactly three inert,
+digest-bound command strings: `stage_inputs`, `cache_model`, and `smoke`. It
+deliberately contains no Stage A command. Every `modal run` crosses an external
+boundary and is not an offline dry run. Obtain fresh authorization for each
+exact string, execute them one at a time, and inspect the result before moving
+to the next boundary. Do not reconstruct shorter commands by dropping the full
+plan or action digest flags.
+
+After cache population and CPU smoke, inspect the complete model-cache manifest
+and the exact successful smoke receipt. Only then use their reviewed 64-character
+artifact IDs to derive a prospective Stage A action locally:
 
 ```bash
-# External writes/compute shown for handoff only; fresh approval is required.
-modal run modal_phase_marker.py::stage-inputs --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
-modal run modal_phase_marker.py::cache-model --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
-modal run modal_phase_marker.py::smoke --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
-modal run modal_phase_marker.py::run-stage-a --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
+# Local only: prints one inert, evidence-bound fresh Stage A action; does not
+# import Modal, contact a service, write a volume, load a model, or allocate GPU.
+./.venv/bin/python -m phase_marker.modal_plan stage-a-action \
+  --repo-root . \
+  --config configs/phase-marker-qwen25-7b.toml \
+  --artifact-root artifacts/phase-marker \
+  --dependency-lock requirements-modal-phase-marker.txt \
+  --smoke-receipt-artifact-id '<REVIEWED_SMOKE_RECEIPT_ARTIFACT_ID>' \
+  --model-cache-artifact-id '<REVIEWED_MODEL_CACHE_ARTIFACT_ID>' \
+  --fresh
+```
 
-# Crash recovery only: inspect status, review the printed missing-arm plan, and
-# obtain fresh approval before this explicit resume.
-modal run modal_phase_marker.py::run-stage-a --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000 --resume
+The output contains the exact H100 command as inert data. Review its run ID,
+full plan and action digests, dependency IDs, fresh/resume mode, resources, and
+spend envelope, then request a distinct authorization for that exact command.
+For crash recovery, first inspect the durable status and quarantine plan, then
+rerun the local planner with `--resume` instead of `--fresh`; the resulting
+approval digest and command are intentionally different.
+
+After an authorized action, inspection remains separate:
+
+```bash
 
 # Read-only remote inspection after an authorized run.
-modal run modal_phase_marker.py::status --run-id "$PHASE_MARKER_RUN_ID"
+modal run modal_phase_marker_inspect.py::status --run-id "$PHASE_MARKER_RUN_ID"
 
 # Explicit local write of compact allowlisted evidence after successful status.
-modal run modal_phase_marker.py::download-evidence --run-id "$PHASE_MARKER_RUN_ID" --destination phase-marker-stage-a-evidence
+modal run modal_phase_marker_inspect.py::download-evidence --run-id "$PHASE_MARKER_RUN_ID" --destination phase-marker-stage-a-evidence
 ```
 
 Stage A requests one H100 per job, permits Modal's automatic H200-compatible

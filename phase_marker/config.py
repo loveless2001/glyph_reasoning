@@ -26,7 +26,18 @@ class ExperimentConfig:
     @classmethod
     def load(cls, path: Path) -> "ExperimentConfig":
         with path.open("rb") as handle:
-            raw = tomllib.load(handle)
+            content = handle.read()
+        return cls.from_toml_bytes(content)
+
+    @classmethod
+    def from_toml_bytes(cls, content: bytes) -> "ExperimentConfig":
+        """Parse one already-authenticated TOML byte snapshot."""
+        if not isinstance(content, bytes):
+            raise TypeError("experiment config content must be bytes")
+        try:
+            raw = tomllib.loads(content.decode("utf-8"))
+        except (UnicodeError, tomllib.TOMLDecodeError) as error:
+            raise ValueError("experiment config is invalid TOML") from error
 
         config = cls(
             model_id=_require_string(raw, "model_id"),

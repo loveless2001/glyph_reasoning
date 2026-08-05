@@ -4,7 +4,7 @@
 
 **Goal:** Build a dedicated, artifact-bound Modal launcher that runs seed-42 training and validation-only checkpoint selection for all six phase-marker arms, then stops before behavior evaluation.
 
-**Architecture:** Keep experiment planning and artifact rules in Modal-independent Python modules, with `modal_phase_marker.py` acting only as a resource and entrypoint adapter. Stage immutable inputs and the exact Qwen snapshot on separate volumes, execute each arm in an isolated ephemeral workspace, and promote validated outputs through attempt directories into immutable canonical paths.
+**Architecture:** Keep experiment planning and artifact rules in Modal-independent Python modules, with `modal_phase_marker.py` acting only as the compute resource and entrypoint adapter and `modal_phase_marker_inspect.py` acting as the standalone zero-compute inspection adapter. Stage immutable inputs and the exact Qwen snapshot on separate volumes, execute each arm in an isolated ephemeral workspace, and promote validated outputs through attempt directories into immutable canonical paths.
 
 **Tech Stack:** Python 3.12, dataclasses, hashlib/JSON/pathlib/subprocess, pytest, PyTorch 2.9.0, Transformers 4.57.3, PEFT 0.18.0, vLLM 0.13.0, Modal 1.3.5, CUDA 12.8, Modal Volumes.
 
@@ -33,7 +33,9 @@
 
 - Create `phase_marker/modal_plan.py`: frozen workload, approval, identity, and exact command planning; no Modal import or writes.
 - Create `phase_marker/modal_artifacts.py`: input allowlist, source/bundle hashes, workspaces, receipts, attempt publication, and model-cache manifests.
-- Create `modal_phase_marker.py`: thin Modal 1.3.5 images, volumes, remote functions, and operator entrypoints.
+- Create `modal_phase_marker.py`: thin Modal 1.3.5 compute images, volumes, remote functions, and compute operator entrypoints; it imports only pure inspection helpers and defines no status or evidence-download function.
+- Create `phase_marker/modal_inspection.py`: Modal-independent status validation and descriptor-safe, atomic no-replace local evidence publication helpers.
+- Create `modal_phase_marker_inspect.py`: standalone zero-compute, read-only runs-volume status and evidence-download entrypoints; it must not import the compute adapter.
 - Create `requirements-modal-phase-marker.in`: human-reviewed direct runtime pins.
 - Create `requirements-modal-phase-marker.txt`: compiled transitive lock with hashes; no floating dependency specifiers.
 - Create `tests/phase_marker/test_modal_plan.py`: plan, workload, budget, and identity tests.
@@ -1054,9 +1056,12 @@ git commit -m "feat: orchestrate staged Modal pilot"
 ### Task 8: Operator Status, Evidence Retrieval, Documentation, and Final Local Gate
 
 **Files:**
+- Create: `phase_marker/modal_inspection.py`
+- Create: `modal_phase_marker_inspect.py`
 - Modify: `modal_phase_marker.py`
 - Modify: `README.md`
 - Modify: `tests/phase_marker/test_modal_adapter.py`
+- Modify: `tests/phase_marker/test_modal_artifacts.py`
 - Modify: `tests/phase_marker/test_modal_plan.py`
 
 **Interfaces:**
@@ -1088,10 +1093,17 @@ cannot be downloaded by this entrypoint. Refuse an existing local destination.
 
 - [ ] **Step 3: Implement status and download entrypoints**
 
-Use Modal 1.3.5 `Volume.listdir` and `Volume.read_file` through small injectable
-adapters. Write downloads atomically to a newly created local directory and
-recompute every advertised hash after download. `status` is read-only;
-`download-evidence` is an explicit local write initiated by its own command.
+Implement the entrypoints in the standalone `modal_phase_marker_inspect.py`
+adapter, which declares only the non-creating read-only runs volume and imports
+no compute image, GPU function, or compute adapter. Keep validation and local
+publication in `phase_marker/modal_inspection.py`; the compute adapter may
+import only pure helpers from that module. Use Modal 1.3.5 `Volume.listdir` and
+`Volume.read_file` through small injectable adapters. Materialize downloads in
+a temporary sibling directory, recompute every advertised hash, perform a final
+source allowlist relist, and publish with an atomic no-replace directory rename.
+Refuse any pre-existing destination, including a dangling symlink, and preserve
+a destination created concurrently. `status` is read-only; `download-evidence`
+is an explicit local write initiated by its own command.
 
 - [ ] **Step 4: Document exact non-executing operator flow**
 
@@ -1112,17 +1124,30 @@ PHASE_MARKER_RUN_ID="$(./.venv/bin/python -m phase_marker.modal_plan run-id \
   --artifact-root artifacts/phase-marker \
   --dependency-lock requirements-modal-phase-marker.txt
 
-# External writes/compute shown for handoff only; do not execute without fresh approval.
-modal run modal_phase_marker.py::stage-inputs --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
-modal run modal_phase_marker.py::cache-model --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
-modal run modal_phase_marker.py::smoke --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
-modal run modal_phase_marker.py::run-stage-a --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000
+# The plan JSON contains only the exact digest-bound stage-inputs, cache-model,
+# and smoke actions as inert strings. Execute none without separate fresh approval.
 
-# Explicit crash recovery only; first inspect status and approve the printed missing-arm plan.
-modal run modal_phase_marker.py::run-stage-a --approved-run-id "$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000 --resume
+# Local only, and only after reviewing exact successful cache/smoke artifact IDs:
+./.venv/bin/python -m phase_marker.modal_plan stage-a-action \
+  --repo-root . \
+  --config configs/phase-marker-qwen25-7b.toml \
+  --artifact-root artifacts/phase-marker \
+  --dependency-lock requirements-modal-phase-marker.txt \
+  --smoke-receipt-artifact-id '<REVIEWED_SMOKE_RECEIPT_ARTIFACT_ID>' \
+  --model-cache-artifact-id '<REVIEWED_MODEL_CACHE_ARTIFACT_ID>' \
+  --fresh
+
+# The local command above prints the exact H100 action as inert data. It is not
+# included in this checked-in plan. Use --resume only after status/recovery review.
 
 # Read-only remote inspection after an authorized run.
-modal run modal_phase_marker.py::status --run-id "$PHASE_MARKER_RUN_ID"
+modal run modal_phase_marker_inspect.py::status --run-id "$PHASE_MARKER_RUN_ID"
+
+# Explicit local evidence materialization through the standalone zero-compute
+# inspector. The destination must not already exist.
+modal run modal_phase_marker_inspect.py::download-evidence \
+  --run-id "$PHASE_MARKER_RUN_ID" \
+  --destination artifacts/phase-marker-evidence/"$PHASE_MARKER_RUN_ID"
 ```
 
 Explain Stage A's 48-hour/$250 envelope, full pilot $600/$1,000 boundary, two
@@ -1137,7 +1162,9 @@ Run:
 ```bash
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ./.venv/bin/pytest -q tests
 ./.venv/bin/python -m py_compile \
-  phase_marker/modal_plan.py phase_marker/modal_artifacts.py modal_phase_marker.py
+  phase_marker/modal_plan.py phase_marker/modal_artifacts.py \
+  phase_marker/modal_inspection.py modal_phase_marker.py \
+  modal_phase_marker_inspect.py
 git diff --check
 git status --short
 ```
@@ -1150,10 +1177,12 @@ pre-existing top-level `infer_test.py` and performs an import-time Hub lookup.
 - [ ] **Step 6: Generate but do not execute the final action manifest**
 
 Run the local planner and save its canonical JSON under `/tmp` only. Verify it
-contains the exact input-upload command, CPU cache command, CPU smoke command,
-and Stage A command as inert strings; six training and six selection jobs; the
-full run ID; H100/time/concurrency; USD 250 Stage A estimate; USD 600 full
-estimate; USD 1,000 ceiling; and no behavior/mechanism execution command.
+contains the exact digest-bound input-upload, CPU cache, and CPU smoke commands,
+but explicitly withholds the Stage A command pending reviewed cache/smoke
+artifact IDs and an explicit fresh/resume mode. Verify six training and six
+selection jobs; the full run ID and plan digest; H100/time/concurrency; USD 250
+Stage A estimate; USD 600 full estimate; USD 1,000 ceiling; and no
+behavior/mechanism execution command.
 
 Do not contact Modal, create volumes, upload data, cache the model, build the
 remote image, deploy, or launch a GPU in this step.
@@ -1161,11 +1190,15 @@ remote image, deploy, or launch a GPU in this step.
 - [ ] **Step 7: Commit and prepare approval handoff**
 
 ```bash
-git add modal_phase_marker.py README.md tests/phase_marker/test_modal_adapter.py \
-  tests/phase_marker/test_modal_plan.py requirements-modal-phase-marker.in \
-  requirements-modal-phase-marker.txt
+git add README.md docs/superpowers/plans/2026-08-05-phase-marker-modal-pilot.md \
+  modal_phase_marker.py modal_phase_marker_inspect.py phase_marker/config.py \
+  phase_marker/modal_artifacts.py phase_marker/modal_inspection.py \
+  phase_marker/modal_plan.py tests/phase_marker/test_modal_adapter.py \
+  tests/phase_marker/test_modal_artifacts.py tests/phase_marker/test_modal_plan.py
 git commit -m "docs: finalize Modal pilot operator flow"
 ```
+
+Do not stage the preserved untracked `artifacts/` tree.
 
 The handoff must report test counts, branch/commit, input/model/run identities,
 exact proposed external commands, and the remaining budget. Request fresh

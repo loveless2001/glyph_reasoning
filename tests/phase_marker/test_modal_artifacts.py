@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -70,6 +71,17 @@ class FailFirstCommitVolume(CommitVolume):
         self.commit_count += 1
         if self.commit_count == 1:
             raise RuntimeError("injected first commit failure")
+
+
+class FailNthCommitVolume(CommitVolume):
+    def __init__(self, fail_on: int) -> None:
+        super().__init__()
+        self.fail_on = fail_on
+
+    def commit(self) -> None:
+        self.commit_count += 1
+        if self.commit_count == self.fail_on:
+            raise RuntimeError(f"injected commit {self.fail_on} failure")
 
 
 class FailFirstCommitWithFileExistsVolume(CommitVolume):
@@ -297,6 +309,41 @@ def test_model_cache_validation_rejects_changed_bytes_and_manifest_metadata(
                 artifact_id=manifest.artifact_id,
             ),
         )
+
+
+@pytest.mark.parametrize(
+    "bad_file",
+    (
+        {"path": {"not": "a path"}, "size": 1, "sha256": "1" * 64},
+        {"path": "config.json", "size": {"not": "an int"}, "sha256": "1" * 64},
+    ),
+)
+def test_model_cache_manifest_parser_normalizes_malformed_file_shapes_to_value_error(
+    qwen_snapshot: Path,
+    bad_file: object,
+) -> None:
+    """Would fail if untrusted manifest shapes leaked TypeError or AttributeError."""
+    payload = asdict(build_model_cache_manifest(qwen_snapshot))
+    payload["files"] = [bad_file]
+
+    with pytest.raises(ValueError, match="model cache"):
+        modal_artifacts.parse_model_cache_manifest_payload(payload)
+
+
+def test_model_cache_manifest_parser_requires_the_minimum_pinned_snapshot_file_set(
+    qwen_snapshot: Path,
+) -> None:
+    """Would fail if Stage A accepted a self-consistent but incomplete cache manifest."""
+    payload = asdict(build_model_cache_manifest(qwen_snapshot))
+    payload["files"] = [
+        item for item in payload["files"] if item["path"] != "config.json"
+    ]
+    payload["artifact_id"] = modal_artifacts.sha256_json(
+        {key: value for key, value in payload.items() if key != "artifact_id"}
+    )
+
+    with pytest.raises(ValueError, match="required files"):
+        modal_artifacts.parse_model_cache_manifest_payload(payload)
 
 
 def test_model_cache_hashes_symlink_target_bytes(qwen_snapshot: Path, tmp_path: Path) -> None:
@@ -754,6 +801,7 @@ def test_cpu_smoke_invalid_run_id_receipt_cannot_escape_run_root(
             run_root=run_root,
             volume=volume,
             runtime_imports=("json",),
+            execution_provenance=_execution_provenance("smoke", "invalid-plan"),
         )
 
     receipts = list((run_root / "runs/invalid-plan/receipts/smoke").glob("*.json"))
@@ -763,9 +811,17 @@ def test_cpu_smoke_invalid_run_id_receipt_cannot_escape_run_root(
 
 
 def receipt_fixture(**changes: object) -> AttemptReceipt:
+    plan_digest = "1" * 64
+    cache_artifact_id = "e" * 64
+    smoke_receipt_artifact_id = "9" * 64
+    stage_a_resume = False
+    started_at = datetime.now(timezone.utc)
     fields: dict[str, object] = {
         "schema_version": 1,
-        "run_id": "pilot-s42-cfg-12345678-split-12345678-src-123456789012",
+        "run_id": (
+            "pilot-s42-cfg-12345678-split-22222222-src-cccccccccccc-plan-"
+            + "1" * 64
+        ),
         "bundle_id": "a" * 64,
         "stage": "train",
         "arm": "glyph",
@@ -775,11 +831,19 @@ def receipt_fixture(**changes: object) -> AttemptReceipt:
         "command_hash": "b" * 64,
         "source_hash": "c" * 64,
         "dependency_lock_hash": "d" * 64,
-        "model_cache_artifact_id": "e" * 64,
+        "model_cache_artifact_id": cache_artifact_id,
+        "stage_a_action_digest": modal_artifacts._stage_a_action_digest(
+            plan_digest=plan_digest,
+            resume=stage_a_resume,
+            smoke_receipt_artifact_id=smoke_receipt_artifact_id,
+            model_cache_artifact_id=cache_artifact_id,
+        ),
+        "stage_a_resume": stage_a_resume,
+        "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
         "requested_gpu": "H100",
         "observed_gpu": None,
-        "started_at": "2026-08-05T00:00:00+00:00",
-        "finished_at": "2026-08-05T00:00:01+00:00",
+        "started_at": started_at.isoformat(),
+        "finished_at": (started_at + timedelta(seconds=1)).isoformat(),
         "elapsed_seconds": 1.0,
         "timeout_seconds": 60,
         "exit_status": 0,
@@ -788,9 +852,37 @@ def receipt_fixture(**changes: object) -> AttemptReceipt:
         "expected_outputs": ("adapter_config.json",),
         "output_hashes": ("f" * 64,),
         "failure_reason": None,
+        "plan_digest": plan_digest,
+        "config_hash": "1" * 64,
+        "split_artifact_id": "2" * 64,
+        "materialization_artifact_ids": tuple(
+            f"{value:x}" * 64 for value in range(3, 9)
+        ),
+        "model_revision": QWEN25_7B_TOKENIZER_REVISION,
+        "modal_app_id": "ap-test",
+        "modal_app_name": "phase-marker-pilot-stage-a",
+        "modal_function_name": "run_training_job",
+        "modal_function_call_id": "fc-test",
+        "modal_input_id": "in-test",
+        "python_version": "3.12.test",
+        "torch_version": "2.7.test",
+        "cuda_runtime_version": "12.8.test",
+        "cuda_driver_version": "570.test",
+        "runtime_versions": tuple(
+            (module, "locked-test-version")
+            for module in modal_artifacts.LOCKED_RUNTIME_MODULES
+        ),
         "artifact_id": "",
+        "failure_stage": None,
     }
     fields.update(changes)
+    if fields["validated"] is False:
+        if "failure_reason" not in changes:
+            fields["failure_reason"] = "RuntimeError: failed fixture attempt"
+        if "failure_stage" not in changes:
+            fields["failure_stage"] = (
+                "producer-validation" if fields["exit_status"] == 0 else "command"
+            )
     receipt = AttemptReceipt(**fields)
     if "artifact_id" not in changes:
         return replace(receipt, artifact_id=receipt.recomputed_artifact_id())
@@ -853,6 +945,24 @@ def test_bundle_rejects_changed_files(repo_fixture: Path) -> None:
         validate_bundle_at_root(bundle, repo_fixture)
 
 
+def test_bundle_build_and_revalidation_reject_symlinked_allowlist_files(
+    repo_fixture: Path, tmp_path: Path,
+) -> None:
+    """Would fail if an approved pathname could redirect a later trusted read."""
+    target = repo_fixture / "artifacts/phase-marker/training-data/glyph.jsonl"
+    original = target.read_bytes()
+    external = tmp_path / "same-bytes.jsonl"
+    external.write_bytes(original)
+    bundle = build_input_bundle(repo_fixture)
+    target.unlink()
+    target.symlink_to(external)
+
+    with pytest.raises(ValueError, match="symlinked|regular"):
+        validate_bundle_at_root(bundle, repo_fixture)
+    with pytest.raises(ValueError, match="symlinked|regular"):
+        build_input_bundle(repo_fixture)
+
+
 def test_bundle_rejects_extra_and_unsafe_file_entries(repo_fixture: Path) -> None:
     bundle = build_input_bundle(repo_fixture)
     extra = BundleFile("extra.json", 1, "0" * 64)
@@ -896,6 +1006,26 @@ def test_source_hash_includes_only_approved_python_sources(tmp_path: Path) -> No
     assert SOURCE_INCLUDE_PATHS == ("phase_marker/**/*.py", "modal_phase_marker.py")
 
 
+def test_source_hash_rejects_symlinked_or_nonregular_python_sources(
+    tmp_path: Path,
+) -> None:
+    """Would fail if unhashed indirection or a special source entered the image set."""
+    package = tmp_path / "phase_marker"
+    package.mkdir()
+    external = tmp_path / "external.py"
+    external.write_text("VALUE = 1\n", encoding="utf-8")
+    linked = package / "linked.py"
+    linked.symlink_to(external)
+    with pytest.raises(ValueError, match="source path is a symlink"):
+        hash_source_tree(tmp_path)
+
+    linked.unlink()
+    fifo = package / "special.py"
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError, match="not a regular file"):
+        hash_source_tree(tmp_path)
+
+
 def test_plan_uses_bound_bundle_ids_and_identity_hashes(repo_fixture: Path) -> None:
     artifact_root = repo_fixture / "artifacts/phase-marker"
     bundle = build_input_bundle(repo_fixture)
@@ -929,7 +1059,8 @@ def test_plan_uses_bound_bundle_ids_and_identity_hashes(repo_fixture: Path) -> N
     assert changed_source.run_id != plan.run_id
     assert changed_lock.source_hash == plan.source_hash
     assert changed_lock.dependency_lock_hash != plan.dependency_lock_hash
-    assert changed_lock.run_id == plan.run_id
+    assert changed_lock.run_label == plan.run_label
+    assert changed_lock.run_id != plan.run_id
 
     config = ExperimentConfig.load(repo_fixture / CONFIG_PATH)
     changed_config = replace(config, confirmatory_seeds=(102, 202, 303))
@@ -1206,7 +1337,9 @@ def test_receipt_rejects_stale_artifact_id(tmp_path: Path) -> None:
 
 def test_promotion_copies_attempt_bytes_once_and_refuses_existing_canonical(tmp_path: Path) -> None:
     """Would fail if promotion overwrote a canonical result or changed output bytes."""
-    receipt = _receipt_for_file("adapter.bin", b"frozen adapter bytes")
+    receipt = _receipt_for_file(
+        "adapter.bin", b"frozen adapter bytes", timeout_seconds=14_400
+    )
     attempt_root = tmp_path / "runs/attempts" / receipt.attempt_id
     source = (
         attempt_root / "workspace"
@@ -1223,6 +1356,52 @@ def test_promotion_copies_attempt_bytes_once_and_refuses_existing_canonical(tmp_
     assert (source / "adapter.bin").read_bytes() == b"frozen adapter bytes"
     with pytest.raises(FileExistsError, match="canonical output already exists"):
         promote_validated_output(source, attempt_root, canonical, receipt)
+
+
+def test_retained_promotion_lease_is_exact_self_hashed_owner_deadline(
+    tmp_path: Path,
+) -> None:
+    """Would fail if resume inferred staleness from an empty or unauthenticated lock."""
+    receipt = _receipt_for_file(
+        "adapter.bin", b"frozen adapter bytes", timeout_seconds=14_400
+    )
+    attempt_root = tmp_path / "runs/attempts" / receipt.attempt_id
+    source = (
+        attempt_root / "workspace"
+        / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    )
+    source.mkdir(parents=True)
+    (source / "adapter.bin").write_bytes(b"frozen adapter bytes")
+    canonical = tmp_path / "runs/artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
+    created = datetime.fromisoformat(receipt.started_at) + timedelta(seconds=1)
+
+    promote_validated_output(
+        source,
+        attempt_root,
+        canonical,
+        receipt,
+        retain_lease=True,
+        lease_created_at=created,
+    )
+
+    lock = canonical.parent / ".glyph.promotion.lock"
+    lease = modal_artifacts.load_promotion_lease_payload(lock.read_bytes())
+    assert lease["owner_attempt_id"] == receipt.attempt_id
+    assert lease["owner_receipt_artifact_id"] == receipt.artifact_id
+    assert lease["owner_stage_a_action_digest"] == receipt.stage_a_action_digest
+    assert lease["producer_path"].endswith("/checkpoints/pilot/seed-42/glyph")
+    assert lease["receipt_path"].endswith("/receipts/canonical/train/glyph.json")
+    assert lease["lease_path"].endswith("/.glyph.promotion.lock")
+    assert datetime.fromisoformat(str(lease["recover_after"])) == (
+        datetime.fromisoformat(receipt.started_at)
+        + timedelta(seconds=receipt.timeout_seconds + 3_600)
+    )
+    tampered = dict(lease)
+    tampered["arm"] = "dot"
+    with pytest.raises(ValueError, match="lease"):
+        modal_artifacts.load_promotion_lease_payload(
+            (canonical_json(tampered) + "\n").encode("utf-8")
+        )
 
 
 def test_promotion_lock_cleanup_failure_rolls_publication_back_to_quarantine(
@@ -1288,6 +1467,29 @@ def _training_command(arm: str) -> str:
     )
 
 
+@pytest.mark.parametrize(
+    "command_mutator",
+    (
+        lambda command: " " + command,
+        lambda command: command.replace(" -m ", "  -m "),
+        lambda command: command.replace("--arm glyph", "--arm 'glyph'"),
+    ),
+)
+def test_exact_command_rejects_noncanonical_whitespace_and_quoting(
+    tmp_path: Path,
+    command_mutator: object,
+) -> None:
+    """Would fail if argv equivalence replaced byte-exact command approval."""
+    assert callable(command_mutator)
+    with pytest.raises(ValueError, match="approved command"):
+        run_exact_command(
+            command_mutator(_training_command("glyph")),
+            workspace=tmp_path,
+            log_path=tmp_path / "run.log",
+            env={},
+        )
+
+
 def _receipt_for_file(path: str, content: bytes, **changes: object) -> AttemptReceipt:
     return receipt_fixture(
         expected_outputs=(path,),
@@ -1300,13 +1502,18 @@ def test_workspace_setup_failure_keeps_partial_attempt_quarantined(
     repo_fixture: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Would fail if setup errors erase forensic evidence from an attempt."""
-    original_copy = modal_artifacts.shutil.copyfile
+    original_write = Path.write_bytes
+    interrupted = False
 
-    def copy_then_fail(source: Path, destination: Path) -> str:
-        original_copy(source, destination)
-        raise OSError("simulated copy interruption")
+    def write_then_fail(destination: Path, content: bytes) -> int:
+        nonlocal interrupted
+        written = original_write(destination, content)
+        if not interrupted and "workspace" in destination.parts:
+            interrupted = True
+            raise OSError("simulated copy interruption")
+        return written
 
-    monkeypatch.setattr(modal_artifacts.shutil, "copyfile", copy_then_fail)
+    monkeypatch.setattr(Path, "write_bytes", write_then_fail)
     with pytest.raises(OSError, match="copy interruption"):
         prepare_ephemeral_workspace(
             code_root=_workspace_code_root(tmp_path), input_root=repo_fixture,
@@ -1534,6 +1741,57 @@ def _job_execution_plan(repo_fixture: Path, bundle: object) -> modal_plan.PilotP
     )
 
 
+def _stage_a_approval(
+    plan: modal_plan.PilotPlan,
+    *,
+    cache_artifact_id: str = "e" * 64,
+    smoke_receipt_artifact_id: str = "9" * 64,
+    resume: bool = False,
+) -> dict[str, object]:
+    return modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=resume,
+        smoke_receipt_artifact_id=smoke_receipt_artifact_id,
+        model_cache_artifact_id=cache_artifact_id,
+    )
+
+
+def _stage_a_approval_for_model(
+    plan: modal_plan.PilotPlan, model_root: Path, *, resume: bool = False,
+) -> dict[str, object]:
+    _snapshot, manifest = modal_artifacts._validated_model_cache(model_root)
+    return _stage_a_approval(
+        plan, cache_artifact_id=manifest.artifact_id, resume=resume
+    )
+
+
+def _execution_provenance(stage: str, suffix: str = "test") -> dict[str, object]:
+    function = {
+        "train": "run_training_job",
+        "selection": "run_selection_job",
+        "smoke": "smoke_remote",
+        "finalizer": "finalize_stage_a_remote",
+    }[stage]
+    return {
+        "modal_app_id": "ap-test",
+        "modal_app_name": "phase-marker-pilot-stage-a",
+        "modal_function_name": function,
+        "modal_function_call_id": f"fc-{suffix}",
+        "modal_input_id": f"in-{suffix}",
+        "python_version": "3.12.test",
+        "torch_version": "2.7.test",
+        "cuda_runtime_version": "12.8.test",
+        "cuda_driver_version": (
+            "not-observed-cpu" if stage in {"smoke", "finalizer"} else "570.test"
+        ),
+        "runtime_versions": [
+            {"module": module, "version": "locked-test-version"}
+            for module in modal_artifacts.LOCKED_RUNTIME_MODULES
+        ],
+    }
+
+
 def test_execute_jobs_use_exact_commands_offline_env_and_promote_only_producers(
     repo_fixture: Path,
     qwen_snapshot: Path,
@@ -1618,10 +1876,20 @@ def test_execute_jobs_use_exact_commands_offline_env_and_promote_only_producers(
         "environ": {"CUDA_VISIBLE_DEVICES": "0", "PATH": "/usr/bin"},
         "producer_validator": validate,
         "bf16_probe": lambda: True,
+        "stage_a_approval": _stage_a_approval(
+            plan, cache_artifact_id=cache_manifest.artifact_id
+        ),
     }
 
-    training = modal_artifacts.execute_pilot_job(stage="train", **common)
-    selection = modal_artifacts.execute_pilot_job(stage="selection", **common)
+    training = modal_artifacts.execute_pilot_job(
+        stage="train", execution_provenance=_execution_provenance("train", "training"),
+        **common,
+    )
+    selection = modal_artifacts.execute_pilot_job(
+        stage="selection",
+        execution_provenance=_execution_provenance("selection", "selection"),
+        **common,
+    )
 
     assert [argv for argv, _ in commands] == [
         shlex.split(job.training_command), shlex.split(job.selection_command)
@@ -1646,6 +1914,17 @@ def test_execute_jobs_use_exact_commands_offline_env_and_promote_only_producers(
     assert training["observed_gpu"] == "NVIDIA H200"
     assert selection["requested_gpu"] == "H100"
     assert selection["observed_gpu"] == "NVIDIA H200"
+    assert training["plan_digest"] == plan.plan_digest
+    assert training["config_hash"] == plan.config_hash
+    assert training["split_artifact_id"] == plan.split_artifact_id
+    assert training["materialization_artifact_ids"] == list(
+        plan.materialization_artifact_ids
+    )
+    assert training["model_revision"] == plan.model_revision
+    assert training["modal_function_name"] == "run_training_job"
+    assert training["modal_function_call_id"] == "fc-training"
+    assert training["modal_input_id"] == "in-training"
+    assert training["cuda_runtime_version"] == "12.8.test"
     assert training["promoted"] is True and selection["promoted"] is True
     assert modal_artifacts.validate_job_receipt_payload(
         receipt_payload=training,
@@ -1659,7 +1938,9 @@ def test_execute_jobs_use_exact_commands_offline_env_and_promote_only_producers(
         job_payload=asdict(job),
         stage="selection",
     )["artifact_id"] == selection["artifact_id"]
-    assert volume.commit_count == 2
+    # Each successful job durably creates its lease, publishes the producer and
+    # receipts, then removes the lease.
+    assert volume.commit_count == 6
 
     run = run_root / "runs" / plan.run_id
     checkpoint = run / "artifacts/phase-marker/checkpoints/pilot/seed-42/glyph"
@@ -1722,6 +2003,8 @@ def test_job_validation_failure_persists_unpromoted_receipt_and_reraises(
             model_root=model_root,
             run_root=run_root,
             volume=volume,
+            stage_a_approval=_stage_a_approval_for_model(plan, model_root),
+            execution_provenance=_execution_provenance("train", "validation-fail"),
             ephemeral_root=ephemeral_root,
             environ={"CUDA_VISIBLE_DEVICES": "0"},
             producer_validator=lambda *_: (_ for _ in ()).throw(
@@ -1735,6 +2018,8 @@ def test_job_validation_failure_persists_unpromoted_receipt_and_reraises(
     assert len(failed) == 1
     receipt = json.loads(failed[0].read_text(encoding="utf-8"))
     assert receipt["arm"] == "dot"
+    assert receipt["exit_status"] == 0
+    assert receipt["failure_stage"] == "producer-validation"
     assert receipt["validated"] is False
     assert receipt["promoted"] is False
     assert "RuntimeError: producer rejected dot" in receipt["failure_reason"]
@@ -1782,6 +2067,8 @@ def test_job_subprocess_failure_without_outputs_still_persists_failed_receipt(
             model_root=model_root,
             run_root=run_root,
             volume=volume,
+            stage_a_approval=_stage_a_approval_for_model(plan, model_root),
+            execution_provenance=_execution_provenance("train", "command-fail"),
             ephemeral_root=ephemeral_root,
             environ={"CUDA_VISIBLE_DEVICES": "0"},
             bf16_probe=lambda: True,
@@ -1832,6 +2119,8 @@ def test_job_bf16_preflight_failure_still_persists_failed_receipt(
             model_root=model_root,
             run_root=run_root,
             volume=volume,
+            stage_a_approval=_stage_a_approval_for_model(plan, model_root),
+            execution_provenance=_execution_provenance("train", "bf16-fail"),
             environ={"CUDA_VISIBLE_DEVICES": "0"},
             bf16_probe=lambda: False,
         )
@@ -1882,6 +2171,8 @@ def test_job_rejects_nonapproved_gpu_before_model_command_and_persists_failure(
             model_root=model_root,
             run_root=run_root,
             volume=volume,
+            stage_a_approval=_stage_a_approval_for_model(plan, model_root),
+            execution_provenance=_execution_provenance("train", "gpu-fail"),
             environ={"CUDA_VISIBLE_DEVICES": "0"},
             bf16_probe=lambda: pytest.fail("BF16 probe ran on rejected GPU"),
         )
@@ -1929,6 +2220,10 @@ def test_selection_workspace_failure_still_persists_failed_receipt(
             model_root=model_root,
             run_root=run_root,
             volume=volume,
+            stage_a_approval=_stage_a_approval_for_model(plan, model_root),
+            execution_provenance=_execution_provenance(
+                "selection", "workspace-fail"
+            ),
             environ={"CUDA_VISIBLE_DEVICES": "0"},
             bf16_probe=lambda: True,
         )
@@ -1944,13 +2239,13 @@ def test_selection_workspace_failure_still_persists_failed_receipt(
     assert volume.commit_count == 1
 
 
-def test_job_publication_commit_failure_rolls_back_canonical_and_records_failure(
+def test_job_lease_durability_failure_aborts_before_promotion_and_records_failure(
     repo_fixture: Path,
     qwen_snapshot: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Would fail if a failed commit stranded canonical success or masked its cause."""
+    """Would fail if an undurable lease allowed canonical promotion to proceed."""
     code_root = Path(__file__).resolve().parents[2]
     input_root = tmp_path / "inputs"
     model_root = tmp_path / "model-cache"
@@ -1985,6 +2280,8 @@ def test_job_publication_commit_failure_rolls_back_canonical_and_records_failure
             model_root=model_root,
             run_root=run_root,
             volume=volume,
+            stage_a_approval=_stage_a_approval_for_model(plan, model_root),
+            execution_provenance=_execution_provenance("train", "commit-fail"),
             ephemeral_root=ephemeral_root,
             environ={"CUDA_VISIBLE_DEVICES": "0"},
             producer_validator=lambda *_: None,
@@ -2002,11 +2299,145 @@ def test_job_publication_commit_failure_rolls_back_canonical_and_records_failure
     assert receipt["validated"] is False and receipt["promoted"] is False
     assert "RuntimeError: injected first commit failure" in receipt["failure_reason"]
     attempt = next((run / "attempts").iterdir())
-    assert (attempt / "failed-publication/producer").is_dir()
-    assert (attempt / "failed-publication/success-receipt.json").is_file()
+    assert not (attempt / "failed-publication").exists()
+    assert not (
+        canonical.parent / f".{canonical.name}.promotion.lock"
+    ).exists()
     assert not (attempt / "workspace").exists()
     assert not list(attempt.rglob("bundle-manifest.json"))
     assert volume.commit_count == 2
+
+
+def test_job_publication_commit_failure_quarantines_uncommitted_pair_and_lease(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a failed publication commit stranded canonical state or its lease."""
+    code_root = Path(__file__).resolve().parents[2]
+    input_root = tmp_path / "inputs"
+    model_root = tmp_path / "model-cache"
+    run_root = tmp_path / "runs"
+    ephemeral_root = tmp_path / "ephemeral"
+    ephemeral_root.mkdir()
+    bundle = _stage_job_inputs(repo_fixture, input_root)
+    _stage_job_model(qwen_snapshot, model_root)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[5]
+
+    def fake_subprocess(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[0] == "nvidia-smi":
+            return SimpleNamespace(returncode=0, stdout="NVIDIA H100 80GB HBM3\n")
+        workspace = Path(str(kwargs["cwd"]))
+        output = workspace / argv[argv.index("--output-dir") + 1]
+        output.mkdir(parents=True)
+        (output / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+        (output / "adapter_model.safetensors").write_bytes(b"adapter")
+        (output / "run-manifest.json").write_text("{}\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess)
+    volume = FailNthCommitVolume(2)
+    with pytest.raises(RuntimeError, match="injected commit 2 failure"):
+        modal_artifacts.execute_pilot_job(
+            stage="train",
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            job_payload=asdict(job),
+            code_root=code_root,
+            input_root=input_root,
+            model_root=model_root,
+            run_root=run_root,
+            volume=volume,
+            stage_a_approval=_stage_a_approval_for_model(plan, model_root),
+            execution_provenance=_execution_provenance("train", "commit-two-fail"),
+            ephemeral_root=ephemeral_root,
+            environ={"CUDA_VISIBLE_DEVICES": "0"},
+            producer_validator=lambda *_: None,
+            bf16_probe=lambda: True,
+        )
+
+    run = run_root / "runs" / plan.run_id
+    canonical = run / "artifacts/phase-marker/checkpoints/pilot/seed-42/filler"
+    canonical_receipt = run / "receipts/canonical/train/filler.json"
+    failed = list((run / "receipts/attempts").glob("*.json"))
+    assert not canonical.exists()
+    assert not canonical_receipt.exists()
+    assert len(failed) == 1
+    receipt = json.loads(failed[0].read_text(encoding="utf-8"))
+    assert receipt["validated"] is False and receipt["promoted"] is False
+    assert "RuntimeError: injected commit 2 failure" in receipt["failure_reason"]
+    attempt = next((run / "attempts").iterdir())
+    assert (attempt / "failed-publication/producer").is_dir()
+    assert (attempt / "failed-publication/success-receipt.json").is_file()
+    assert (attempt / "failed-publication/canonical-receipt.json").is_file()
+    assert (attempt / "failed-publication/promotion.lock").is_file()
+    assert not (
+        canonical.parent / f".{canonical.name}.promotion.lock"
+    ).exists()
+    assert volume.commit_count == 3
+
+
+def test_job_lease_cleanup_commit_failure_preserves_durable_publication(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if cleanup uncertainty rolled back a durably published producer."""
+    code_root = Path(__file__).resolve().parents[2]
+    input_root = tmp_path / "inputs"
+    model_root = tmp_path / "model-cache"
+    run_root = tmp_path / "runs"
+    ephemeral_root = tmp_path / "ephemeral"
+    ephemeral_root.mkdir()
+    bundle = _stage_job_inputs(repo_fixture, input_root)
+    _stage_job_model(qwen_snapshot, model_root)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[5]
+
+    def fake_subprocess(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[0] == "nvidia-smi":
+            return SimpleNamespace(returncode=0, stdout="NVIDIA H100 80GB HBM3\n")
+        workspace = Path(str(kwargs["cwd"]))
+        output = workspace / argv[argv.index("--output-dir") + 1]
+        output.mkdir(parents=True)
+        (output / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+        (output / "adapter_model.safetensors").write_bytes(b"adapter")
+        (output / "run-manifest.json").write_text("{}\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess)
+    volume = FailNthCommitVolume(3)
+    with pytest.raises(RuntimeError, match="injected commit 3 failure"):
+        modal_artifacts.execute_pilot_job(
+            stage="train",
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            job_payload=asdict(job),
+            code_root=code_root,
+            input_root=input_root,
+            model_root=model_root,
+            run_root=run_root,
+            volume=volume,
+            stage_a_approval=_stage_a_approval_for_model(plan, model_root),
+            execution_provenance=_execution_provenance("train", "commit-three-fail"),
+            ephemeral_root=ephemeral_root,
+            environ={"CUDA_VISIBLE_DEVICES": "0"},
+            producer_validator=lambda *_: None,
+            bf16_probe=lambda: True,
+        )
+
+    run = run_root / "runs" / plan.run_id
+    canonical = run / "artifacts/phase-marker/checkpoints/pilot/seed-42/filler"
+    canonical_receipt = run / "receipts/canonical/train/filler.json"
+    attempt_receipts = list((run / "receipts/attempts").glob("*.json"))
+    assert canonical.is_dir()
+    assert canonical_receipt.is_file()
+    assert len(attempt_receipts) == 1
+    receipt = json.loads(attempt_receipts[0].read_text(encoding="utf-8"))
+    assert receipt["validated"] is True and receipt["promoted"] is True
+    assert not list((run / "attempts").glob("*/failed-publication"))
+    assert volume.commit_count == 3
 
 
 def _finalizer_receipt_payload(
@@ -2015,7 +2446,11 @@ def _finalizer_receipt_payload(
     stage: str,
     *,
     cache_artifact_id: str = "e" * 64,
+    resume: bool = False,
 ) -> dict[str, object]:
+    approval = _stage_a_approval(
+        plan, cache_artifact_id=cache_artifact_id, resume=resume
+    )
     command = job.training_command if stage == "train" else job.selection_command
     paths = (
         ("adapter_config.json", "adapter_model.safetensors", "run-manifest.json")
@@ -2035,6 +2470,9 @@ def _finalizer_receipt_payload(
         source_hash=plan.source_hash,
         dependency_lock_hash=plan.dependency_lock_hash,
         model_cache_artifact_id=cache_artifact_id,
+        stage_a_action_digest=str(approval["approval_digest"]),
+        stage_a_resume=resume,
+        smoke_receipt_artifact_id=str(approval["smoke_receipt_artifact_id"]),
         requested_gpu="H100",
         observed_gpu="NVIDIA H100 80GB HBM3",
         started_at="2026-08-05T00:00:00+00:00",
@@ -2047,13 +2485,140 @@ def _finalizer_receipt_payload(
         expected_outputs=paths,
         output_hashes=tuple(hashlib.sha256(path.encode()).hexdigest() for path in paths),
         failure_reason=None,
+        plan_digest=plan.plan_digest,
+        config_hash=plan.config_hash,
+        split_artifact_id=plan.split_artifact_id,
+        materialization_artifact_ids=plan.materialization_artifact_ids,
+        model_revision=plan.model_revision,
+        modal_app_id="ap-test",
+        modal_app_name="phase-marker-pilot-stage-a",
+        modal_function_name=(
+            "run_training_job" if stage == "train" else "run_selection_job"
+        ),
+        modal_function_call_id=f"fc-{stage}-{job.arm}",
+        modal_input_id=f"in-{stage}-{job.arm}",
+        python_version="3.12.test",
+        torch_version="2.7.test",
+        cuda_runtime_version="12.8.test",
+        cuda_driver_version="570.test",
+        runtime_versions=tuple(
+            (module, "locked-test-version")
+            for module in modal_artifacts.LOCKED_RUNTIME_MODULES
+        ),
         artifact_id="",
     )
     receipt = replace(receipt, artifact_id=receipt.recomputed_artifact_id())
     payload = asdict(receipt)
     payload["expected_outputs"] = list(receipt.expected_outputs)
     payload["output_hashes"] = list(receipt.output_hashes)
+    payload["materialization_artifact_ids"] = list(
+        receipt.materialization_artifact_ids
+    )
+    payload["runtime_versions"] = [
+        {"module": module, "version": version}
+        for module, version in receipt.runtime_versions
+    ]
     return payload
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    (
+        ("stage_a_action_digest", "d" * 64),
+        ("stage_a_resume", True),
+        ("smoke_receipt_artifact_id", "d" * 64),
+        ("model_cache_artifact_id", "d" * 64),
+    ),
+)
+def test_attempt_receipt_rejects_self_hashed_approval_field_tampering(
+    repo_fixture: Path,
+    field: str,
+    changed: object,
+) -> None:
+    """Would fail if a self-hash could hide altered Stage A authorization."""
+    bundle = build_input_bundle(repo_fixture)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    payload = _finalizer_receipt_payload(plan, plan.jobs[0], "train")
+    payload[field] = changed
+    unsigned = dict(payload)
+    unsigned.pop("artifact_id")
+    payload["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+
+    with pytest.raises(ValueError, match="receipt"):
+        modal_artifacts.load_attempt_receipt_payload(payload)
+
+
+def test_finalizer_preserves_mixed_fresh_and_resume_approval_history(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+) -> None:
+    """Would fail if resumed lineage flattened receipts into one approval claim."""
+    bundle = build_input_bundle(repo_fixture)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    plan_payload = modal_plan.pilot_plan_payload(plan)
+    _snapshot, cache_manifest = _stage_job_model(
+        qwen_snapshot, tmp_path / "model-cache"
+    )
+    training = tuple(
+        _finalizer_receipt_payload(
+            plan,
+            job,
+            "train",
+            cache_artifact_id=cache_manifest.artifact_id,
+            resume=index >= 3,
+        )
+        for index, job in enumerate(plan.jobs)
+    )
+    selection = tuple(
+        _finalizer_receipt_payload(
+            plan,
+            job,
+            "selection",
+            cache_artifact_id=cache_manifest.artifact_id,
+            resume=True,
+        )
+        for job in plan.jobs
+    )
+    approval = _stage_a_approval(
+        plan, cache_artifact_id=cache_manifest.artifact_id, resume=True
+    )
+
+    result = modal_artifacts.finalize_stage_a(
+        plan_payload=plan_payload,
+        receipts=(*training, *selection),
+        input_root=tmp_path / "inputs",
+        model_root=tmp_path / "model-cache",
+        run_root=tmp_path / "runs",
+        volume=CommitVolume(),
+        stage_a_approval=approval,
+        execution_provenance=_execution_provenance(
+            "finalizer", "mixed-approval-history"
+        ),
+        behavior_gate=lambda **_: {
+            "passed": True,
+            "checked_artifact_ids": ["f" * 64],
+            "commands": ["./.venv/bin/python -m phase_marker.behavior run"],
+        },
+    )
+
+    expected_history = modal_artifacts._receipt_approval_history(
+        (*training, *selection)
+    )
+    assert result["stage_a_resume"] is True
+    assert result["stage_a_action_digest"] == approval["approval_digest"]
+    assert result["receipt_approval_history"] == expected_history
+    assert {item["stage_a_resume"] for item in expected_history} == {False, True}
+    assert sum(
+        len(item["receipt_artifact_ids"]) for item in expected_history
+    ) == 12
+    assert modal_artifacts.validate_stage_a_summary(
+        result,
+        plan_payload=plan_payload,
+        training_receipts=training,
+        selection_receipts=selection,
+        stage_a_approval=approval,
+    ) == result
 
 
 def test_cpu_finalizer_runs_read_only_gate_and_publishes_inert_stop_summary(
@@ -2105,7 +2670,11 @@ def test_cpu_finalizer_runs_read_only_gate_and_publishes_inert_stop_summary(
         model_root=tmp_path / "model-cache",
         run_root=tmp_path / "runs",
         volume=volume,
+        stage_a_approval=_stage_a_approval(
+            plan, cache_artifact_id=cache_manifest.artifact_id
+        ),
         behavior_gate=gate,
+        execution_provenance=_execution_provenance("finalizer", "finalizer"),
     )
 
     assert len(gate_calls) == 1
@@ -2115,6 +2684,14 @@ def test_cpu_finalizer_runs_read_only_gate_and_publishes_inert_stop_summary(
     assert gate_calls[0]["run_root"] == tmp_path / "runs"
     assert result["stopped_before_behavior"] is True
     assert result["next_command"] == "./.venv/bin/python -m phase_marker.behavior run"
+    assert result["elapsed_gpu_seconds"] == {
+        "training": 360.0,
+        "selection": 360.0,
+        "total": 720.0,
+    }
+    assert result["finalizer_provenance"]["modal_function_name"] == (
+        "finalize_stage_a_remote"
+    )
     assert "confirmation_seeds" not in result
     assert "mechanism_approval" not in result
     assert "callback" not in result
@@ -2132,7 +2709,11 @@ def test_cpu_finalizer_runs_read_only_gate_and_publishes_inert_stop_summary(
         model_root=tmp_path / "model-cache",
         run_root=tmp_path / "runs",
         volume=volume,
+        stage_a_approval=_stage_a_approval(
+            plan, cache_artifact_id=cache_manifest.artifact_id
+        ),
         behavior_gate=gate,
+        execution_provenance=_execution_provenance("finalizer", "finalizer"),
     )
     assert resumed == result
     assert len(gate_calls) == 2
@@ -2211,6 +2792,12 @@ def test_finalizer_commit_failure_quarantines_summary_and_preserves_original_err
             model_root=tmp_path / "model-cache",
             run_root=tmp_path / "runs",
             volume=volume,
+            stage_a_approval=_stage_a_approval(
+                plan, cache_artifact_id=cache_manifest.artifact_id
+            ),
+            execution_provenance=_execution_provenance(
+                "finalizer", "commit-fail"
+            ),
             behavior_gate=lambda **_: {
                 "passed": True,
                 "checked_artifact_ids": ["f" * 64],

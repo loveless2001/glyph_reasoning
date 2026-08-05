@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import argparse
+from collections.abc import Mapping, Sequence
 import hashlib
 import json
 from pathlib import Path
 import shlex
-from typing import Sequence
 
-from phase_marker.modal_artifacts import InputBundle, build_input_bundle, hash_source_tree, validate_bundle_at_root
+from phase_marker.modal_artifacts import (
+    InputBundle,
+    build_input_bundle,
+    hash_source_tree,
+    read_bundle_files_at_root,
+    read_regular_file_at,
+)
 from phase_marker.config import ExperimentConfig
 from phase_marker.io import canonical_json
 from phase_marker.pipeline import (
@@ -24,6 +30,8 @@ _PILOT_KIND = "pilot"
 _EXPECTED_ARMS = ("semantic", "glyph", "dot", "random", "direct", "filler")
 _PORTABLE_CONFIG_PATH = Path("configs/phase-marker-qwen25-7b.toml")
 _PORTABLE_ARTIFACT_ROOT = Path("artifacts/phase-marker")
+_CANONICAL_DEPENDENCY_LOCK_PATH = "requirements-modal-phase-marker.txt"
+_APPROVED_ACTIONS = frozenset({"stage-inputs", "cache-model", "smoke", "run-stage-a"})
 _SHA256_LENGTH = 64
 _MANIFEST_FIELDS = frozenset(
     {
@@ -97,9 +105,12 @@ class PilotPlan:
     model_revision: str
     source_hash: str
     dependency_lock_hash: str
+    canonical_dependency_lock_path: str
     bundle_id: str
     resources: StageAResources
     jobs: tuple[PilotJob, ...]
+    run_label: str
+    plan_digest: str
     run_id: str
     local_repo_root: Path
 
@@ -123,9 +134,13 @@ def build_pilot_plan(
 
     root, config_path, artifact_root = _approved_pilot_paths(config_path, artifact_root)
     _reject_duplicate_artifact_ids(bundle.artifact_ids)
-    validate_bundle_at_root(bundle, root)
-    bundle_split_id, *bundle_materialization_ids = _bundle_artifact_ids(bundle, artifact_root)
-    config = ExperimentConfig.load(config_path)
+    bundle_files = read_bundle_files_at_root(bundle, root)
+    bundle_split_id, *bundle_materialization_ids = _bundle_artifact_ids(
+        bundle, bundle_files
+    )
+    config = ExperimentConfig.from_toml_bytes(
+        bundle_files[_PORTABLE_CONFIG_PATH.as_posix()]
+    )
     if config.pilot_seed != 42:
         raise ValueError("pilot plan requires the frozen seed 42")
     resources = build_stage_a_resources()
@@ -149,12 +164,11 @@ def build_pilot_plan(
     config_hash = hashlib.sha256(
         canonical_json(asdict(config)).encode("utf-8")
     ).hexdigest()
-    run_id = (
+    run_label = (
         f"pilot-s{config.pilot_seed}-cfg-{config_hash[:8]}"
         f"-split-{bundle_split_id[:8]}-src-{source_hash[:12]}"
     )
-    _validate_run_id(run_id, config_hash, bundle_split_id, source_hash)
-    return PilotPlan(
+    plan = PilotPlan(
         schema_version=1,
         kind=_PILOT_KIND,
         seed=config.pilot_seed,
@@ -164,12 +178,119 @@ def build_pilot_plan(
         model_revision=QWEN25_7B_TOKENIZER_REVISION,
         source_hash=source_hash,
         dependency_lock_hash=dependency_lock_hash,
+        canonical_dependency_lock_path=_CANONICAL_DEPENDENCY_LOCK_PATH,
         bundle_id=bundle.bundle_id,
         resources=resources,
         jobs=jobs,
-        run_id=run_id,
+        run_label=run_label,
+        plan_digest="",
+        run_id="",
         local_repo_root=root,
     )
+    plan_digest = pilot_plan_digest(plan)
+    run_id = f"{run_label}-plan-{plan_digest}"
+    plan = replace(plan, plan_digest=plan_digest, run_id=run_id)
+    _validate_run_id(plan)
+    return plan
+
+
+def pilot_plan_digest(plan: PilotPlan) -> str:
+    """Hash every canonical workload byte used to authorize this pilot."""
+    if not isinstance(plan, PilotPlan):
+        raise TypeError("pilot plan digest requires a PilotPlan")
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "schema_version": plan.schema_version,
+                "kind": plan.kind,
+                "seed": plan.seed,
+                "config_hash": plan.config_hash,
+                "split_artifact_id": plan.split_artifact_id,
+                "materialization_artifact_ids": list(
+                    plan.materialization_artifact_ids
+                ),
+                "model_revision": plan.model_revision,
+                "source_hash": plan.source_hash,
+                "dependency_lock": {
+                    "path": plan.canonical_dependency_lock_path,
+                    "sha256": plan.dependency_lock_hash,
+                },
+                "bundle_id": plan.bundle_id,
+                "resources": asdict(plan.resources),
+                "jobs": [asdict(job) for job in plan.jobs],
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def action_approval_digest(
+    plan: PilotPlan,
+    *,
+    action: str,
+    resume: bool | None = None,
+    smoke_receipt_artifact_id: str | None = None,
+    model_cache_artifact_id: str | None = None,
+) -> str:
+    """Derive one non-transferable approval identity for an external action."""
+    _validate_run_id(plan)
+    if action not in _APPROVED_ACTIONS:
+        raise ValueError("external action is not approved")
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "plan_digest": plan.plan_digest,
+        "action": action,
+    }
+    evidence = (resume, smoke_receipt_artifact_id, model_cache_artifact_id)
+    if action == "run-stage-a":
+        if (
+            not isinstance(resume, bool)
+            or not _is_sha256(smoke_receipt_artifact_id)
+            or not _is_sha256(model_cache_artifact_id)
+        ):
+            raise ValueError("Stage A evidence identities and resume mode are required")
+        payload.update(
+            {
+                "resume": resume,
+                "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
+                "model_cache_artifact_id": model_cache_artifact_id,
+            }
+        )
+    elif any(value is not None for value in evidence):
+        raise ValueError("non-Stage-A actions do not accept Stage A evidence")
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def action_approval_payload(
+    plan: PilotPlan,
+    *,
+    action: str,
+    resume: bool | None = None,
+    smoke_receipt_artifact_id: str | None = None,
+    model_cache_artifact_id: str | None = None,
+) -> dict[str, object]:
+    """Return the exact approval envelope passed across a remote boundary."""
+    digest = action_approval_digest(
+        plan,
+        action=action,
+        resume=resume,
+        smoke_receipt_artifact_id=smoke_receipt_artifact_id,
+        model_cache_artifact_id=model_cache_artifact_id,
+    )
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "action": action,
+        "plan_digest": plan.plan_digest,
+        "approval_digest": digest,
+    }
+    if action == "run-stage-a":
+        payload.update(
+            {
+                "resume": resume,
+                "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
+                "model_cache_artifact_id": model_cache_artifact_id,
+            }
+        )
+    return payload
 
 
 def pilot_plan_payload(plan: PilotPlan) -> dict[str, object]:
@@ -184,6 +305,7 @@ def pilot_plan_payload(plan: PilotPlan) -> dict[str, object]:
         "model_revision": plan.model_revision,
         "source_hash": plan.source_hash,
         "dependency_lock_hash": plan.dependency_lock_hash,
+        "canonical_dependency_lock_path": plan.canonical_dependency_lock_path,
         "bundle_id": plan.bundle_id,
         "resources": {
             "hardware": plan.resources.hardware,
@@ -208,21 +330,22 @@ def pilot_plan_payload(plan: PilotPlan) -> dict[str, object]:
             }
             for job in plan.jobs
         ],
+        "run_label": plan.run_label,
+        "plan_digest": plan.plan_digest,
         "run_id": plan.run_id,
     }
 
 
 def approval_action_manifest(plan: PilotPlan) -> dict[str, object]:
-    """Return exact external commands as inert, approval-gated handoff data."""
+    """Return pre-GPU commands while withholding Stage A until evidence review."""
     if not isinstance(plan, PilotPlan):
         raise TypeError("approval action manifest requires a PilotPlan")
-    prefix = (
-        "modal run modal_phase_marker.py::{entrypoint} --approved-run-id "
-        '"$PHASE_MARKER_RUN_ID" --acknowledge-budget-usd 1000'
-    )
+    _validate_run_id(plan)
+
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": plan.run_id,
+        "plan_digest": plan.plan_digest,
         "bundle_id": plan.bundle_id,
         "model_revision": plan.model_revision,
         "training_job_count": len(plan.jobs),
@@ -236,15 +359,117 @@ def approval_action_manifest(plan: PilotPlan) -> dict[str, object]:
             "spend_cap_usd": plan.resources.spend_cap_usd,
         },
         "external_actions": {
-            "stage_inputs": prefix.format(entrypoint="stage-inputs"),
-            "cache_model": prefix.format(entrypoint="cache-model"),
-            "smoke": prefix.format(entrypoint="smoke"),
-            "run_stage_a": prefix.format(entrypoint="run-stage-a"),
+            "stage_inputs": _modal_action_command(
+                plan,
+                entrypoint="stage-inputs",
+                approval=action_approval_payload(plan, action="stage-inputs"),
+            ),
+            "cache_model": _modal_action_command(
+                plan,
+                entrypoint="cache-model",
+                approval=action_approval_payload(plan, action="cache-model"),
+            ),
+            "smoke": _modal_action_command(
+                plan,
+                entrypoint="smoke",
+                approval=action_approval_payload(plan, action="smoke"),
+            ),
+        },
+        "withheld_actions": {
+            "run_stage_a": {
+                "status": "withheld-pending-reviewed-dependencies",
+                "action": "run-stage-a",
+                "hardware": "H100",
+                "command_included": False,
+                "required_evidence": [
+                    "smoke_receipt_artifact_id",
+                    "model_cache_artifact_id",
+                    "resume",
+                ],
+                "reason": (
+                    "review the exact successful CPU smoke receipt and model-cache "
+                    "manifest before deriving a Stage A action approval"
+                ),
+            }
         },
         "approval_required": True,
         "stopped_before_behavior": True,
         "mechanism_approval_included": False,
     }
+
+
+def approved_stage_a_action_manifest(
+    plan: PilotPlan,
+    *,
+    smoke_receipt_artifact_id: str,
+    model_cache_artifact_id: str,
+    resume: bool,
+) -> dict[str, object]:
+    """Derive the exact inert H100 action only from reviewed dependency IDs."""
+    if not isinstance(plan, PilotPlan):
+        raise TypeError("Stage A action manifest requires a PilotPlan")
+    _validate_run_id(plan)
+    approval = action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=resume,
+        smoke_receipt_artifact_id=smoke_receipt_artifact_id,
+        model_cache_artifact_id=model_cache_artifact_id,
+    )
+    extra = [
+        "--smoke-receipt-artifact-id", smoke_receipt_artifact_id,
+        "--model-cache-artifact-id", model_cache_artifact_id,
+    ]
+    if resume:
+        extra.append("--resume")
+    return {
+        "schema_version": 1,
+        "status": "approval-ready-after-reviewed-dependencies",
+        "run_id": plan.run_id,
+        "plan_digest": plan.plan_digest,
+        "resume": resume,
+        "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
+        "model_cache_artifact_id": model_cache_artifact_id,
+        "approval": approval,
+        "resources": {
+            "hardware": plan.resources.hardware,
+            "timeout_seconds": plan.resources.timeout_seconds,
+            "max_containers": plan.resources.max_containers,
+            "stage_a_estimated_spend_usd": (
+                plan.resources.stage_a_estimated_spend_usd
+            ),
+            "spend_cap_usd": plan.resources.spend_cap_usd,
+        },
+        "external_action": _modal_action_command(
+            plan,
+            entrypoint="run-stage-a",
+            approval=approval,
+            extra_arguments=extra,
+        ),
+        "approval_required": True,
+        "stopped_before_behavior": True,
+        "mechanism_approval_included": False,
+    }
+
+
+def _modal_action_command(
+    plan: PilotPlan,
+    *,
+    entrypoint: str,
+    approval: Mapping[str, object],
+    extra_arguments: Sequence[str] = (),
+) -> str:
+    return shlex.join(
+        [
+            "modal", "run", f"modal_phase_marker.py::{entrypoint}",
+            "--approved-run-id", plan.run_id,
+            "--acknowledge-budget-usd", "1000",
+            "--repo-root", ".",
+            "--approved-plan-digest", plan.plan_digest,
+            "--approved-action-digest", str(approval["approval_digest"]),
+            *extra_arguments,
+        ]
+    )
 
 
 def _validate_manifest_jobs(
@@ -288,9 +513,9 @@ def _validate_manifest_jobs(
         expected_training, expected_selection = _expected_commands(
             config_path, artifact_root, config.pilot_seed, expected_arm
         )
-        if shlex.split(training_command) != expected_training:
+        if training_command != shlex.join(expected_training):
             raise ValueError("pilot training command is not the approved form")
-        if shlex.split(selection_command) != expected_selection:
+        if selection_command != shlex.join(expected_selection):
             raise ValueError("pilot selection command is not the approved form")
         expected_outputs = item["expected_outputs"]
         if (
@@ -378,21 +603,26 @@ def _approved_pilot_paths(config_path: Path, artifact_root: Path) -> tuple[Path,
     return repo_root, approved_config, approved_artifact_root
 
 
-def _bundle_artifact_ids(bundle: InputBundle, artifact_root: Path) -> tuple[str, ...]:
+def _bundle_artifact_ids(
+    bundle: InputBundle, bundle_files: Mapping[str, bytes],
+) -> tuple[str, ...]:
     relative_manifests = (
         "splits/manifest.json",
         *(f"training-data/{arm}.manifest.json" for arm in _EXPECTED_ARMS),
     )
     values: list[str] = []
     for relative_path in relative_manifests:
-        path = Path(artifact_root) / relative_path
+        bundle_path = f"{_PORTABLE_ARTIFACT_ROOT.as_posix()}/{relative_path}"
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ValueError(f"bundle manifest is invalid: {path}") from error
+            content = bundle_files[bundle_path]
+            payload = json.loads(content.decode("utf-8"))
+        except (KeyError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"bundle manifest is invalid: {bundle_path}") from error
         artifact_id = payload.get("artifact_id") if isinstance(payload, dict) else None
         if not _is_sha256(artifact_id):
-            raise ValueError(f"bundle manifest artifact_id is missing or malformed: {path}")
+            raise ValueError(
+                f"bundle manifest artifact_id is missing or malformed: {bundle_path}"
+            )
         values.append(str(artifact_id))
     actual = tuple(values)
     if actual != bundle.artifact_ids:
@@ -405,22 +635,28 @@ def _reject_duplicate_artifact_ids(artifact_ids: tuple[str, ...]) -> None:
         raise ValueError("duplicate artifact ID in bundle")
 
 
-def _validate_run_id(
-    run_id: str, config_hash: str, split_id: str, source_hash: str
-) -> None:
-    expected = (
-        f"pilot-s42-cfg-{config_hash[:8]}-split-{split_id[:8]}-src-{source_hash[:12]}"
+def _validate_run_id(plan: PilotPlan) -> None:
+    expected_label = (
+        f"pilot-s42-cfg-{plan.config_hash[:8]}-split-{plan.split_artifact_id[:8]}"
+        f"-src-{plan.source_hash[:12]}"
     )
-    if run_id != expected:
+    expected_digest = pilot_plan_digest(plan)
+    if (
+        plan.canonical_dependency_lock_path != _CANONICAL_DEPENDENCY_LOCK_PATH
+        or plan.run_label != expected_label
+        or plan.plan_digest != expected_digest
+        or plan.run_id != f"{expected_label}-plan-{expected_digest}"
+    ):
         raise ValueError("pilot run ID is noncanonical")
 
 
 def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    target = Path(path)
+    return hashlib.sha256(
+        read_regular_file_at(
+            target.parent, target.name, label="dependency lock file"
+        )
+    ).hexdigest()
 
 
 def _resolve_beneath_repo(repo_root: Path, value: str) -> Path:
@@ -449,12 +685,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Print an immutable pilot plan or its canonical run ID, entirely offline."""
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
-    for command in ("plan", "run-id"):
+    for command in ("plan", "run-id", "stage-a-action"):
         subparser = subcommands.add_parser(command)
         subparser.add_argument("--repo-root", required=True)
         subparser.add_argument("--config", required=True)
         subparser.add_argument("--artifact-root", required=True)
         subparser.add_argument("--dependency-lock", required=True)
+        if command == "stage-a-action":
+            subparser.add_argument("--smoke-receipt-artifact-id", required=True)
+            subparser.add_argument("--model-cache-artifact-id", required=True)
+            mode = subparser.add_mutually_exclusive_group(required=True)
+            mode.add_argument("--fresh", action="store_false", dest="resume")
+            mode.add_argument("--resume", action="store_true", dest="resume")
     arguments = parser.parse_args(argv)
     repo_root = Path(arguments.repo_root).resolve()
     config_path = _resolve_beneath_repo(repo_root, arguments.config)
@@ -463,15 +705,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         repo_root, config_path, artifact_root
     )
     dependency_lock = _resolve_beneath_repo(repo_root, arguments.dependency_lock)
+    canonical_dependency_lock = repo_root / _CANONICAL_DEPENDENCY_LOCK_PATH
+    approved_dependency_lock = canonical_dependency_lock.resolve()
+    if dependency_lock != approved_dependency_lock:
+        raise ValueError("dependency lock must use the exact canonical dependency lock path")
     plan = build_pilot_plan(
         config_path,
         artifact_root,
         bundle=build_input_bundle(repo_root),
         source_hash=hash_source_tree(repo_root),
-        dependency_lock_hash=_file_sha256(dependency_lock),
+        dependency_lock_hash=_file_sha256(canonical_dependency_lock),
     )
     if arguments.command == "run-id":
         print(plan.run_id)
+    elif arguments.command == "stage-a-action":
+        print(canonical_json(approved_stage_a_action_manifest(
+            plan,
+            smoke_receipt_artifact_id=arguments.smoke_receipt_artifact_id,
+            model_cache_artifact_id=arguments.model_cache_artifact_id,
+            resume=arguments.resume,
+        )))
     else:
         payload = pilot_plan_payload(plan)
         payload["action_manifest"] = approval_action_manifest(plan)

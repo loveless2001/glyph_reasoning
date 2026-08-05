@@ -5,14 +5,16 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import chdir, contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -53,6 +55,24 @@ _PILOT_KIND = "pilot"
 _PILOT_SEED = 42
 _WORKSPACE_METADATA = "workspace-metadata.json"
 _DEFAULT_EPHEMERAL_JOB_ROOT = Path("/tmp/phase-marker-pilot")
+PROMOTION_STALE_GRACE_SECONDS = 3_600
+LOCKED_RUNTIME_MODULES = (
+    "accelerate",
+    "datasets",
+    "einops",
+    "huggingface_hub",
+    "modal",
+    "numpy",
+    "peft",
+    "google.protobuf",
+    "safetensors",
+    "sentencepiece",
+    "statsmodels",
+    "tokenizers",
+    "torch",
+    "transformers",
+    "vllm",
+)
 _MODEL_CACHE_REQUIRED_FILES = (
     "config.json",
     "generation_config.json",
@@ -86,9 +106,12 @@ _PLAN_PAYLOAD_FIELDS = frozenset(
         "model_revision",
         "source_hash",
         "dependency_lock_hash",
+        "canonical_dependency_lock_path",
         "bundle_id",
         "resources",
         "jobs",
+        "run_label",
+        "plan_digest",
         "run_id",
     }
 )
@@ -197,6 +220,9 @@ class AttemptReceipt:
     source_hash: str
     dependency_lock_hash: str
     model_cache_artifact_id: str
+    stage_a_action_digest: str
+    stage_a_resume: bool
+    smoke_receipt_artifact_id: str
     requested_gpu: str
     observed_gpu: str | None
     started_at: str
@@ -209,7 +235,23 @@ class AttemptReceipt:
     expected_outputs: tuple[str, ...]
     output_hashes: tuple[str, ...]
     failure_reason: str | None
+    plan_digest: str
+    config_hash: str
+    split_artifact_id: str
+    materialization_artifact_ids: tuple[str, ...]
+    model_revision: str
+    modal_app_id: str
+    modal_app_name: str
+    modal_function_name: str
+    modal_function_call_id: str
+    modal_input_id: str
+    python_version: str
+    torch_version: str
+    cuda_runtime_version: str
+    cuda_driver_version: str
+    runtime_versions: tuple[tuple[str, str], ...]
     artifact_id: str
+    failure_stage: str | None = None
 
     def recomputed_artifact_id(self) -> str:
         """Return the receipt identity from every immutable field but itself."""
@@ -242,7 +284,7 @@ def prepare_ephemeral_workspace(
 
     code = Path(code_root).resolve()
     inputs = Path(input_root).resolve()
-    validate_bundle_at_root(bundle, inputs)
+    bundle_files = read_bundle_files_at_root(bundle, inputs)
     python = code / ".venv/bin/python"
     package = code / "phase_marker"
     if not python.is_file() or not package.is_dir():
@@ -265,7 +307,7 @@ def prepare_ephemeral_workspace(
     for item in bundle.files:
         destination = workspace / item.path
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(inputs / item.path, destination)
+        destination.write_bytes(bundle_files[item.path])
         destination.chmod(0o444)
     if canonical_training_root is not None:
         training = Path(canonical_training_root).resolve()
@@ -366,6 +408,10 @@ def promote_validated_output(
     attempt_root: Path,
     canonical_root: Path,
     receipt: AttemptReceipt,
+    *,
+    lease_created_at: datetime | None = None,
+    retain_lease: bool = False,
+    lease_durability_barrier: Callable[[], None] | None = None,
 ) -> Path:
     """Copy an accepted output into its attempt namespace, then atomically promote it."""
     _validate_receipt(receipt)
@@ -392,11 +438,14 @@ def promote_validated_output(
 
     target.parent.mkdir(parents=True, exist_ok=True)
     lock = target.parent / f".{target.name}.promotion.lock"
+    lease = _promotion_lease_payload(receipt, created_at=lease_created_at)
     try:
-        lock.touch(exist_ok=False)
+        _write_canonical_json_exclusive(lock, lease)
     except FileExistsError as error:
         raise FileExistsError("canonical promotion is already in progress") from error
     try:
+        if lease_durability_barrier is not None:
+            lease_durability_barrier()
         if target.exists():
             raise FileExistsError("canonical output already exists")
         staged.replace(target)
@@ -419,18 +468,236 @@ def promote_validated_output(
                 f"{type(lock_error).__name__}: {lock_error}"
             )
         raise
-    try:
-        lock.unlink(missing_ok=True)
-    except Exception as error:
-        _restore_failed_job_promotion(
-            error=error,
-            published=True,
-            target=target,
-            attempt_root=root,
-            lock=lock,
-        )
-        raise
+    if not retain_lease:
+        try:
+            lock.unlink(missing_ok=True)
+        except Exception as error:
+            _restore_failed_job_promotion(
+                error=error,
+                published=True,
+                target=target,
+                attempt_root=root,
+                lock=lock,
+            )
+            raise
     return target
+
+
+def release_promotion_lease(
+    canonical_root: Path, receipt: AttemptReceipt,
+) -> None:
+    """Release only the exact authenticated lease owned by a durable receipt."""
+    _validate_receipt(receipt)
+    target = Path(canonical_root)
+    lock = target.parent / f".{target.name}.promotion.lock"
+    content = _read_regular_file_at(lock.parent, lock.name, label="promotion lease")
+    lease = load_promotion_lease_payload(content)
+    expected = {
+        "run_id": receipt.run_id,
+        "plan_digest": receipt.plan_digest,
+        "stage": receipt.stage,
+        "arm": receipt.arm,
+        "owner_attempt_id": receipt.attempt_id,
+        "owner_receipt_artifact_id": receipt.artifact_id,
+        "owner_stage_a_action_digest": receipt.stage_a_action_digest,
+        "modal_app_id": receipt.modal_app_id,
+        "modal_app_name": receipt.modal_app_name,
+        "modal_function_name": receipt.modal_function_name,
+        "modal_function_call_id": receipt.modal_function_call_id,
+        "modal_input_id": receipt.modal_input_id,
+    }
+    if any(lease.get(name) != value for name, value in expected.items()):
+        raise ValueError("promotion lease is not owned by the durable receipt")
+    lock.unlink()
+
+
+_PROMOTION_LEASE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "run_id",
+        "plan_digest",
+        "stage",
+        "arm",
+        "owner_attempt_id",
+        "owner_receipt_artifact_id",
+        "owner_stage_a_action_digest",
+        "producer_path",
+        "receipt_path",
+        "lease_path",
+        "modal_app_id",
+        "modal_app_name",
+        "modal_function_name",
+        "modal_function_call_id",
+        "modal_input_id",
+        "owner_started_at",
+        "owner_timeout_seconds",
+        "lease_created_at",
+        "stale_grace_seconds",
+        "recover_after",
+        "artifact_id",
+    }
+)
+
+
+def _promotion_lease_payload(
+    receipt: AttemptReceipt, *, created_at: datetime | None = None,
+) -> dict[str, object]:
+    """Build the exact self-authenticating owner lease for one promotion."""
+    _validate_receipt(receipt)
+    created = datetime.now(timezone.utc) if created_at is None else created_at
+    if created.tzinfo is None or created.utcoffset() is None:
+        raise ValueError("promotion lease clock must be timezone-aware")
+    created = created.astimezone(timezone.utc)
+    try:
+        owner_started = datetime.fromisoformat(receipt.started_at).astimezone(
+            timezone.utc
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("promotion lease owner start time is invalid") from error
+    recover_after = owner_started + timedelta(
+        seconds=receipt.timeout_seconds + PROMOTION_STALE_GRACE_SECONDS
+    )
+    if created < owner_started or created >= recover_after:
+        raise ValueError("promotion lease creation time is outside its owner deadline")
+    producer_path = (
+        f"/runs/{receipt.run_id}/"
+        f"{_producer_relative_path(receipt.stage, receipt.arm).as_posix()}"
+    )
+    receipt_path = (
+        f"/runs/{receipt.run_id}/receipts/canonical/"
+        f"{receipt.stage}/{receipt.arm}.json"
+    )
+    lease_path = (
+        f"{PurePosixPath(producer_path).parent}/"
+        f".{receipt.arm}.promotion.lock"
+    )
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "stage-a-promotion-lease",
+        "run_id": receipt.run_id,
+        "plan_digest": receipt.plan_digest,
+        "stage": receipt.stage,
+        "arm": receipt.arm,
+        "owner_attempt_id": receipt.attempt_id,
+        "owner_receipt_artifact_id": receipt.artifact_id,
+        "owner_stage_a_action_digest": receipt.stage_a_action_digest,
+        "producer_path": producer_path,
+        "receipt_path": receipt_path,
+        "lease_path": lease_path,
+        "modal_app_id": receipt.modal_app_id,
+        "modal_app_name": receipt.modal_app_name,
+        "modal_function_name": receipt.modal_function_name,
+        "modal_function_call_id": receipt.modal_function_call_id,
+        "modal_input_id": receipt.modal_input_id,
+        "owner_started_at": owner_started.isoformat(timespec="microseconds"),
+        "owner_timeout_seconds": receipt.timeout_seconds,
+        "lease_created_at": created.isoformat(timespec="microseconds"),
+        "stale_grace_seconds": PROMOTION_STALE_GRACE_SECONDS,
+        "recover_after": recover_after.isoformat(timespec="microseconds"),
+    }
+    payload["artifact_id"] = sha256_json(payload)
+    return payload
+
+
+def load_promotion_lease_payload(content: bytes) -> dict[str, object]:
+    """Parse and authenticate one exact Stage-A promotion lease."""
+    if not isinstance(content, bytes):
+        raise TypeError("promotion lease content must be bytes")
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("promotion lease is malformed") from error
+    if not isinstance(payload, Mapping) or set(payload) != _PROMOTION_LEASE_FIELDS:
+        raise ValueError("promotion lease fields are invalid")
+    unsigned = dict(payload)
+    artifact_id = unsigned.pop("artifact_id", None)
+    try:
+        owner_started = datetime.fromisoformat(str(payload["owner_started_at"]))
+        created = datetime.fromisoformat(str(payload["lease_created_at"]))
+        recover_after = datetime.fromisoformat(str(payload["recover_after"]))
+    except (TypeError, ValueError) as error:
+        raise ValueError("promotion lease timestamps are invalid") from error
+    identity_values = (
+        payload.get("run_id"),
+        payload.get("stage"),
+        payload.get("arm"),
+        payload.get("owner_attempt_id"),
+        payload.get("producer_path"),
+        payload.get("receipt_path"),
+        payload.get("lease_path"),
+        payload.get("modal_app_id"),
+        payload.get("modal_app_name"),
+        payload.get("modal_function_name"),
+        payload.get("modal_function_call_id"),
+        payload.get("modal_input_id"),
+    )
+    try:
+        owner_uuid = uuid.UUID(str(payload.get("owner_attempt_id")))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("promotion lease owner attempt is invalid") from error
+    run_id = str(payload.get("run_id"))
+    stage = str(payload.get("stage"))
+    arm = str(payload.get("arm"))
+    expected_producer = (
+        f"/runs/{run_id}/{_producer_relative_path(stage, arm).as_posix()}"
+        if stage in {"train", "selection"} and arm in _ARMS
+        else ""
+    )
+    expected_receipt = f"/runs/{run_id}/receipts/canonical/{stage}/{arm}.json"
+    expected_lease = (
+        f"{PurePosixPath(expected_producer).parent}/.{arm}.promotion.lock"
+        if expected_producer
+        else ""
+    )
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("kind") != "stage-a-promotion-lease"
+        or not _is_sha256(payload.get("plan_digest"))
+        or not _is_sha256(payload.get("owner_receipt_artifact_id"))
+        or not _is_sha256(payload.get("owner_stage_a_action_digest"))
+        or payload.get("stage") not in {"train", "selection"}
+        or payload.get("arm") not in _ARMS
+        or owner_uuid.version != 4
+        or str(owner_uuid) != payload.get("owner_attempt_id")
+        or payload.get("producer_path") != expected_producer
+        or payload.get("receipt_path") != expected_receipt
+        or payload.get("lease_path") != expected_lease
+        or not all(
+            isinstance(value, str)
+            and bool(value)
+            and "\n" not in value
+            and "\r" not in value
+            for value in identity_values
+        )
+        or payload.get("modal_app_name") != "phase-marker-pilot-stage-a"
+        or payload.get("modal_function_name")
+        != (
+            "run_training_job"
+            if payload.get("stage") == "train"
+            else "run_selection_job"
+        )
+        or any(
+            value.tzinfo is None
+            or value.utcoffset() != timedelta(0)
+            for value in (owner_started, created, recover_after)
+        )
+        or payload.get("owner_started_at")
+        != owner_started.isoformat(timespec="microseconds")
+        or payload.get("lease_created_at")
+        != created.isoformat(timespec="microseconds")
+        or payload.get("recover_after")
+        != recover_after.isoformat(timespec="microseconds")
+        or payload.get("owner_timeout_seconds") != 14_400
+        or payload.get("stale_grace_seconds") != PROMOTION_STALE_GRACE_SECONDS
+        or recover_after - owner_started
+        != timedelta(seconds=14_400 + PROMOTION_STALE_GRACE_SECONDS)
+        or not (owner_started <= created < recover_after)
+        or not _is_sha256(artifact_id)
+        or artifact_id != sha256_json(unsigned)
+    ):
+        raise ValueError("promotion lease identity is invalid")
+    return dict(payload)
 
 
 def _restore_failed_job_promotion(
@@ -478,6 +745,8 @@ def execute_pilot_job(
     model_root: Path,
     run_root: Path,
     volume: VolumeClient,
+    execution_provenance: Mapping[str, object],
+    stage_a_approval: Mapping[str, object],
     ephemeral_root: Path = _DEFAULT_EPHEMERAL_JOB_ROOT,
     environ: Mapping[str, str] | None = None,
     producer_validator: Callable[..., None] | None = None,
@@ -488,6 +757,8 @@ def execute_pilot_job(
         raise ValueError("pilot job stage is invalid")
     _validate_pilot_plan_payload(plan_payload)
     job = _validate_stage_job_payload(stage, plan_payload, job_payload)
+    provenance = _validate_execution_provenance(execution_provenance, stage=stage)
+    approval = _validated_stage_a_approval(plan_payload, stage_a_approval)
 
     code = Path(code_root).resolve()
     if hash_source_tree(code) != plan_payload["source_hash"]:
@@ -503,6 +774,8 @@ def execute_pilot_job(
     validate_bundle_at_root(bundle, bundle_root)
 
     snapshot, cache_manifest = _validated_model_cache(model_root)
+    if cache_manifest.artifact_id != approval["model_cache_artifact_id"]:
+        raise ValueError("pilot job model cache does not match Stage A approval")
 
     attempt_id = create_attempt_id()
     run_mount = Path(run_root).resolve()
@@ -521,9 +794,11 @@ def execute_pilot_job(
     observed_gpu: str | None = None
     exit_status = 1
     published = False
+    durably_published = False
     attempt_receipt_path: Path | None = None
     canonical_receipt_path: Path | None = None
     failed_records: tuple[tuple[str, str], ...] = ()
+    failure_stage = "workspace-setup"
     try:
         if (
             ephemeral == run_mount
@@ -553,6 +828,7 @@ def execute_pilot_job(
                 )
                 if prepared.resolve() != workspace.resolve():
                     raise ValueError("pilot attempt workspace path is noncanonical")
+                failure_stage = "runtime-validation"
                 _require_one_visible_cuda_device(command_env)
                 observed_gpu = _observe_gpu_name()
                 if not _is_approved_observed_gpu(observed_gpu):
@@ -571,6 +847,7 @@ def execute_pilot_job(
                         "HF_HUB_CACHE": str(snapshot.parents[2]),
                     }
                 )
+                failure_stage = "command"
                 exit_status = run_exact_command(
                     command,
                     workspace=workspace,
@@ -582,6 +859,7 @@ def execute_pilot_job(
                     raise RuntimeError(
                         f"{stage} job for {job['arm']} exited with status {exit_status}"
                     )
+                failure_stage = "producer-validation"
                 validator = (
                     _validate_job_producer
                     if producer_validator is None
@@ -602,6 +880,7 @@ def execute_pilot_job(
                     attempt_id=attempt_id,
                     command=command,
                     cache_artifact_id=cache_manifest.artifact_id,
+                    stage_a_approval=approval,
                     observed_gpu=observed_gpu,
                     started=started,
                     elapsed_seconds=max(0.0, time.monotonic() - started_clock),
@@ -610,13 +889,29 @@ def execute_pilot_job(
                     promoted=True,
                     records=records,
                     failure_reason=None,
+                    failure_stage=None,
+                    provenance=provenance,
                 )
-                promote_validated_output(producer, attempt_root, canonical, receipt)
+                failure_stage = "promotion"
+                promote_validated_output(
+                    producer,
+                    attempt_root,
+                    canonical,
+                    receipt,
+                    retain_lease=True,
+                    lease_durability_barrier=volume.commit,
+                )
                 published = True
+                failure_stage = "receipt-publication"
                 attempt_receipt_path = _write_attempt_receipt_in_namespace(run, receipt)
                 canonical_receipt_path = _link_canonical_receipt(
                     run, receipt, attempt_receipt_path
                 )
+                failure_stage = "commit"
+                volume.commit()
+                durably_published = True
+                failure_stage = "lease-release"
+                release_promotion_lease(canonical, receipt)
                 volume.commit()
                 return _receipt_payload(receipt, include_artifact_id=True)
             except Exception:
@@ -629,6 +924,14 @@ def execute_pilot_job(
     except Exception as error:
         if isinstance(error, _JobPublicationRollbackError):
             _append_failure_log(log_path, error)
+            raise
+        if durably_published:
+            _append_failure_log(log_path, error)
+            error.add_note(
+                "canonical producer and receipts were durably committed; "
+                "lease cleanup durability is uncertain, so inspect status and "
+                "use expiry-safe recovery if the authenticated lease remains"
+            )
             raise
         try:
             _quarantine_failed_job_publication(
@@ -646,6 +949,7 @@ def execute_pilot_job(
                 attempt_id=attempt_id,
                 command=command,
                 cache_artifact_id=cache_manifest.artifact_id,
+                stage_a_approval=approval,
                 observed_gpu=observed_gpu,
                 started=started,
                 elapsed_seconds=max(0.0, time.monotonic() - started_clock),
@@ -654,6 +958,8 @@ def execute_pilot_job(
                 promoted=False,
                 records=failed_records,
                 failure_reason=f"{type(error).__name__}: {error}",
+                failure_stage=failure_stage,
+                provenance=provenance,
             )
             _write_attempt_receipt_in_namespace(run, failed)
             volume.commit()
@@ -673,6 +979,7 @@ def _job_attempt_receipt(
     attempt_id: str,
     command: str,
     cache_artifact_id: str,
+    stage_a_approval: Mapping[str, object],
     observed_gpu: str | None,
     started: datetime,
     elapsed_seconds: float,
@@ -681,6 +988,8 @@ def _job_attempt_receipt(
     promoted: bool,
     records: tuple[tuple[str, str], ...],
     failure_reason: str | None,
+    failure_stage: str | None,
+    provenance: Mapping[str, object],
 ) -> AttemptReceipt:
     receipt = AttemptReceipt(
         schema_version=1,
@@ -695,6 +1004,11 @@ def _job_attempt_receipt(
         source_hash=str(plan_payload["source_hash"]),
         dependency_lock_hash=str(plan_payload["dependency_lock_hash"]),
         model_cache_artifact_id=cache_artifact_id,
+        stage_a_action_digest=str(stage_a_approval["approval_digest"]),
+        stage_a_resume=bool(stage_a_approval["resume"]),
+        smoke_receipt_artifact_id=str(
+            stage_a_approval["smoke_receipt_artifact_id"]
+        ),
         requested_gpu="H100",
         observed_gpu=observed_gpu,
         started_at=started.isoformat(),
@@ -707,7 +1021,28 @@ def _job_attempt_receipt(
         expected_outputs=tuple(path for path, _ in records),
         output_hashes=tuple(digest for _, digest in records),
         failure_reason=failure_reason,
+        plan_digest=str(plan_payload["plan_digest"]),
+        config_hash=str(plan_payload["config_hash"]),
+        split_artifact_id=str(plan_payload["split_artifact_id"]),
+        materialization_artifact_ids=tuple(
+            str(value) for value in plan_payload["materialization_artifact_ids"]
+        ),
+        model_revision=str(plan_payload["model_revision"]),
+        modal_app_id=str(provenance["modal_app_id"]),
+        modal_app_name=str(provenance["modal_app_name"]),
+        modal_function_name=str(provenance["modal_function_name"]),
+        modal_function_call_id=str(provenance["modal_function_call_id"]),
+        modal_input_id=str(provenance["modal_input_id"]),
+        python_version=str(provenance["python_version"]),
+        torch_version=str(provenance["torch_version"]),
+        cuda_runtime_version=str(provenance["cuda_runtime_version"]),
+        cuda_driver_version=str(provenance["cuda_driver_version"]),
+        runtime_versions=tuple(
+            (str(item["module"]), str(item["version"]))
+            for item in provenance["runtime_versions"]
+        ),
         artifact_id="",
+        failure_stage=failure_stage,
     )
     return AttemptReceipt(
         **{**asdict(receipt), "artifact_id": receipt.recomputed_artifact_id()}
@@ -740,6 +1075,9 @@ def _quarantine_failed_job_publication(
         attempt_receipt_path.replace(quarantine / "success-receipt.json")
     if published:
         canonical.replace(quarantine / "producer")
+        promotion_lease = canonical.parent / f".{canonical.name}.promotion.lock"
+        if promotion_lease.exists():
+            promotion_lease.replace(quarantine / "promotion.lock")
 
 
 def _validate_stage_job_payload(
@@ -764,8 +1102,73 @@ def _validate_stage_job_payload(
         if stage == "train"
         else _workspace_selection_command(str(normalized["arm"]))
     )
-    if shlex.split(str(command), posix=True) != expected:
+    if str(command) != shlex.join(expected):
         raise ValueError("pilot job command does not match the approved plan")
+    return normalized
+
+
+def _validate_execution_provenance(
+    payload: Mapping[str, object], *, stage: str,
+) -> dict[str, object]:
+    """Validate injected Modal/runtime provenance before any model work."""
+    fields = {
+        "modal_app_id",
+        "modal_app_name",
+        "modal_function_name",
+        "modal_function_call_id",
+        "modal_input_id",
+        "python_version",
+        "torch_version",
+        "cuda_runtime_version",
+        "cuda_driver_version",
+        "runtime_versions",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != fields:
+        raise ValueError("execution provenance fields are invalid")
+    expected_function = {
+        "train": "run_training_job",
+        "selection": "run_selection_job",
+        "smoke": "smoke_remote",
+        "finalizer": "finalize_stage_a_remote",
+    }.get(stage)
+    if expected_function is None:
+        raise ValueError("execution provenance stage is invalid")
+    scalar_fields = fields - {"runtime_versions"}
+    if (
+        any(
+            not isinstance(payload[name], str)
+            or not payload[name]
+            or "\n" in payload[name]
+            or "\r" in payload[name]
+            for name in scalar_fields
+        )
+        or payload["modal_app_name"] != "phase-marker-pilot-stage-a"
+        or payload["modal_function_name"] != expected_function
+    ):
+        raise ValueError("execution provenance identity is invalid")
+    versions = payload["runtime_versions"]
+    if (
+        not isinstance(versions, (list, tuple))
+        or len(versions) != len(LOCKED_RUNTIME_MODULES)
+    ):
+        raise ValueError("execution runtime versions are invalid")
+    normalized_versions: list[dict[str, str]] = []
+    for expected_module, item in zip(LOCKED_RUNTIME_MODULES, versions, strict=True):
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"module", "version"}
+            or item["module"] != expected_module
+            or not isinstance(item["version"], str)
+            or not item["version"]
+            or "\n" in item["version"]
+            or "\r" in item["version"]
+        ):
+            raise ValueError("execution runtime versions are invalid")
+        normalized_versions.append(
+            {"module": expected_module, "version": str(item["version"])}
+        )
+    normalized = dict(payload)
+    normalized["runtime_versions"] = normalized_versions
     return normalized
 
 
@@ -908,7 +1311,7 @@ def validate_canonical_job_semantics(
     bundle = build_input_bundle(local)
     if bundle.bundle_id != plan_payload["bundle_id"]:
         raise ValueError("local resume inputs no longer match the approved bundle")
-    validate_bundle_at_root(bundle, local)
+    bundle_files = read_bundle_files_at_root(bundle, local)
     if stage == "selection" and not canonical_training_files:
         raise ValueError("canonical selection lacks its semantic training parent")
     if stage == "train" and canonical_training_files is not None:
@@ -917,10 +1320,9 @@ def validate_canonical_job_semantics(
     with tempfile.TemporaryDirectory(prefix="phase-marker-resume-") as temporary:
         workspace = Path(temporary)
         for relative in INPUT_ALLOWLIST:
-            source = local / relative
             destination = workspace / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
+            destination.write_bytes(bundle_files[relative])
         producer = workspace / _producer_relative_path(stage, str(job["arm"]))
         _write_semantic_file_view(producer, producer_files)
         if canonical_training_files is not None:
@@ -1031,11 +1433,22 @@ def load_attempt_receipt_payload(payload: Mapping[str, object]) -> AttemptReceip
     if not isinstance(payload, Mapping) or set(payload) != fields:
         raise ValueError("attempt receipt fields are invalid")
     normalized = dict(payload)
-    for name in ("expected_outputs", "output_hashes"):
+    for name in (
+        "expected_outputs", "output_hashes", "materialization_artifact_ids"
+    ):
         value = normalized[name]
         if not isinstance(value, (list, tuple)):
             raise ValueError("attempt receipt output records are invalid")
         normalized[name] = tuple(value)
+    runtime_versions = normalized["runtime_versions"]
+    if not isinstance(runtime_versions, (list, tuple)):
+        raise ValueError("attempt receipt runtime versions are invalid")
+    normalized_runtime: list[tuple[str, str]] = []
+    for item in runtime_versions:
+        if not isinstance(item, Mapping) or set(item) != {"module", "version"}:
+            raise ValueError("attempt receipt runtime versions are invalid")
+        normalized_runtime.append((item["module"], item["version"]))
+    normalized["runtime_versions"] = tuple(normalized_runtime)
     try:
         receipt = AttemptReceipt(**normalized)
     except TypeError as error:
@@ -1050,11 +1463,17 @@ def validate_job_receipt_payload(
     plan_payload: Mapping[str, object],
     job_payload: Mapping[str, object],
     stage: str,
+    stage_a_approval: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Fail closed unless a successful receipt binds the exact plan, job, and stage."""
     _validate_pilot_plan_payload(plan_payload)
     job = _validate_stage_job_payload(stage, plan_payload, job_payload)
     receipt = load_attempt_receipt_payload(receipt_payload)
+    approval = (
+        None
+        if stage_a_approval is None
+        else _validated_stage_a_approval(plan_payload, stage_a_approval)
+    )
     command = str(job["training_command"] if stage == "train" else job["selection_command"])
     if (
         receipt.run_id != plan_payload["run_id"]
@@ -1066,6 +1485,12 @@ def validate_job_receipt_payload(
         or receipt.command_hash != hashlib.sha256(command.encode("utf-8")).hexdigest()
         or receipt.source_hash != plan_payload["source_hash"]
         or receipt.dependency_lock_hash != plan_payload["dependency_lock_hash"]
+        or receipt.plan_digest != plan_payload["plan_digest"]
+        or receipt.config_hash != plan_payload["config_hash"]
+        or receipt.split_artifact_id != plan_payload["split_artifact_id"]
+        or list(receipt.materialization_artifact_ids)
+        != plan_payload["materialization_artifact_ids"]
+        or receipt.model_revision != plan_payload["model_revision"]
         or receipt.requested_gpu != "H100"
         or receipt.observed_gpu is None
         or not _is_approved_observed_gpu(receipt.observed_gpu)
@@ -1074,6 +1499,18 @@ def validate_job_receipt_payload(
         or receipt.validated is not True
         or receipt.promoted is not True
         or receipt.failure_reason is not None
+        or receipt.failure_stage is not None
+        or (
+            approval is not None
+            and (
+                receipt.stage_a_action_digest != approval["approval_digest"]
+                or receipt.stage_a_resume is not approval["resume"]
+                or receipt.smoke_receipt_artifact_id
+                != approval["smoke_receipt_artifact_id"]
+                or receipt.model_cache_artifact_id
+                != approval["model_cache_artifact_id"]
+            )
+        )
     ):
         raise ValueError(f"{stage} receipt does not match approved job {job['arm']}")
     required = (
@@ -1093,6 +1530,7 @@ def validate_canonical_job_output(
     plan_payload: Mapping[str, object],
     job_payload: Mapping[str, object],
     stage: str,
+    stage_a_approval: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Revalidate one canonical receipt, complete producer tree, and producer manifest."""
     validated = validate_job_receipt_payload(
@@ -1100,6 +1538,7 @@ def validate_canonical_job_output(
         plan_payload=plan_payload,
         job_payload=job_payload,
         stage=stage,
+        stage_a_approval=stage_a_approval,
     )
     receipt = load_attempt_receipt_payload(validated)
     if not isinstance(producer_files, Mapping) or not producer_files:
@@ -1159,9 +1598,17 @@ _STAGE_A_SUMMARY_FIELDS = frozenset(
         "schema_version",
         "stage",
         "run_id",
+        "plan_digest",
+        "stage_a_action_digest",
+        "stage_a_resume",
+        "smoke_receipt_artifact_id",
+        "model_cache_artifact_id",
+        "receipt_approval_history",
         "training_receipt_ids",
         "selection_receipt_ids",
         "behavior_gate_checked_artifact_ids",
+        "elapsed_gpu_seconds",
+        "finalizer_provenance",
         "next_command",
         "stopped_before_behavior",
         "artifact_id",
@@ -1175,6 +1622,7 @@ def validate_stage_a_summary(
     plan_payload: Mapping[str, object],
     training_receipts: tuple[Mapping[str, object], ...],
     selection_receipts: tuple[Mapping[str, object], ...],
+    stage_a_approval: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Validate the compact, inert Stage A stop envelope."""
     _validate_pilot_plan_payload(plan_payload)
@@ -1183,14 +1631,62 @@ def validate_stage_a_summary(
     training_ids = [receipt.get("artifact_id") for receipt in training_receipts]
     selection_ids = [receipt.get("artifact_id") for receipt in selection_receipts]
     checked = summary["behavior_gate_checked_artifact_ids"]
+    training_elapsed = _receipt_elapsed_seconds(training_receipts)
+    selection_elapsed = _receipt_elapsed_seconds(selection_receipts)
+    expected_elapsed = {
+        "training": training_elapsed,
+        "selection": selection_elapsed,
+        "total": math.fsum((training_elapsed, selection_elapsed)),
+    }
+    try:
+        finalizer_provenance = _validate_execution_provenance(
+            summary["finalizer_provenance"], stage="finalizer"
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("Stage A summary finalizer provenance is invalid") from error
+    summary_approval = {
+        "schema_version": 1,
+        "action": "run-stage-a",
+        "plan_digest": summary.get("plan_digest"),
+        "approval_digest": summary.get("stage_a_action_digest"),
+        "resume": summary.get("stage_a_resume"),
+        "smoke_receipt_artifact_id": summary.get("smoke_receipt_artifact_id"),
+        "model_cache_artifact_id": summary.get("model_cache_artifact_id"),
+    }
+    try:
+        validated_approval = _validated_stage_a_approval(
+            plan_payload, summary_approval
+        )
+        expected_approval = (
+            validated_approval
+            if stage_a_approval is None
+            else _validated_stage_a_approval(plan_payload, stage_a_approval)
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("Stage A summary approval provenance is invalid") from error
+    receipt_matrix = (*training_receipts, *selection_receipts)
+    expected_approval_history = _receipt_approval_history(receipt_matrix)
     if (
         summary["schema_version"] != 1
         or summary["stage"] != "stage-a"
         or summary["run_id"] != plan_payload["run_id"]
+        or summary["plan_digest"] != plan_payload["plan_digest"]
+        or validated_approval != expected_approval
+        or summary["receipt_approval_history"] != expected_approval_history
+        or any(
+            receipt.get("plan_digest") != plan_payload["plan_digest"]
+            or receipt.get("smoke_receipt_artifact_id")
+            != validated_approval["smoke_receipt_artifact_id"]
+            or receipt.get("model_cache_artifact_id")
+            != validated_approval["model_cache_artifact_id"]
+            for receipt in receipt_matrix
+        )
         or summary["training_receipt_ids"] != training_ids
         or summary["selection_receipt_ids"] != selection_ids
         or not isinstance(checked, list)
         or not all(_is_sha256(value) for value in checked)
+        or summary["elapsed_gpu_seconds"] != expected_elapsed
+        or summary["finalizer_provenance"] != finalizer_provenance
         or not isinstance(summary["next_command"], str)
         or not summary["next_command"]
         or summary["stopped_before_behavior"] is not True
@@ -1204,6 +1700,49 @@ def validate_stage_a_summary(
     return dict(summary)
 
 
+def _receipt_elapsed_seconds(
+    receipts: Sequence[Mapping[str, object]],
+) -> float:
+    values: list[float] = []
+    for receipt in receipts:
+        value = receipt.get("elapsed_seconds")
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            raise ValueError("Stage A receipt elapsed GPU time is invalid")
+        values.append(float(value))
+    return math.fsum(values)
+
+
+def _receipt_approval_history(
+    receipts: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Group every canonical receipt under the exact approval that produced it."""
+    grouped: dict[tuple[str, bool], list[str]] = {}
+    for receipt in receipts:
+        digest = receipt.get("stage_a_action_digest")
+        resume = receipt.get("stage_a_resume")
+        artifact_id = receipt.get("artifact_id")
+        if (
+            not _is_sha256(digest)
+            or not isinstance(resume, bool)
+            or not _is_sha256(artifact_id)
+        ):
+            raise ValueError("Stage A receipt approval history is invalid")
+        grouped.setdefault((str(digest), resume), []).append(str(artifact_id))
+    return [
+        {
+            "stage_a_action_digest": digest,
+            "stage_a_resume": resume,
+            "receipt_artifact_ids": sorted(artifact_ids),
+        }
+        for (digest, resume), artifact_ids in sorted(grouped.items())
+    ]
+
+
 def finalize_stage_a(
     *,
     plan_payload: Mapping[str, object],
@@ -1212,10 +1751,16 @@ def finalize_stage_a(
     model_root: Path,
     run_root: Path,
     volume: VolumeClient,
+    execution_provenance: Mapping[str, object],
+    stage_a_approval: Mapping[str, object],
     behavior_gate: Callable[..., Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Validate the complete Stage A matrix and publish a mandatory stop summary."""
     _validate_pilot_plan_payload(plan_payload)
+    approval = _validated_stage_a_approval(plan_payload, stage_a_approval)
+    provenance = _validate_execution_provenance(
+        execution_provenance, stage="finalizer"
+    )
     snapshot, cache_manifest = _validated_model_cache(model_root)
     jobs = plan_payload["jobs"]
     assert isinstance(jobs, list)
@@ -1250,6 +1795,14 @@ def finalize_stage_a(
         for receipt in (*training, *selection)
     ):
         raise ValueError("Stage A receipts do not bind the validated model cache")
+    if any(
+        receipt["smoke_receipt_artifact_id"]
+        != approval["smoke_receipt_artifact_id"]
+        or receipt["model_cache_artifact_id"]
+        != approval["model_cache_artifact_id"]
+        for receipt in (*training, *selection)
+    ):
+        raise ValueError("Stage A receipts do not bind the approved dependencies")
 
     gate_function = (
         _run_behavior_prerequisite_gate if behavior_gate is None else behavior_gate
@@ -1282,9 +1835,23 @@ def finalize_stage_a(
         "schema_version": 1,
         "stage": "stage-a",
         "run_id": plan_payload["run_id"],
+        "plan_digest": plan_payload["plan_digest"],
+        "stage_a_action_digest": approval["approval_digest"],
+        "stage_a_resume": approval["resume"],
+        "smoke_receipt_artifact_id": approval["smoke_receipt_artifact_id"],
+        "model_cache_artifact_id": approval["model_cache_artifact_id"],
+        "receipt_approval_history": _receipt_approval_history(
+            (*training, *selection)
+        ),
         "training_receipt_ids": [receipt["artifact_id"] for receipt in training],
         "selection_receipt_ids": [receipt["artifact_id"] for receipt in selection],
         "behavior_gate_checked_artifact_ids": list(checked),
+        "elapsed_gpu_seconds": {
+            "training": _receipt_elapsed_seconds(training),
+            "selection": _receipt_elapsed_seconds(selection),
+            "total": _receipt_elapsed_seconds((*training, *selection)),
+        },
+        "finalizer_provenance": provenance,
         "next_command": commands[0],
         "stopped_before_behavior": True,
     }
@@ -1294,6 +1861,7 @@ def finalize_stage_a(
         plan_payload=plan_payload,
         training_receipts=training,
         selection_receipts=selection,
+        stage_a_approval=approval,
     )
     run = Path(run_root).resolve() / "runs" / str(plan_payload["run_id"])
     run.mkdir(parents=True, exist_ok=True)
@@ -1310,6 +1878,7 @@ def finalize_stage_a(
             plan_payload=plan_payload,
             training_receipts=training,
             selection_receipts=selection,
+            stage_a_approval=approval,
         )
         if revalidated != validated:
             raise ValueError("existing Stage A summary conflicts with current validation")
@@ -1418,6 +1987,13 @@ def _receipt_payload(receipt: AttemptReceipt, *, include_artifact_id: bool) -> d
     payload = asdict(receipt)
     payload["expected_outputs"] = list(receipt.expected_outputs)
     payload["output_hashes"] = list(receipt.output_hashes)
+    payload["materialization_artifact_ids"] = list(
+        receipt.materialization_artifact_ids
+    )
+    payload["runtime_versions"] = [
+        {"module": module, "version": version}
+        for module, version in receipt.runtime_versions
+    ]
     if not include_artifact_id:
         payload.pop("artifact_id")
     return payload
@@ -1495,6 +2071,12 @@ def _validate_receipt(receipt: AttemptReceipt) -> None:
             receipt.source_hash,
             receipt.dependency_lock_hash,
             receipt.model_cache_artifact_id,
+            receipt.stage_a_action_digest,
+            receipt.smoke_receipt_artifact_id,
+            receipt.plan_digest,
+            receipt.config_hash,
+            receipt.split_artifact_id,
+            *receipt.materialization_artifact_ids,
             receipt.artifact_id,
             *receipt.output_hashes,
         )
@@ -1506,6 +2088,44 @@ def _validate_receipt(receipt: AttemptReceipt) -> None:
         receipt.validated is False
         and receipt.expected_outputs == ()
         and receipt.output_hashes == ()
+    )
+    failure_stages = {
+        "workspace-setup",
+        "runtime-validation",
+        "command",
+        "producer-validation",
+        "promotion",
+        "receipt-publication",
+        "commit",
+    }
+    post_command_failure_stages = {
+        "producer-validation", "promotion", "receipt-publication", "commit"
+    }
+    expected_function = (
+        "run_training_job" if receipt.stage == "train" else "run_selection_job"
+    )
+    runtime_versions_valid = (
+        isinstance(receipt.runtime_versions, tuple)
+        and tuple(module for module, _version in receipt.runtime_versions)
+        == LOCKED_RUNTIME_MODULES
+        and all(
+            isinstance(version, str)
+            and bool(version)
+            and "\n" not in version
+            and "\r" not in version
+            for _module, version in receipt.runtime_versions
+        )
+    )
+    provenance_scalars = (
+        receipt.modal_app_id,
+        receipt.modal_app_name,
+        receipt.modal_function_name,
+        receipt.modal_function_call_id,
+        receipt.modal_input_id,
+        receipt.python_version,
+        receipt.torch_version,
+        receipt.cuda_runtime_version,
+        receipt.cuda_driver_version,
     )
     if (
         not isinstance(receipt.command, str)
@@ -1525,9 +2145,47 @@ def _validate_receipt(receipt: AttemptReceipt) -> None:
         or isinstance(receipt.exit_status, bool)
         or not isinstance(receipt.validated, bool)
         or not isinstance(receipt.promoted, bool)
+        or not isinstance(receipt.stage_a_resume, bool)
+        or len(receipt.materialization_artifact_ids) != len(_ARMS)
+        or len(set(receipt.materialization_artifact_ids)) != len(_ARMS)
+        or receipt.model_revision != QWEN25_7B_TOKENIZER_REVISION
+        or not receipt.run_id.endswith(f"-plan-{receipt.plan_digest}")
+        or receipt.modal_app_name != "phase-marker-pilot-stage-a"
+        or receipt.modal_function_name != expected_function
+        or any(
+            not isinstance(value, str)
+            or not value
+            or "\n" in value
+            or "\r" in value
+            for value in provenance_scalars
+        )
+        or not runtime_versions_valid
         or not output_records_valid
+        or receipt.stage_a_action_digest
+        != _stage_a_action_digest(
+            plan_digest=receipt.plan_digest,
+            resume=receipt.stage_a_resume,
+            smoke_receipt_artifact_id=receipt.smoke_receipt_artifact_id,
+            model_cache_artifact_id=receipt.model_cache_artifact_id,
+        )
         or (receipt.validated is False and receipt.promoted is True)
         or (receipt.failure_reason is not None and not isinstance(receipt.failure_reason, str))
+        or (
+            receipt.validated is True
+            and (receipt.failure_reason is not None or receipt.failure_stage is not None)
+        )
+        or (
+            receipt.validated is False
+            and (
+                not isinstance(receipt.failure_reason, str)
+                or not receipt.failure_reason
+                or receipt.failure_stage not in failure_stages
+                or (
+                    receipt.exit_status == 0
+                    and receipt.failure_stage not in post_command_failure_stages
+                )
+            )
+        )
     ):
         raise ValueError("receipt fields are invalid")
     if receipt.artifact_id != receipt.recomputed_artifact_id():
@@ -1630,8 +2288,12 @@ def _approved_command_argv(command: str) -> list[str]:
     except ValueError as error:
         raise ValueError("approved command is malformed") from error
     for arm in _ARMS:
-        if argv == _workspace_training_command(arm) or argv == _workspace_selection_command(arm):
-            return argv
+        for expected in (
+            _workspace_training_command(arm),
+            _workspace_selection_command(arm),
+        ):
+            if argv == expected and command == shlex.join(expected):
+                return argv
     raise ValueError("command is not an approved command")
 
 
@@ -1703,20 +2365,15 @@ def require_clean_tracked_status(status: str) -> None:
 def hash_source_tree(repo_root: Path) -> str:
     """Hash precisely the Python source staged by the future Modal adapter."""
     root = Path(repo_root).resolve()
-    paths: list[Path] = []
-    package = root / "phase_marker"
-    if package.is_dir():
-        paths.extend(
-            path
-            for path in package.rglob("*.py")
-            if "__pycache__" not in path.parts and path.is_file()
-        )
-    adapter = root / "modal_phase_marker.py"
-    if adapter.is_file():
-        paths.append(adapter)
+    paths = source_tree_relative_paths(root)
     records = [
-        {"path": path.relative_to(root).as_posix(), "sha256": _file_sha256(path)}
-        for path in sorted(paths, key=lambda value: value.relative_to(root).as_posix())
+        {
+            "path": relative,
+            "sha256": hashlib.sha256(
+                _read_regular_file_at(root, relative, label="source file")
+            ).hexdigest(),
+        }
+        for relative in paths
     ]
     return sha256_json(records)
 
@@ -1767,6 +2424,11 @@ def load_model_cache_manifest(path: Path) -> ModelCacheManifest:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("model cache manifest is missing or invalid") from error
+    return parse_model_cache_manifest_payload(payload)
+
+
+def parse_model_cache_manifest_payload(payload: object) -> ModelCacheManifest:
+    """Parse an external cache-manifest object with normalized ValueError failures."""
     if not isinstance(payload, Mapping) or set(payload) != {
         "schema_version", "model_id", "model_revision", "files", "artifact_id",
     }:
@@ -2077,6 +2739,8 @@ def _validate_pilot_plan_payload(payload: Mapping[str, object]) -> None:
         or payload["kind"] != "pilot"
         or payload["seed"] != _PILOT_SEED
         or payload["model_revision"] != QWEN25_7B_TOKENIZER_REVISION
+        or payload["canonical_dependency_lock_path"]
+        != "requirements-modal-phase-marker.txt"
         or not all(_is_sha256(value) for value in hashes)
         or not isinstance(materialization_ids, list)
         or len(materialization_ids) != len(_EXPECTED_PLAN_ARMS)
@@ -2107,13 +2771,159 @@ def _validate_pilot_plan_payload(payload: Mapping[str, object]) -> None:
             )
         ):
             raise ValueError("pilot plan payload jobs are invalid")
-    expected_run_id = (
+    expected_run_label = (
         f"pilot-s42-cfg-{str(payload['config_hash'])[:8]}"
         f"-split-{str(payload['split_artifact_id'])[:8]}"
         f"-src-{str(payload['source_hash'])[:12]}"
     )
-    if payload["run_id"] != expected_run_id:
+    expected_plan_digest = _pilot_plan_payload_digest(payload)
+    if (
+        payload["run_label"] != expected_run_label
+        or payload["plan_digest"] != expected_plan_digest
+        or payload["run_id"] != f"{expected_run_label}-plan-{expected_plan_digest}"
+    ):
         raise ValueError("pilot plan payload run ID is invalid")
+
+
+def _pilot_plan_payload_digest(payload: Mapping[str, object]) -> str:
+    """Recompute full plan identity without importing the planner circularly."""
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "schema_version": payload.get("schema_version"),
+                "kind": payload.get("kind"),
+                "seed": payload.get("seed"),
+                "config_hash": payload.get("config_hash"),
+                "split_artifact_id": payload.get("split_artifact_id"),
+                "materialization_artifact_ids": payload.get(
+                    "materialization_artifact_ids"
+                ),
+                "model_revision": payload.get("model_revision"),
+                "source_hash": payload.get("source_hash"),
+                "dependency_lock": {
+                    "path": payload.get("canonical_dependency_lock_path"),
+                    "sha256": payload.get("dependency_lock_hash"),
+                },
+                "bundle_id": payload.get("bundle_id"),
+                "resources": payload.get("resources"),
+                "jobs": payload.get("jobs"),
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def validate_action_approval_payload(
+    *,
+    plan_payload: Mapping[str, object],
+    approval_payload: Mapping[str, object],
+    action: str,
+    resume: bool | None = None,
+    smoke_receipt_artifact_id: str | None = None,
+    model_cache_artifact_id: str | None = None,
+) -> dict[str, object]:
+    """Fail closed unless an approval is exact for this plan and action."""
+    _validate_pilot_plan_payload(plan_payload)
+    common = {"schema_version", "action", "plan_digest", "approval_digest"}
+    expected_fields = (
+        common
+        | {
+            "resume",
+            "smoke_receipt_artifact_id",
+            "model_cache_artifact_id",
+        }
+        if action == "run-stage-a"
+        else common
+    )
+    if not isinstance(approval_payload, Mapping) or set(approval_payload) != expected_fields:
+        raise ValueError("action approval envelope fields are invalid")
+    if (
+        approval_payload["schema_version"] != 1
+        or approval_payload["action"] != action
+        or approval_payload["plan_digest"] != plan_payload["plan_digest"]
+    ):
+        raise ValueError("action approval envelope identity is invalid")
+    digest_payload: dict[str, object] = {
+        "schema_version": 1,
+        "plan_digest": plan_payload["plan_digest"],
+        "action": action,
+    }
+    if action == "run-stage-a":
+        if (
+            not isinstance(resume, bool)
+            or not _is_sha256(smoke_receipt_artifact_id)
+            or not _is_sha256(model_cache_artifact_id)
+            or approval_payload["resume"] is not resume
+            or approval_payload["smoke_receipt_artifact_id"]
+            != smoke_receipt_artifact_id
+            or approval_payload["model_cache_artifact_id"]
+            != model_cache_artifact_id
+        ):
+            raise ValueError("Stage A approval evidence identity is invalid")
+        digest_payload.update(
+            {
+                "resume": resume,
+                "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
+                "model_cache_artifact_id": model_cache_artifact_id,
+            }
+        )
+    elif any(
+        value is not None
+        for value in (resume, smoke_receipt_artifact_id, model_cache_artifact_id)
+    ):
+        raise ValueError("non-Stage-A approval received Stage A evidence")
+    expected_digest = hashlib.sha256(
+        canonical_json(digest_payload).encode("utf-8")
+    ).hexdigest()
+    if approval_payload["approval_digest"] != expected_digest:
+        raise ValueError("action approval digest is invalid")
+    return dict(approval_payload)
+
+
+def _stage_a_action_digest(
+    *,
+    plan_digest: str,
+    resume: bool,
+    smoke_receipt_artifact_id: str,
+    model_cache_artifact_id: str,
+) -> str:
+    if (
+        not _is_sha256(plan_digest)
+        or not isinstance(resume, bool)
+        or not _is_sha256(smoke_receipt_artifact_id)
+        or not _is_sha256(model_cache_artifact_id)
+    ):
+        raise ValueError("Stage A receipt approval identity is invalid")
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "schema_version": 1,
+                "plan_digest": plan_digest,
+                "action": "run-stage-a",
+                "resume": resume,
+                "smoke_receipt_artifact_id": smoke_receipt_artifact_id,
+                "model_cache_artifact_id": model_cache_artifact_id,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _validated_stage_a_approval(
+    plan_payload: Mapping[str, object],
+    approval_payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate and normalize the approval provenance persisted by Stage A."""
+    if not isinstance(approval_payload, Mapping):
+        raise ValueError("Stage A approval provenance is required")
+    return validate_action_approval_payload(
+        plan_payload=plan_payload,
+        approval_payload=approval_payload,
+        action="run-stage-a",
+        resume=approval_payload.get("resume"),
+        smoke_receipt_artifact_id=approval_payload.get(
+            "smoke_receipt_artifact_id"
+        ),
+        model_cache_artifact_id=approval_payload.get("model_cache_artifact_id"),
+    )
 
 
 def _write_cache_attempt_receipt(
@@ -2279,21 +3089,31 @@ def _validate_model_cache_manifest_shape(manifest: ModelCacheManifest) -> None:
         raise ValueError("model cache schema version is invalid")
     if manifest.model_id != REQUIRED_MODEL_ID or manifest.model_revision != QWEN25_7B_TOKENIZER_REVISION:
         raise ValueError("model cache identity is invalid")
+    if not isinstance(manifest.files, tuple) or any(
+        not isinstance(item, ModelCacheFile)
+        or not isinstance(item.path, str)
+        or (
+            item.path not in _MODEL_CACHE_REQUIRED_FILES
+            and not _is_model_shard_path(item.path)
+        )
+        or not isinstance(item.size, int)
+        or isinstance(item.size, bool)
+        or item.size <= 0
+        or not _is_sha256(item.sha256)
+        for item in manifest.files
+    ):
+        raise ValueError("model cache file metadata is invalid")
     paths = tuple(item.path for item in manifest.files)
     if (
         not manifest.files
         or paths != tuple(sorted(paths))
         or len(paths) != len(set(paths))
-        or any(
-            not isinstance(item, ModelCacheFile)
-            or not isinstance(item.size, int)
-            or isinstance(item.size, bool)
-            or item.size <= 0
-            or not _is_sha256(item.sha256)
-            for item in manifest.files
-        )
     ):
         raise ValueError("model cache file metadata is invalid")
+    if not set(_MODEL_CACHE_REQUIRED_FILES).issubset(paths) or not any(
+        _is_model_shard_path(path) for path in paths
+    ):
+        raise ValueError("model cache manifest required files are missing")
     expected_id = _model_cache_artifact_id(
         schema_version=manifest.schema_version,
         model_id=manifest.model_id,
@@ -2308,8 +3128,20 @@ def build_input_bundle(repo_root: Path) -> InputBundle:
     """Describe exactly the approved config and input artifacts, without writes."""
     root = Path(repo_root).resolve()
     _validate_allowlist_paths(INPUT_ALLOWLIST)
-    files = tuple(_bundle_file(root, relative_path) for relative_path in INPUT_ALLOWLIST)
-    artifact_ids = tuple(_manifest_artifact_id(root / relative_path) for relative_path in _MANIFEST_PATHS)
+    contents = {
+        relative_path: _read_regular_file_at(
+            root, relative_path, label="required input bundle file"
+        )
+        for relative_path in INPUT_ALLOWLIST
+    }
+    files = tuple(
+        _bundle_file_from_bytes(relative_path, contents[relative_path])
+        for relative_path in INPUT_ALLOWLIST
+    )
+    artifact_ids = tuple(
+        _manifest_artifact_id_from_bytes(relative_path, contents[relative_path])
+        for relative_path in _MANIFEST_PATHS
+    )
     _reject_duplicate_artifact_ids(artifact_ids)
     bundle = InputBundle(
         schema_version=1,
@@ -2330,14 +3162,24 @@ def build_input_bundle(repo_root: Path) -> InputBundle:
 
 def validate_bundle_at_root(bundle: InputBundle, root: Path) -> None:
     """Fail closed unless this root still exactly matches the bundle description."""
+    read_bundle_files_at_root(bundle, root)
+
+
+def read_bundle_files_at_root(
+    bundle: InputBundle, root: Path,
+) -> dict[str, bytes]:
+    """Read each exact allowlisted regular file once and validate those same bytes."""
     _validate_bundle_shape(bundle)
     resolved_root = Path(root).resolve()
+    contents: dict[str, bytes] = {}
     for item in bundle.files:
-        path = resolved_root / item.path
-        if not path.is_file():
-            raise ValueError(f"bundle file is missing: {item.path}")
-        if path.stat().st_size != item.size or _file_sha256(path) != item.sha256:
+        content = _read_regular_file_at(
+            resolved_root, item.path, label="bundle file"
+        )
+        if len(content) != item.size or hashlib.sha256(content).hexdigest() != item.sha256:
             raise ValueError(f"bundle file hash mismatch: {item.path}")
+        contents[item.path] = content
+    return contents
 
 
 def load_input_bundle(path: Path) -> InputBundle:
@@ -2386,6 +3228,7 @@ def run_cpu_smoke(
     run_root: Path,
     volume: VolumeClient,
     runtime_imports: tuple[str, ...],
+    execution_provenance: Mapping[str, object],
 ) -> dict[str, object]:
     """Validate the locked CPU preflight and persist one content-addressed receipt."""
     run_id = plan_payload.get("run_id") if isinstance(plan_payload, Mapping) else None
@@ -2393,18 +3236,21 @@ def run_cpu_smoke(
     receipt_root = Path(run_root) / "runs" / receipt_namespace / "receipts" / "smoke"
     imported: list[dict[str, object]] = []
     model_cache_artifact_id: str | None = None
+    provenance = _validate_execution_provenance(execution_provenance, stage="smoke")
     try:
         _validate_pilot_plan_payload(plan_payload)
-        if not runtime_imports or len(set(runtime_imports)) != len(runtime_imports):
+        if runtime_imports != LOCKED_RUNTIME_MODULES:
             raise ValueError("locked runtime import list is invalid")
         for name in runtime_imports:
             if not isinstance(name, str) or not name:
                 raise ValueError("locked runtime import list is invalid")
             module = importlib.import_module(name)
             version = getattr(module, "__version__", None)
-            imported.append(
-                {"module": name, "version": version if isinstance(version, str) else None}
-            )
+            if not isinstance(version, str) or not version:
+                raise ValueError(f"locked runtime version is unavailable: {name}")
+            imported.append({"module": name, "version": version})
+        if imported != provenance["runtime_versions"]:
+            raise ValueError("smoke runtime versions do not match Modal provenance")
 
         code = Path(code_root).resolve()
         if hash_source_tree(code) != plan_payload["source_hash"]:
@@ -2437,6 +3283,7 @@ def run_cpu_smoke(
             model_cache_artifact_id=model_cache_artifact_id,
             validated=True,
             failure_reason=None,
+            provenance=provenance,
         )
         receipt_path = _write_content_addressed_receipt(receipt_root, receipt)
         volume.commit()
@@ -2452,6 +3299,7 @@ def run_cpu_smoke(
             model_cache_artifact_id=model_cache_artifact_id,
             validated=False,
             failure_reason=f"{type(error).__name__}: {error}",
+            provenance=provenance,
         )
         _write_content_addressed_receipt(receipt_root, receipt)
         volume.commit()
@@ -2465,20 +3313,39 @@ def _cpu_smoke_receipt_payload(
     model_cache_artifact_id: str | None,
     validated: bool,
     failure_reason: str | None,
+    provenance: Mapping[str, object],
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema_version": 1,
         "stage": "smoke",
         "hardware": "CPU",
         "run_id": plan_payload.get("run_id"),
+        "plan_digest": plan_payload.get("plan_digest"),
+        "config_hash": plan_payload.get("config_hash"),
+        "split_artifact_id": plan_payload.get("split_artifact_id"),
+        "materialization_artifact_ids": plan_payload.get(
+            "materialization_artifact_ids"
+        ),
         "source_hash": plan_payload.get("source_hash"),
         "dependency_lock_hash": plan_payload.get("dependency_lock_hash"),
+        "canonical_dependency_lock_path": plan_payload.get(
+            "canonical_dependency_lock_path"
+        ),
         "bundle_id": plan_payload.get("bundle_id"),
         "model_revision": plan_payload.get("model_revision"),
         "model_cache_artifact_id": model_cache_artifact_id,
         "imports": imported,
         "validated": validated,
         "failure_reason": failure_reason,
+        "modal_app_id": provenance["modal_app_id"],
+        "modal_app_name": provenance["modal_app_name"],
+        "modal_function_name": provenance["modal_function_name"],
+        "modal_function_call_id": provenance["modal_function_call_id"],
+        "modal_input_id": provenance["modal_input_id"],
+        "python_version": provenance["python_version"],
+        "torch_version": provenance["torch_version"],
+        "cuda_runtime_version": provenance["cuda_runtime_version"],
+        "cuda_driver_version": provenance["cuda_driver_version"],
     }
     payload["artifact_id"] = sha256_json(payload)
     return payload
@@ -2518,24 +3385,145 @@ def _write_content_addressed_receipt(
     return path
 
 
+def source_tree_relative_paths(repo_root: Path) -> tuple[str, ...]:
+    """Return exactly the regular Python files eligible for the Modal image."""
+    resolved_root = Path(repo_root).resolve()
+    package = resolved_root / "phase_marker"
+    paths: list[str] = []
+    package_stat = _lstat_optional(package)
+    if package_stat is not None:
+        if not stat.S_ISDIR(package_stat.st_mode):
+            raise ValueError("phase_marker source must be a regular directory")
+
+        def visit(directory: Path) -> None:
+            try:
+                entries = sorted(os.scandir(directory), key=lambda item: item.name)
+            except OSError as error:
+                raise ValueError("phase_marker source tree is unreadable") from error
+            for entry in entries:
+                candidate = Path(entry.path)
+                relative = candidate.relative_to(resolved_root)
+                if entry.is_symlink():
+                    raise ValueError(
+                        f"source path is a symlink: {relative.as_posix()}"
+                    )
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name != "__pycache__":
+                        visit(candidate)
+                    continue
+                if candidate.suffix == ".py":
+                    if not entry.is_file(follow_symlinks=False):
+                        raise ValueError(
+                            f"source path is not a regular file: {relative.as_posix()}"
+                        )
+                    paths.append(relative.as_posix())
+
+        visit(package)
+    adapter = resolved_root / "modal_phase_marker.py"
+    adapter_stat = _lstat_optional(adapter)
+    if adapter_stat is not None:
+        if not stat.S_ISREG(adapter_stat.st_mode):
+            raise ValueError("modal_phase_marker.py must be a regular source file")
+        paths.append("modal_phase_marker.py")
+    return tuple(sorted(paths))
+
+
+def _lstat_optional(path: Path) -> os.stat_result | None:
+    try:
+        return Path(path).lstat()
+    except FileNotFoundError:
+        return None
+
+
+def _read_regular_file_at(root: Path, relative_path: str, *, label: str) -> bytes:
+    """Read one path through no-follow directory descriptors and one stable file FD."""
+    candidate = PurePosixPath(relative_path)
+    if (
+        not isinstance(relative_path, str)
+        or not relative_path
+        or candidate.is_absolute()
+        or candidate.as_posix() != relative_path
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+    ):
+        raise ValueError(f"{label} path is invalid: {relative_path}")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        current_fd = os.open(Path(root), directory_flags)
+        descriptors.append(current_fd)
+        for part in candidate.parts[:-1]:
+            current_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            descriptors.append(current_fd)
+        file_fd = os.open(candidate.parts[-1], file_flags, dir_fd=current_fd)
+        descriptors.append(file_fd)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} is not a regular file: {relative_path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        content = b"".join(chunks)
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or len(content) != after.st_size
+        ):
+            raise ValueError(f"{label} changed while being read: {relative_path}")
+        return content
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError(
+            f"{label} is missing, symlinked, or nonregular: {relative_path}"
+        ) from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def read_regular_file_at(
+    root: Path, relative_path: str, *, label: str = "file",
+) -> bytes:
+    """Public no-follow read for other offline planning boundaries."""
+    return _read_regular_file_at(Path(root), relative_path, label=label)
+
+
 def _bundle_file(root: Path, relative_path: str) -> BundleFile:
-    path = root / relative_path
-    if not path.is_file():
-        raise ValueError(f"required input bundle file is missing: {relative_path}")
-    size = path.stat().st_size
-    if size <= 0:
+    content = _read_regular_file_at(
+        Path(root).resolve(), relative_path, label="required input bundle file"
+    )
+    return _bundle_file_from_bytes(relative_path, content)
+
+
+def _bundle_file_from_bytes(relative_path: str, content: bytes) -> BundleFile:
+    if not content:
         raise ValueError(f"required input bundle file is empty: {relative_path}")
-    return BundleFile(relative_path, size, _file_sha256(path))
+    return BundleFile(
+        relative_path, len(content), hashlib.sha256(content).hexdigest()
+    )
 
 
 def _manifest_artifact_id(path: Path) -> str:
+    target = Path(path)
+    content = _read_regular_file_at(
+        target.parent.resolve(), target.name, label="bundle manifest"
+    )
+    return _manifest_artifact_id_from_bytes(str(path), content)
+
+
+def _manifest_artifact_id_from_bytes(label: str, content: bytes) -> str:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid bundle manifest: {path}") from error
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid bundle manifest: {label}") from error
     value = payload.get("artifact_id") if isinstance(payload, dict) else None
     if not _is_sha256(value):
-        raise ValueError(f"bundle manifest artifact_id is missing or malformed: {path}")
+        raise ValueError(f"bundle manifest artifact_id is missing or malformed: {label}")
     return str(value)
 
 

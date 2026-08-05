@@ -3,15 +3,18 @@ from __future__ import annotations
 import builtins
 from contextlib import contextmanager
 from dataclasses import asdict, replace
+from datetime import datetime, timedelta
 import hashlib
 import io
 import importlib
 import importlib.util
 import json
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any, Callable
@@ -78,6 +81,32 @@ EXPECTED_LOCKED_RUNTIME_IMPORTS = (
 )
 
 
+def _adapter_execution_provenance(stage: str) -> dict[str, object]:
+    function = {
+        "train": "run_training_job",
+        "selection": "run_selection_job",
+        "smoke": "smoke_remote",
+        "finalizer": "finalize_stage_a_remote",
+    }[stage]
+    return {
+        "modal_app_id": "ap-test",
+        "modal_app_name": "phase-marker-pilot-stage-a",
+        "modal_function_name": function,
+        "modal_function_call_id": f"fc-{stage}",
+        "modal_input_id": f"in-{stage}",
+        "python_version": "3.12.test",
+        "torch_version": "2.7.test",
+        "cuda_runtime_version": "12.8.test",
+        "cuda_driver_version": (
+            "not-observed-cpu" if stage in {"smoke", "finalizer"} else "570.test"
+        ),
+        "runtime_versions": [
+            {"module": module, "version": "locked-test-version"}
+            for module in EXPECTED_LOCKED_RUNTIME_IMPORTS
+        ],
+    }
+
+
 class FakeRemoteFunction:
     def __init__(self, modal: FakeModal, function: Callable[..., object]) -> None:
         self._modal = modal
@@ -108,9 +137,21 @@ class FakeImage:
         return self
 
     def add_local_dir(
-        self, local_path: str, remote_path: str, *, copy: bool
+        self,
+        local_path: str,
+        remote_path: str,
+        *,
+        copy: bool,
+        ignore: object = None,
     ) -> FakeImage:
-        self.operations.append(("add_local_dir", local_path, remote_path, {"copy": copy}))
+        self.operations.append(
+            (
+                "add_local_dir",
+                local_path,
+                remote_path,
+                {"copy": copy, "ignore": ignore},
+            )
+        )
         return self
 
     def add_local_file(
@@ -136,10 +177,14 @@ class FakeVolume:
         self.name = name
         self.create_if_missing = create_if_missing
         self.read_only_calls = 0
+        self.read_only_handle = FakeVolumeMount(self)
 
     def read_only(self) -> FakeVolumeMount:
         self.read_only_calls += 1
-        return FakeVolumeMount(self)
+        return self.read_only_handle
+
+    def hydrate(self) -> None:
+        self._modal.rpc_calls.append(("volume_hydrate", self.name))
 
     def __getattr__(self, name: str) -> Any:
         if name in {"commit", "reload"}:
@@ -170,6 +215,9 @@ class RecordingVolume:
         if path not in self.files:
             raise FileNotFoundError(path)
         return [self.files[path]]
+
+    def reload(self) -> None:
+        self.events.append(("reload",))
 
     @contextmanager
     def batch_upload(self) -> object:
@@ -311,9 +359,36 @@ def _load_adapter(monkeypatch: pytest.MonkeyPatch, fake_modal: FakeModal) -> Mod
     return module
 
 
+def _load_inspection_adapter(
+    monkeypatch: pytest.MonkeyPatch, fake_modal: FakeModal,
+) -> ModuleType:
+    path = REPO_ROOT / "modal_phase_marker_inspect.py"
+    spec = importlib.util.spec_from_file_location(
+        "modal_phase_marker_inspect_under_test", path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.delitem(sys.modules, "modal_phase_marker", raising=False)
+    monkeypatch.setitem(sys.modules, "modal", fake_modal)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        fake_modal.importing = False
+    module.fake_modal = fake_modal
+    return module
+
+
 @pytest.fixture
 def imported_adapter(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return _load_adapter(monkeypatch, FakeModal())
+
+
+@pytest.fixture
+def imported_inspection_adapter(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    path = REPO_ROOT / "modal_phase_marker_inspect.py"
+    assert path.is_file(), "standalone inspection adapter is missing"
+    return _load_inspection_adapter(monkeypatch, FakeModal())
 
 
 @pytest.fixture
@@ -337,6 +412,27 @@ def _build_plan(pilot_repo: Path, dependency_lock_hash: str) -> modal_plan.Pilot
         source_hash="1" * 64,
         dependency_lock_hash=dependency_lock_hash,
     )
+
+
+def _operator_approval_kwargs(
+    plan: modal_plan.PilotPlan,
+    *,
+    action: str,
+    resume: bool | None = None,
+    smoke_receipt_artifact_id: str | None = None,
+    model_cache_artifact_id: str | None = None,
+) -> dict[str, str]:
+    approval = modal_plan.action_approval_payload(
+        plan,
+        action=action,
+        resume=resume,
+        smoke_receipt_artifact_id=smoke_receipt_artifact_id,
+        model_cache_artifact_id=model_cache_artifact_id,
+    )
+    return {
+        "approved_plan_digest": plan.plan_digest,
+        "approved_action_digest": str(approval["approval_digest"]),
+    }
 
 
 def _locked_requirements() -> dict[str, tuple[str, tuple[str, ...]]]:
@@ -388,7 +484,9 @@ def test_dependency_lock_hash_tracks_only_the_compiled_lock_bytes(pilot_repo: Pa
     assert changed.dependency_lock_hash != original.dependency_lock_hash
     assert changed.source_hash == original.source_hash
     assert changed.config_hash == original.config_hash
-    assert changed.run_id == original.run_id
+    assert changed.run_label == original.run_label
+    assert changed.plan_digest != original.plan_digest
+    assert changed.run_id != original.run_id
 
 
 def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> None:
@@ -417,18 +515,24 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
         "seed": "42",
     }
     assert [(volume.name, volume.create_if_missing) for volume in fake.volumes] == [
-        *((name, True) for name in imported_adapter.VOLUME_NAMES),
-        (imported_adapter.VOLUME_NAMES[2], False),
+        *((name, False) for name in imported_adapter.VOLUME_NAMES),
     ]
-    assert imported_adapter.inspection_runs_volume is fake.volumes[-1]
-    assert imported_adapter.inspection_runs_volume is not imported_adapter.runs_volume
+    assert not hasattr(imported_adapter, "inspection_runs_volume")
 
     assert len(fake.images) == 1
     assert imported_adapter.cpu_image is imported_adapter.gpu_image
     assert imported_adapter.gpu_image.operations == [
         ("from_registry", imported_adapter.BASE_IMAGE, {"add_python": "3.12"}),
         ("pip_install_from_requirements", "requirements-modal-phase-marker.txt"),
-        ("add_local_dir", "phase_marker", "/opt/glyph_reasoning/phase_marker", {"copy": True}),
+        (
+            "add_local_dir",
+            "phase_marker",
+            "/opt/glyph_reasoning/phase_marker",
+            {
+                "copy": True,
+                "ignore": imported_adapter._ignore_unhashed_phase_source,
+            },
+        ),
         (
             "add_local_file",
             "modal_phase_marker.py",
@@ -447,32 +551,31 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
             "ln -sf /usr/local/bin/python /opt/glyph_reasoning/.venv/bin/python",
         ),
     ]
+    assert imported_adapter._ignore_unhashed_phase_source(Path("planner.py")) is False
+    assert imported_adapter._ignore_unhashed_phase_source(Path("notes.txt")) is True
+    assert (
+        imported_adapter._ignore_unhashed_phase_source(
+            Path("__pycache__/planner.cpython-312.pyc")
+        )
+        is True
+    )
     assert ":12.8.1-cudnn-devel-ubuntu22.04" not in imported_adapter.BASE_IMAGE
 
     gpu_options = next(
         call[1] for call in fake.declaration_calls
         if call[0] == "function"
         and call[1].get("gpu") == "H100"
-        and "/mnt/inputs" in call[1]["volumes"]
+        and "/inputs" in call[1]["volumes"]
     )
     assert gpu_options["image"] is imported_adapter.gpu_image
     assert gpu_options["timeout"] == 14_400
     assert gpu_options["max_containers"] == 2
     assert gpu_options["retries"] == 0
-    assert gpu_options["volumes"]["/mnt/inputs"].volume is imported_adapter.inputs_volume
-    assert gpu_options["volumes"]["/mnt/model"].volume is imported_adapter.model_volume
-    assert gpu_options["volumes"]["/mnt/runs"] is imported_adapter.runs_volume
-    assert gpu_options["volumes"]["/mnt/inputs"].read_only is True
-    assert gpu_options["volumes"]["/mnt/model"].read_only is True
-
-    status_options = next(
-        call[1] for call in fake.declaration_calls
-        if call[0] == "function" and set(call[1]["volumes"]) == {"/mnt/runs"}
-    )
-    assert "gpu" not in status_options
-    assert status_options["volumes"]["/mnt/runs"].volume is (
-        imported_adapter.inspection_runs_volume
-    )
+    assert gpu_options["volumes"]["/inputs"].volume is imported_adapter.inputs_volume
+    assert gpu_options["volumes"]["/model-cache"].volume is imported_adapter.model_volume
+    assert gpu_options["volumes"]["/runs"] is imported_adapter.runs_volume
+    assert gpu_options["volumes"]["/inputs"].read_only is True
+    assert gpu_options["volumes"]["/model-cache"].read_only is True
 
     cache_options = next(
         call[1] for call in fake.declaration_calls
@@ -507,55 +610,260 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
         "run_training_job",
         "run_selection_job",
         "finalize_stage_a_remote",
-        "gpu_resources",
-        "status_resources",
+        "recover_stage_a_orphans_remote",
     }
     assert isinstance(imported_adapter.cache_model_remote, imported_adapter.RemoteFunction)
     assert isinstance(imported_adapter.smoke_remote, imported_adapter.RemoteFunction)
-    assert isinstance(imported_adapter.gpu_resources, imported_adapter.RemoteFunction)
-    assert isinstance(imported_adapter.status_resources, imported_adapter.RemoteFunction)
     assert [
         call[1] for call in fake.declaration_calls if call[0] == "local_entrypoint_decorated"
     ] == [
-        "status", "download_evidence", "stage_inputs", "cache_model", "smoke",
-        "run_stage_a",
+        "stage_inputs", "cache_model", "smoke", "run_stage_a",
     ]
     assert "plan" not in [
         call[1] for call in fake.declaration_calls if call[0] == "local_entrypoint_decorated"
     ]
 
 
-def test_status_and_download_entrypoints_use_no_create_inspection_handle(
-    imported_adapter: ModuleType,
+def test_inspection_adapter_declares_no_compute_capability(
+    imported_inspection_adapter: ModuleType,
+) -> None:
+    """Would fail if status import could declare an image, function, GPU, or new volume."""
+    adapter = imported_inspection_adapter
+    fake = adapter.fake_modal
+
+    assert "modal_phase_marker" not in sys.modules
+    assert len(fake.apps) == 1
+    assert adapter.app.include_source is False
+    assert fake.images == []
+    assert fake.rpc_calls == []
+    assert not any(call[0] == "Image.from_registry" for call in fake.declaration_calls)
+    assert not any(call[0] == "function" for call in fake.declaration_calls)
+    assert fake.apps[0].remote_functions == {}
+
+    assert [(volume.name, volume.create_if_missing) for volume in fake.volumes] == [
+        ("phase-marker-pilot-runs-v1", False),
+    ]
+    declared = fake.volumes[0]
+    assert declared.read_only_calls == 1
+    assert adapter.runs_volume is declared.read_only_handle
+    assert adapter.runs_volume.read_only is True
+    assert [
+        call[1] for call in fake.declaration_calls
+        if call[0] == "local_entrypoint_decorated"
+    ] == ["status", "download_evidence"]
+
+
+def test_inspection_entrypoints_delegate_only_to_the_read_only_handle(
+    imported_inspection_adapter: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Would fail if read-only inspection reused a volume-creating handle."""
-    run_id = "pilot-s42-cfg-11111111-split-22222222-src-333333333333"
+    """Would fail if either inspection command regained a writable or compute handle."""
+    adapter = imported_inspection_adapter
+    run_id = (
+        "pilot-s42-cfg-11111111-split-22222222-src-333333333333-plan-"
+        + "4" * 64
+    )
+    destination = tmp_path / "evidence"
     seen: list[tuple[str, object]] = []
-    monkeypatch.setattr(
-        imported_adapter,
-        "status_local",
-        lambda volume, *, run_id: seen.append(("status", volume))
-        or {"run_id": run_id, "valid": True},
-    )
-    monkeypatch.setattr(
-        imported_adapter,
-        "download_evidence_local",
-        lambda volume, *, run_id, destination: seen.append(("download", volume))
-        or (destination / "stage-a-summary.json",),
-    )
 
-    imported_adapter.status(run_id)
-    imported_adapter.download_evidence(run_id, str(tmp_path / "evidence"))
+    def inspect_status(volume: object, *, run_id: str) -> dict[str, object]:
+        seen.append(("status", volume))
+        return {"run_id": run_id, "valid": True}
+
+    def inspect_download(
+        volume: object, *, run_id: str, destination: Path,
+    ) -> tuple[Path, ...]:
+        seen.append(("download", volume))
+        return (destination / "stage-a-summary.json",)
+
+    monkeypatch.setattr(adapter, "status_local", inspect_status)
+    monkeypatch.setattr(adapter, "download_evidence_local", inspect_download)
+
+    adapter.status(run_id)
+    adapter.download_evidence(run_id, str(destination))
 
     assert seen == [
-        ("status", imported_adapter.inspection_runs_volume),
-        ("download", imported_adapter.inspection_runs_volume),
+        ("status", adapter.runs_volume),
+        ("download", adapter.runs_volume),
     ]
+    assert adapter.fake_modal.rpc_calls == []
+    assert capsys.readouterr().out.splitlines() == [
+        canonical_json({"run_id": run_id, "valid": True}),
+        canonical_json({
+            "run_id": run_id,
+            "destination": str(destination),
+            "files": [str(destination / "stage-a-summary.json")],
+        }),
+    ]
+
+
+def _declared_compute_image_python_paths(image: FakeImage) -> tuple[str, ...]:
+    selected: set[str] = set()
+    for operation in image.operations:
+        if operation[0] == "add_local_dir":
+            local_path = Path(str(operation[1]))
+            options = operation[3]
+            assert isinstance(options, dict)
+            ignore = options["ignore"]
+            local_root = REPO_ROOT / local_path
+            for candidate in local_root.rglob("*"):
+                if not candidate.is_file():
+                    continue
+                relative = candidate.relative_to(local_root)
+                if ignore is None or ignore(relative) is False:
+                    selected.add(candidate.relative_to(REPO_ROOT).as_posix())
+        elif operation[0] == "add_local_file":
+            local_path = Path(str(operation[1]))
+            if local_path.suffix == ".py":
+                selected.add(local_path.as_posix())
+    return tuple(sorted(selected))
+
+
+def test_compute_image_python_set_exactly_matches_source_hash_set(
+    imported_adapter: ModuleType,
+) -> None:
+    """Would fail if Modal could execute a Python byte absent from the source hash."""
+    source_paths = modal_artifacts.source_tree_relative_paths(REPO_ROOT)
+    assert _declared_compute_image_python_paths(imported_adapter.gpu_image) == source_paths
+
+    records = [
+        {
+            "path": relative,
+            "sha256": hashlib.sha256((REPO_ROOT / relative).read_bytes()).hexdigest(),
+        }
+        for relative in source_paths
+    ]
+    assert hash_source_tree(REPO_ROOT) == modal_artifacts.sha256_json(records)
+
+
+def test_all_module_global_volume_handles_are_noncreating_and_gpu_helper_is_absent(
+    imported_adapter: ModuleType,
+) -> None:
+    """Would fail if import or a read path retained volume-creation authority."""
+    assert imported_adapter.fake_modal.volumes
+    assert all(
+        volume.create_if_missing is False
+        for volume in imported_adapter.fake_modal.volumes
+    )
+    assert not hasattr(imported_adapter, "gpu_resources")
+
+
+@pytest.mark.parametrize(
+    ("remote_name", "action"),
+    [
+        ("cache_model_remote", "cache-model"),
+        ("smoke_remote", "smoke"),
+    ],
+)
+def test_direct_cpu_remote_calls_require_the_exact_action_approval_envelope(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    remote_name: str,
+    action: str,
+) -> None:
+    """Would fail if a direct function invocation bypassed local authorization."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    remote = getattr(imported_adapter, remote_name)
+
+    with pytest.raises(ValueError, match="remote action payload"):
+        remote.local(modal_plan.pilot_plan_payload(plan))
+    approval = modal_plan.action_approval_payload(plan, action=action)
+    tampered = dict(approval)
+    tampered["approval_digest"] = "0" * 64
+    with pytest.raises(ValueError, match="approval digest"):
+        remote.local({"plan": modal_plan.pilot_plan_payload(plan), "approval": tampered})
+
+
+def test_direct_gpu_remote_call_requires_stage_a_evidence_bound_approval(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+) -> None:
+    """Would fail if H100 execution accepted an unapproved or cross-mode payload."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    job = asdict(plan.jobs[0])
+    job["expected_outputs"] = list(job["expected_outputs"])
+
+    with pytest.raises(ValueError, match="remote job payload"):
+        imported_adapter.run_training_job.local(
+            {"plan": modal_plan.pilot_plan_payload(plan), "job": job}
+        )
+    approval = modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=False,
+        smoke_receipt_artifact_id="3" * 64,
+        model_cache_artifact_id="4" * 64,
+    )
+    tampered = dict(approval)
+    tampered["resume"] = True
+    with pytest.raises(ValueError, match="approval"):
+        imported_adapter.run_training_job.local(
+            {
+                "plan": modal_plan.pilot_plan_payload(plan),
+                "job": job,
+                "approval": tampered,
+            }
+        )
+
+
+@pytest.mark.parametrize("entrypoint", ("stage_inputs", "cache_model", "smoke"))
+def test_operator_action_digest_is_required_before_any_external_boundary(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    """Would fail if the human run label alone authorized an external action."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    monkeypatch.setattr(
+        imported_adapter, "_build_operator_context", lambda _root: (bundle, plan)
+    )
+    initial_volume_count = len(imported_adapter.fake_modal.volumes)
+
+    with pytest.raises(ValueError, match="plan digest|action approval"):
+        getattr(imported_adapter, entrypoint)(
+            repo_root=str(pilot_repo),
+            approved_run_id=plan.run_id,
+            acknowledge_budget_usd=1_000,
+            approved_plan_digest=plan.plan_digest,
+            approved_action_digest="0" * 64,
+        )
+
+    assert len(imported_adapter.fake_modal.volumes) == initial_volume_count
     assert imported_adapter.fake_modal.rpc_calls == []
-    assert len(capsys.readouterr().out.splitlines()) == 2
+
+
+def test_authorized_volume_creation_revalidates_the_exact_action_approval(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+) -> None:
+    """Would fail if a create-if-missing handle could be obtained cross-action."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    approval = modal_plan.action_approval_payload(plan, action="cache-model")
+    initial_volume_count = len(imported_adapter.fake_modal.volumes)
+
+    with pytest.raises(ValueError, match="approval"):
+        imported_adapter._create_authorized_volume(
+            imported_adapter.VOLUME_NAMES[1],
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            approval_payload=modal_plan.action_approval_payload(
+                plan, action="smoke"
+            ),
+            action="cache-model",
+        )
+    assert len(imported_adapter.fake_modal.volumes) == initial_volume_count
+
+    created = imported_adapter._create_authorized_volume(
+        imported_adapter.VOLUME_NAMES[1],
+        plan_payload=modal_plan.pilot_plan_payload(plan),
+        approval_payload=approval,
+        action="cache-model",
+    )
+    assert created.name == imported_adapter.VOLUME_NAMES[1]
+    assert created.create_if_missing is True
 
 
 def test_stage_a_job_resources_and_mount_permissions_are_exact(
@@ -623,6 +931,13 @@ def test_gpu_job_wrappers_forward_one_approved_payload_to_the_exact_stage(
     payload = {
         "plan": modal_plan.pilot_plan_payload(plan),
         "job": asdict(plan.jobs[0]),
+        "approval": modal_plan.action_approval_payload(
+            plan,
+            action="run-stage-a",
+            resume=False,
+            smoke_receipt_artifact_id="3" * 64,
+            model_cache_artifact_id="4" * 64,
+        ),
     }
     calls: list[dict[str, object]] = []
 
@@ -631,6 +946,15 @@ def test_gpu_job_wrappers_forward_one_approved_payload_to_the_exact_stage(
         return {"stage": kwargs["stage"]}
 
     monkeypatch.setattr(imported_adapter, "execute_pilot_job", execute)
+    provenance = _adapter_execution_provenance("train")
+    monkeypatch.setattr(
+        imported_adapter,
+        "_collect_modal_execution_provenance",
+        lambda function_name: {
+            **provenance,
+            "modal_function_name": function_name,
+        },
+    )
 
     assert imported_adapter.run_training_job.local(payload) == {"stage": "train"}
     assert imported_adapter.run_selection_job.local(payload) == {"stage": "selection"}
@@ -643,15 +967,27 @@ def test_gpu_job_wrappers_forward_one_approved_payload_to_the_exact_stage(
         assert call["model_root"] == Path("/model-cache")
         assert call["run_root"] == Path("/runs")
         assert call["volume"] is imported_adapter.runs_volume
+        assert call["execution_provenance"]["modal_function_name"] == (
+            "run_training_job" if call["stage"] == "train" else "run_selection_job"
+        )
 
 
 def test_cpu_finalizer_wrapper_forwards_receipts_without_loading_weights(
     imported_adapter: ModuleType,
+    pilot_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Would fail if finalization crossed a GPU/model or behavior execution boundary."""
-    plan_payload = {"run_id": "pilot"}
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    plan_payload = modal_plan.pilot_plan_payload(plan)
     receipts = ({"artifact_id": "a" * 64},)
+    approval = modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=False,
+        smoke_receipt_artifact_id="3" * 64,
+        model_cache_artifact_id="4" * 64,
+    )
     calls: list[dict[str, object]] = []
 
     def finalize(**kwargs: object) -> dict[str, object]:
@@ -659,8 +995,18 @@ def test_cpu_finalizer_wrapper_forwards_receipts_without_loading_weights(
         return {"stopped_before_behavior": True}
 
     monkeypatch.setattr(imported_adapter, "finalize_stage_a", finalize, raising=False)
+    provenance = _adapter_execution_provenance("finalizer")
+    monkeypatch.setattr(
+        imported_adapter,
+        "_collect_modal_execution_provenance",
+        lambda _name: provenance,
+    )
 
-    result = imported_adapter.finalize_stage_a_remote.local(plan_payload, receipts)
+    result = imported_adapter.finalize_stage_a_remote.local({
+        "plan": plan_payload,
+        "approval": approval,
+        "receipts": receipts,
+    })
 
     assert result == {"stopped_before_behavior": True}
     assert calls == [
@@ -670,8 +1016,10 @@ def test_cpu_finalizer_wrapper_forwards_receipts_without_loading_weights(
             "input_root": Path("/inputs"),
             "model_root": Path("/model-cache"),
             "run_root": Path("/runs"),
-            "volume": imported_adapter.runs_volume,
-        }
+                "volume": imported_adapter.runs_volume,
+                "execution_provenance": provenance,
+                "stage_a_approval": approval,
+            }
     ]
 
 
@@ -681,12 +1029,19 @@ def test_apply_approved_app_tags_validates_before_the_client_rpc(
     lock_hash = modal_plan._file_sha256(pilot_repo / LOCK_PATH.name)
     plan = _build_plan(pilot_repo, lock_hash)
     fake = imported_adapter.fake_modal
+    approval = modal_plan.action_approval_payload(plan, action="stage-inputs")
 
     with pytest.raises(ValueError, match="run ID"):
-        imported_adapter.apply_approved_app_tags(replace(plan, run_id="noncanonical"))
+        imported_adapter.apply_approved_app_tags(
+            replace(plan, run_id="noncanonical"),
+            approval_payload=approval,
+            action="stage-inputs",
+        )
     assert fake.rpc_calls == []
 
-    imported_adapter.apply_approved_app_tags(plan)
+    imported_adapter.apply_approved_app_tags(
+        plan, approval_payload=approval, action="stage-inputs"
+    )
 
     expected_tags = {
         "experiment": "phase-marker",
@@ -742,6 +1097,50 @@ def test_pure_python_plan_cli_does_not_import_or_call_modal(
     assert modal_imports == ["modal"]
     assert fake.declaration_calls
     assert fake.rpc_calls == []
+
+
+def test_plan_cli_cold_interpreter_blocks_any_modal_import(pilot_repo: Path) -> None:
+    """Would fail if an already-cached module hid a cold Modal dependency."""
+    blocker = """
+import importlib.abc
+import json
+import sys
+
+class BlockModal(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "modal" or fullname.startswith("modal."):
+            raise RuntimeError(f"forbidden Modal import: {fullname}")
+        return None
+
+sys.meta_path.insert(0, BlockModal())
+from phase_marker.modal_plan import main
+main(sys.argv[1:])
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            blocker,
+            "plan",
+            "--repo-root",
+            str(pilot_repo),
+            "--config",
+            str(CONFIG_PATH),
+            "--artifact-root",
+            "artifacts/phase-marker",
+            "--dependency-lock",
+            LOCK_PATH.name,
+        ],
+        cwd=REPO_ROOT,
+        env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert result.stdout == canonical_json(payload) + "\n"
+    assert payload["run_id"].endswith(f"-plan-{payload['plan_digest']}")
+    assert result.stderr == ""
 
 
 def _bundle_volume_files(bundle: object, repo_root: Path) -> dict[str, bytes]:
@@ -890,15 +1289,21 @@ def test_stage_inputs_requires_budget_and_matching_full_identities(
     plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
     monkeypatch.chdir(pilot_repo)
 
-    for approved_run_id, approved_plan, acknowledged, message in (
-        (plan.run_id[:-1], plan, True, "full approved run ID"),
-        (plan.run_id, plan, False, "USD 1000"),
-        (plan.run_id, replace(plan, bundle_id="0" * 64), True, "bundle identity"),
+    for approved_run_id, approved_plan, approved_bundle, acknowledged, message in (
+        (plan.run_id[:-1], plan, bundle, True, "full approved run ID"),
+        (plan.run_id, plan, bundle, False, "USD 1000"),
+        (
+            plan.run_id,
+            plan,
+            replace(bundle, bundle_id="0" * 64),
+            True,
+            "bundle identity",
+        ),
     ):
         volume = RecordingVolume()
         with pytest.raises(ValueError, match=message):
             imported_adapter.stage_inputs_local(
-                bundle,
+                approved_bundle,
                 volume,
                 approved_run_id=approved_run_id,
                 plan=approved_plan,
@@ -955,6 +1360,7 @@ def test_stage_entrypoint_conflicts_fail_before_tags_or_writes(
             repo_root=str(pilot_repo),
             approved_run_id=plan.run_id,
             acknowledge_budget_usd=1_000,
+            **_operator_approval_kwargs(plan, action="stage-inputs"),
         )
 
     assert imported_adapter.fake_modal.rpc_calls == []
@@ -981,6 +1387,7 @@ def test_stage_entrypoint_identical_noop_needs_no_tag_or_upload(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
         acknowledge_budget_usd=1_000,
+        **_operator_approval_kwargs(plan, action="stage-inputs"),
     )
 
     output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
@@ -1003,7 +1410,7 @@ def test_stage_entrypoint_tags_only_after_read_only_preflight_then_narrow_apply(
     upload_items = tuple(_bundle_volume_files(bundle, pilot_repo).items())
     volume = RecordingVolume()
 
-    def tag(approved_plan: object) -> None:
+    def tag(approved_plan: object, **_kwargs: object) -> None:
         assert approved_plan is plan
         volume.events.append(("tags",))
 
@@ -1012,11 +1419,17 @@ def test_stage_entrypoint_tags_only_after_read_only_preflight_then_narrow_apply(
     )
     monkeypatch.setattr(imported_adapter, "inputs_volume", volume)
     monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tag)
+    monkeypatch.setattr(
+        imported_adapter,
+        "_create_authorized_volume",
+        lambda *args, **kwargs: volume,
+    )
 
     imported_adapter.stage_inputs(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
         acknowledge_budget_usd=1_000,
+        **_operator_approval_kwargs(plan, action="stage-inputs"),
     )
 
     assert [event[0] for event in volume.events] == ["listdir", "tags", "batch_upload"]
@@ -1154,8 +1567,16 @@ def test_cpu_smoke_validates_imports_source_bundle_and_cache_without_loading_mod
     monkeypatch.setattr(imported_adapter, "RUN_MOUNT_ROOT", run_root)
     run_volume = CommitOnlyVolume()
     monkeypatch.setattr(imported_adapter, "runs_volume", run_volume)
+    monkeypatch.setattr(
+        imported_adapter,
+        "_collect_modal_execution_provenance",
+        lambda _name: _adapter_execution_provenance("smoke"),
+    )
 
-    result = imported_adapter.smoke_remote.local(modal_plan.pilot_plan_payload(plan))
+    result = imported_adapter.smoke_remote.local({
+        "plan": modal_plan.pilot_plan_payload(plan),
+        "approval": modal_plan.action_approval_payload(plan, action="smoke"),
+    })
 
     assert imported == list(imported_adapter.LOCKED_RUNTIME_IMPORTS)
     assert run_volume.commit_count == 1
@@ -1166,6 +1587,9 @@ def test_cpu_smoke_validates_imports_source_bundle_and_cache_without_loading_mod
     assert receipt["source_hash"] == plan.source_hash
     assert receipt["bundle_id"] == plan.bundle_id
     assert receipt["model_revision"] == QWEN25_7B_TOKENIZER_REVISION
+    assert receipt["plan_digest"] == plan.plan_digest
+    assert receipt["modal_function_name"] == "smoke_remote"
+    assert receipt["modal_input_id"] == "in-smoke"
     assert receipt_path.stem == receipt["artifact_id"]
     assert receipt["artifact_id"] == modal_artifacts.sha256_json({
         key: value for key, value in receipt.items() if key != "artifact_id"
@@ -1193,9 +1617,17 @@ def test_cpu_smoke_persists_content_addressed_failure_and_reraises(
     monkeypatch.setattr(imported_adapter, "RUN_MOUNT_ROOT", run_root)
     run_volume = CommitOnlyVolume()
     monkeypatch.setattr(imported_adapter, "runs_volume", run_volume)
+    monkeypatch.setattr(
+        imported_adapter,
+        "_collect_modal_execution_provenance",
+        lambda _name: _adapter_execution_provenance("smoke"),
+    )
 
     with pytest.raises(ImportError, match="simulated locked import failure"):
-        imported_adapter.smoke_remote.local(modal_plan.pilot_plan_payload(plan))
+        imported_adapter.smoke_remote.local({
+            "plan": modal_plan.pilot_plan_payload(plan),
+            "approval": modal_plan.action_approval_payload(plan, action="smoke"),
+        })
 
     receipts = list((run_root / f"runs/{plan.run_id}/receipts/smoke").glob("*.json"))
     assert len(receipts) == 1
@@ -1250,6 +1682,15 @@ def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
     monkeypatch.setattr(imported_adapter, "_apply_input_staging_plan", stage_boundary)
     monkeypatch.setattr(
         imported_adapter,
+        "_create_authorized_volume",
+        lambda name, **kwargs: {
+            imported_adapter.VOLUME_NAMES[0]: imported_adapter.inputs_volume,
+            imported_adapter.VOLUME_NAMES[1]: imported_adapter.model_volume,
+            imported_adapter.VOLUME_NAMES[2]: imported_adapter.runs_volume,
+        }[name],
+    )
+    monkeypatch.setattr(
+        imported_adapter,
         "cache_model_remote",
         RemoteBoundary("cache-model", {"artifact_id": "a" * 64}),
     )
@@ -1262,16 +1703,22 @@ def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
         ),
     )
 
+    stage_approval = modal_plan.action_approval_payload(
+        plan, action="stage-inputs"
+    )
     imported_adapter.stage_inputs(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
         acknowledge_budget_usd=1_000,
+        **_operator_approval_kwargs(plan, action="stage-inputs"),
     )
     stage_output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert stage_output[0] == {
         "operation": "stage-inputs",
         "action": "upload",
         "run_id": plan.run_id,
+        "plan_digest": plan.plan_digest,
+        "approval_digest": stage_approval["approval_digest"],
         "bundle_id": bundle.bundle_id,
         "file_count": len(bundle.files) + 1,
         "destination": f"{imported_adapter.VOLUME_NAMES[0]}:/bundles/{bundle.bundle_id}",
@@ -1286,15 +1733,21 @@ def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
         "budget_acknowledged_usd": 1_000.0,
     }
 
+    cache_approval = modal_plan.action_approval_payload(
+        plan, action="cache-model"
+    )
     imported_adapter.cache_model(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
         acknowledge_budget_usd=1_000,
+        **_operator_approval_kwargs(plan, action="cache-model"),
     )
     cache_output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert cache_output[0] == {
         "operation": "cache-model",
         "run_id": plan.run_id,
+        "plan_digest": plan.plan_digest,
+        "approval_digest": cache_approval["approval_digest"],
         "model_revision": QWEN25_7B_TOKENIZER_REVISION,
         "cpu": 4.0,
         "memory_mib": 32_768,
@@ -1305,15 +1758,19 @@ def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(
         "budget_acknowledged_usd": 1_000.0,
     }
 
+    smoke_approval = modal_plan.action_approval_payload(plan, action="smoke")
     imported_adapter.smoke(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
         acknowledge_budget_usd=1_000,
+        **_operator_approval_kwargs(plan, action="smoke"),
     )
     smoke_output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert smoke_output[0] == {
         "operation": "smoke",
         "run_id": plan.run_id,
+        "plan_digest": plan.plan_digest,
+        "approval_digest": smoke_approval["approval_digest"],
         "hardware": "CPU",
         "cpu": 2.0,
         "memory_mib": 8_192,
@@ -1386,12 +1843,25 @@ def test_run_stage_a_entrypoint_forwards_explicit_resume_and_prints_summary(
         imported_adapter, "_build_operator_context", lambda root: (bundle, plan)
     )
     monkeypatch.setattr(imported_adapter, "run_stage_a_local", run)
+    smoke_id = "3" * 64
+    cache_id = "4" * 64
+    approval = modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=True,
+        smoke_receipt_artifact_id=smoke_id,
+        model_cache_artifact_id=cache_id,
+    )
 
     imported_adapter.run_stage_a(
         repo_root=str(pilot_repo),
         approved_run_id=plan.run_id,
         acknowledge_budget_usd=1_000,
         resume=True,
+        approved_plan_digest=plan.plan_digest,
+        approved_action_digest=str(approval["approval_digest"]),
+        smoke_receipt_artifact_id=smoke_id,
+        model_cache_artifact_id=cache_id,
     )
 
     assert calls == [
@@ -1400,17 +1870,94 @@ def test_run_stage_a_entrypoint_forwards_explicit_resume_and_prints_summary(
             "budget_acknowledged": True,
             "resume": True,
             "training_function": imported_adapter.run_training_job,
-            "selection_function": imported_adapter.run_selection_job,
-            "finalizer_function": imported_adapter.finalize_stage_a_remote,
-            "runs_client": imported_adapter.runs_volume,
+                "selection_function": imported_adapter.run_selection_job,
+                "finalizer_function": imported_adapter.finalize_stage_a_remote,
+                "recovery_function": imported_adapter.recover_stage_a_orphans_remote,
+                "runs_client": imported_adapter.runs_volume,
+            "inputs_client": imported_adapter.inputs_volume,
+            "model_client": imported_adapter.model_volume,
+            "smoke_receipt_artifact_id": smoke_id,
+            "model_cache_artifact_id": cache_id,
+            "approval_payload": approval,
         }
     ]
     assert capsys.readouterr().out == canonical_json(summary) + "\n"
 
 
+def _stage_a_test_dependency_evidence(
+    plan: modal_plan.PilotPlan,
+) -> tuple[dict[str, bytes], dict[str, object], dict[str, object]]:
+    file_paths = tuple(sorted((
+        "config.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "model-00001-of-00001.safetensors",
+    )))
+    file_contents = {
+        path: b"x" * (index + 1) for index, path in enumerate(file_paths)
+    }
+    manifest: dict[str, object] = {
+        "schema_version": 1,
+        "model_id": "Qwen/Qwen2.5-7B-Instruct",
+        "model_revision": plan.model_revision,
+        "files": [
+            {
+                "path": path,
+                "size": len(file_contents[path]),
+                "sha256": hashlib.sha256(file_contents[path]).hexdigest(),
+            }
+            for path in file_paths
+        ],
+    }
+    manifest["artifact_id"] = modal_artifacts.sha256_json(manifest)
+    smoke: dict[str, object] = {
+        "schema_version": 1,
+        "stage": "smoke",
+        "hardware": "CPU",
+        "run_id": plan.run_id,
+        "plan_digest": plan.plan_digest,
+        "config_hash": plan.config_hash,
+        "split_artifact_id": plan.split_artifact_id,
+        "materialization_artifact_ids": list(plan.materialization_artifact_ids),
+        "source_hash": plan.source_hash,
+        "dependency_lock_hash": plan.dependency_lock_hash,
+        "canonical_dependency_lock_path": plan.canonical_dependency_lock_path,
+        "bundle_id": plan.bundle_id,
+        "model_revision": plan.model_revision,
+        "model_cache_artifact_id": manifest["artifact_id"],
+        "imports": [
+            {"module": module, "version": "locked-test-version"}
+            for module in EXPECTED_LOCKED_RUNTIME_IMPORTS
+        ],
+        "modal_app_id": "ap-smoke-test",
+        "modal_app_name": "phase-marker-pilot-stage-a",
+        "modal_function_name": "smoke_remote",
+        "modal_function_call_id": "fc-smoke-test",
+        "modal_input_id": "in-smoke-test",
+        "python_version": "3.12.test",
+        "torch_version": "2.7.test",
+        "cuda_runtime_version": "12.8.test",
+        "cuda_driver_version": "not-observed-cpu",
+        "validated": True,
+        "failure_reason": None,
+    }
+    smoke["artifact_id"] = modal_artifacts.sha256_json(smoke)
+    return file_contents, manifest, smoke
+
+
 def _stage_a_receipt(
     plan: modal_plan.PilotPlan, job: modal_plan.PilotJob, stage: str,
 ) -> dict[str, object]:
+    _files, manifest, smoke = _stage_a_test_dependency_evidence(plan)
+    approval = modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=False,
+        smoke_receipt_artifact_id=str(smoke["artifact_id"]),
+        model_cache_artifact_id=str(manifest["artifact_id"]),
+    )
     command = job.training_command if stage == "train" else job.selection_command
     paths = (
         ("adapter_config.json", "adapter_model.safetensors", "run-manifest.json")
@@ -1429,7 +1976,10 @@ def _stage_a_receipt(
         command_hash=hashlib.sha256(command.encode("utf-8")).hexdigest(),
         source_hash=plan.source_hash,
         dependency_lock_hash=plan.dependency_lock_hash,
-        model_cache_artifact_id="e" * 64,
+        model_cache_artifact_id=str(manifest["artifact_id"]),
+        stage_a_action_digest=str(approval["approval_digest"]),
+        stage_a_resume=False,
+        smoke_receipt_artifact_id=str(approval["smoke_receipt_artifact_id"]),
         requested_gpu="H100",
         observed_gpu="NVIDIA H100 80GB HBM3",
         started_at="2026-08-05T00:00:00+00:00",
@@ -1442,12 +1992,39 @@ def _stage_a_receipt(
         expected_outputs=paths,
         output_hashes=tuple(hashlib.sha256(path.encode("utf-8")).hexdigest() for path in paths),
         failure_reason=None,
+        plan_digest=plan.plan_digest,
+        config_hash=plan.config_hash,
+        split_artifact_id=plan.split_artifact_id,
+        materialization_artifact_ids=plan.materialization_artifact_ids,
+        model_revision=plan.model_revision,
+        modal_app_id="ap-test",
+        modal_app_name="phase-marker-pilot-stage-a",
+        modal_function_name=(
+            "run_training_job" if stage == "train" else "run_selection_job"
+        ),
+        modal_function_call_id=f"fc-{stage}-{job.arm}",
+        modal_input_id=f"in-{stage}-{job.arm}",
+        python_version="3.12.test",
+        torch_version="2.7.test",
+        cuda_runtime_version="12.8.test",
+        cuda_driver_version="570.test",
+        runtime_versions=tuple(
+            (module, "locked-test-version")
+            for module in modal_artifacts.LOCKED_RUNTIME_MODULES
+        ),
         artifact_id="",
     )
     receipt = replace(receipt, artifact_id=receipt.recomputed_artifact_id())
     payload = asdict(receipt)
     payload["expected_outputs"] = list(receipt.expected_outputs)
     payload["output_hashes"] = list(receipt.output_hashes)
+    payload["materialization_artifact_ids"] = list(
+        receipt.materialization_artifact_ids
+    )
+    payload["runtime_versions"] = [
+        {"module": module, "version": version}
+        for module, version in receipt.runtime_versions
+    ]
     return payload
 
 
@@ -1459,7 +2036,7 @@ class StageAMapFunction:
         events: list[tuple[object, ...]],
         *,
         before_first: Callable[[], None] | None = None,
-        after_result: Callable[[str], None] | None = None,
+        after_result: Callable[[str, object], None] | None = None,
     ) -> None:
         self.stage = stage
         self.results = results
@@ -1484,8 +2061,25 @@ class StageAMapFunction:
                 result = self.results[arm]
                 if isinstance(result, Exception):
                     raise RuntimeError(f"{arm}: {result}") from result
+                if isinstance(result, dict):
+                    approval = payload.get("approval")
+                    if isinstance(approval, dict) and "artifact_id" in result:
+                        result = dict(result)
+                        result["plan_digest"] = approval["plan_digest"]
+                        result["stage_a_action_digest"] = approval["approval_digest"]
+                        result["stage_a_resume"] = approval["resume"]
+                        result["smoke_receipt_artifact_id"] = approval[
+                            "smoke_receipt_artifact_id"
+                        ]
+                        result["model_cache_artifact_id"] = approval[
+                            "model_cache_artifact_id"
+                        ]
+                        unsigned = dict(result)
+                        unsigned.pop("artifact_id")
+                        result["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+                        self.results[arm] = result
                 if self.after_result is not None:
-                    self.after_result(arm)
+                    self.after_result(arm, result)
                 yield result
 
         return results()
@@ -1495,12 +2089,76 @@ class StageAFinalizer:
     def __init__(self, summary: dict[str, object], events: list[tuple[object, ...]]) -> None:
         self.summary = summary
         self.events = events
-        self.calls: list[tuple[object, object]] = []
+        self.calls: list[object] = []
 
-    def remote(self, plan_payload: object, receipts: object) -> dict[str, object]:
-        self.calls.append((plan_payload, receipts))
+    def remote(self, payload: object) -> dict[str, object]:
+        self.calls.append(payload)
         self.events.append(("finalizer",))
-        return self.summary
+        if not isinstance(payload, dict):
+            return self.summary
+        approval = payload.get("approval")
+        receipts = payload.get("receipts")
+        if not isinstance(approval, dict) or not isinstance(receipts, list):
+            return self.summary
+        training = [receipt for receipt in receipts if receipt.get("stage") == "train"]
+        selection = [
+            receipt for receipt in receipts if receipt.get("stage") == "selection"
+        ]
+        summary = dict(self.summary)
+        summary.update(
+            {
+                "plan_digest": approval["plan_digest"],
+                "stage_a_action_digest": approval["approval_digest"],
+                "stage_a_resume": approval["resume"],
+                "smoke_receipt_artifact_id": approval[
+                    "smoke_receipt_artifact_id"
+                ],
+                "model_cache_artifact_id": approval[
+                    "model_cache_artifact_id"
+                ],
+                "receipt_approval_history": modal_artifacts._receipt_approval_history(
+                    receipts
+                ),
+                "training_receipt_ids": [
+                    receipt["artifact_id"] for receipt in training
+                ],
+                "selection_receipt_ids": [
+                    receipt["artifact_id"] for receipt in selection
+                ],
+                "elapsed_gpu_seconds": {
+                    "training": sum(
+                        float(receipt["elapsed_seconds"]) for receipt in training
+                    ),
+                    "selection": sum(
+                        float(receipt["elapsed_seconds"]) for receipt in selection
+                    ),
+                    "total": sum(
+                        float(receipt["elapsed_seconds"]) for receipt in receipts
+                    ),
+                },
+            }
+        )
+        summary.pop("artifact_id", None)
+        summary["artifact_id"] = modal_artifacts.sha256_json(summary)
+        return summary
+
+
+def _publish_stage_a_result(
+    files: dict[str, bytes], receipt: object, runs: StageARunsClient,
+) -> None:
+    published = dict(files)
+    if isinstance(receipt, dict):
+        receipt_paths = [
+            path for path in published if "/receipts/canonical/" in path
+        ]
+        if receipt_paths:
+            receipt_path = receipt_paths[0]
+            persisted = json.loads(published[receipt_path])
+            if not str(persisted.get("attempt_id", "")).startswith("post-reload-"):
+                published[receipt_path] = (
+                    canonical_json(receipt) + "\n"
+                ).encode("utf-8")
+    runs.files.update(published)
 
 
 class EmptyStageARunsClient:
@@ -1533,6 +2191,128 @@ class StageARunsClient(RecordingVolume):
     def reload(self) -> None:
         self.reload_count += 1
         self.events.append(("reload", self.reload_count))
+
+
+def _stage_a_dependency_kwargs(
+    plan: modal_plan.PilotPlan,
+    pilot_repo: Path,
+    runs: RecordingVolume,
+    *,
+    resume: bool,
+) -> dict[str, object]:
+    bundle = build_input_bundle(pilot_repo)
+    inputs = RecordingVolume(_bundle_volume_files(bundle, pilot_repo))
+    file_contents, manifest, smoke = _stage_a_test_dependency_evidence(plan)
+    model_cache_artifact_id = str(manifest["artifact_id"])
+    snapshot_root = (
+        "/canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots/"
+        f"{plan.model_revision}"
+    )
+    model_files = {
+        f"{snapshot_root}/{path}": content
+        for path, content in file_contents.items()
+    }
+    model_files[
+        "/canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots/"
+        f"{plan.model_revision}.manifest.json"
+    ] = (canonical_json(manifest) + "\n").encode("utf-8")
+    model = RecordingVolume(model_files)
+    smoke_id = str(smoke["artifact_id"])
+    runs.files[
+        f"/runs/{plan.run_id}/receipts/smoke/{smoke_id}.json"
+    ] = (canonical_json(smoke) + "\n").encode("utf-8")
+    approval = modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=resume,
+        smoke_receipt_artifact_id=smoke_id,
+        model_cache_artifact_id=model_cache_artifact_id,
+    )
+    return {
+        "inputs_client": inputs,
+        "model_client": model,
+        "smoke_receipt_artifact_id": smoke_id,
+        "model_cache_artifact_id": model_cache_artifact_id,
+        "approval_payload": approval,
+    }
+
+
+def test_stage_a_dependency_preflight_binds_exact_bundle_cache_and_smoke(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+) -> None:
+    """Would fail if H100 approval could name unreviewed staged evidence."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    runs = RecordingVolume()
+    kwargs = _stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False)
+
+    evidence = imported_adapter.preflight_stage_a_dependencies(
+        plan,
+        inputs_client=kwargs["inputs_client"],
+        model_client=kwargs["model_client"],
+        runs_client=runs,
+        smoke_receipt_artifact_id=kwargs["smoke_receipt_artifact_id"],
+        model_cache_artifact_id=kwargs["model_cache_artifact_id"],
+    )
+
+    assert evidence.bundle_id == plan.bundle_id
+    assert evidence.model_cache_artifact_id == kwargs["model_cache_artifact_id"]
+    assert evidence.smoke_receipt_artifact_id == kwargs["smoke_receipt_artifact_id"]
+    with pytest.raises(ValueError, match="model-cache artifact"):
+        imported_adapter.preflight_stage_a_dependencies(
+            plan,
+            inputs_client=kwargs["inputs_client"],
+            model_client=kwargs["model_client"],
+            runs_client=runs,
+            smoke_receipt_artifact_id=kwargs["smoke_receipt_artifact_id"],
+            model_cache_artifact_id="0" * 64,
+        )
+
+    model = kwargs["model_client"]
+    assert isinstance(model, RecordingVolume)
+    snapshot_file = next(
+        path for path in model.files if path.endswith("/config.json")
+    )
+    model.files[snapshot_file] = b"tampered-but-still-listed"
+    with pytest.raises(ValueError, match="model-cache file"):
+        imported_adapter.preflight_stage_a_dependencies(
+            plan,
+            inputs_client=kwargs["inputs_client"],
+            model_client=model,
+            runs_client=runs,
+            smoke_receipt_artifact_id=kwargs["smoke_receipt_artifact_id"],
+            model_cache_artifact_id=kwargs["model_cache_artifact_id"],
+        )
+
+
+def test_stage_a_dependency_preflight_rejects_self_hashed_extra_smoke_schema(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+) -> None:
+    """Would fail if a self-hashed receipt could invent its own smoke schema."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    runs = RecordingVolume()
+    kwargs = _stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False)
+    original_id = str(kwargs["smoke_receipt_artifact_id"])
+    original_path = f"/runs/{plan.run_id}/receipts/smoke/{original_id}.json"
+    smoke = json.loads(runs.files.pop(original_path))
+    smoke["unapproved_extra"] = "self-hashed"
+    smoke.pop("artifact_id")
+    smoke["artifact_id"] = modal_artifacts.sha256_json(smoke)
+    changed_id = str(smoke["artifact_id"])
+    runs.files[f"/runs/{plan.run_id}/receipts/smoke/{changed_id}.json"] = (
+        canonical_json(smoke) + "\n"
+    ).encode("utf-8")
+
+    with pytest.raises(ValueError, match="smoke receipt"):
+        imported_adapter.preflight_stage_a_dependencies(
+            plan,
+            inputs_client=kwargs["inputs_client"],
+            model_client=kwargs["model_client"],
+            runs_client=runs,
+            smoke_receipt_artifact_id=changed_id,
+            model_cache_artifact_id=kwargs["model_cache_artifact_id"],
+        )
 
 
 def _canonical_stage_a_files(
@@ -1686,6 +2466,14 @@ def _canonical_stage_a_files(
             "evidence.jsonl": evidence,
         }
     command = job.training_command if stage == "train" else job.selection_command
+    _files, cache_manifest, smoke_receipt = _stage_a_test_dependency_evidence(plan)
+    approval = modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=False,
+        smoke_receipt_artifact_id=str(smoke_receipt["artifact_id"]),
+        model_cache_artifact_id=str(cache_manifest["artifact_id"]),
+    )
     paths = tuple(sorted(producer_files))
     receipt = AttemptReceipt(
         schema_version=1,
@@ -1699,7 +2487,10 @@ def _canonical_stage_a_files(
         command_hash=hashlib.sha256(command.encode("utf-8")).hexdigest(),
         source_hash=plan.source_hash,
         dependency_lock_hash=plan.dependency_lock_hash,
-        model_cache_artifact_id="e" * 64,
+        model_cache_artifact_id=str(cache_manifest["artifact_id"]),
+        stage_a_action_digest=str(approval["approval_digest"]),
+        stage_a_resume=False,
+        smoke_receipt_artifact_id=str(approval["smoke_receipt_artifact_id"]),
         requested_gpu="H100",
         observed_gpu="NVIDIA H100 80GB HBM3",
         started_at="2026-08-05T00:00:00+00:00",
@@ -1714,12 +2505,39 @@ def _canonical_stage_a_files(
             hashlib.sha256(producer_files[path]).hexdigest() for path in paths
         ),
         failure_reason=None,
+        plan_digest=plan.plan_digest,
+        config_hash=plan.config_hash,
+        split_artifact_id=plan.split_artifact_id,
+        materialization_artifact_ids=plan.materialization_artifact_ids,
+        model_revision=plan.model_revision,
+        modal_app_id="ap-test",
+        modal_app_name="phase-marker-pilot-stage-a",
+        modal_function_name=(
+            "run_training_job" if stage == "train" else "run_selection_job"
+        ),
+        modal_function_call_id=f"fc-{stage}-{job.arm}",
+        modal_input_id=f"in-{stage}-{job.arm}",
+        python_version="3.12.test",
+        torch_version="2.7.test",
+        cuda_runtime_version="12.8.test",
+        cuda_driver_version="570.test",
+        runtime_versions=tuple(
+            (module, "locked-test-version")
+            for module in modal_artifacts.LOCKED_RUNTIME_MODULES
+        ),
         artifact_id="",
     )
     receipt = replace(receipt, artifact_id=receipt.recomputed_artifact_id())
     receipt_payload = asdict(receipt)
     receipt_payload["expected_outputs"] = list(receipt.expected_outputs)
     receipt_payload["output_hashes"] = list(receipt.output_hashes)
+    receipt_payload["materialization_artifact_ids"] = list(
+        receipt.materialization_artifact_ids
+    )
+    receipt_payload["runtime_versions"] = [
+        {"module": module, "version": version}
+        for module, version in receipt.runtime_versions
+    ]
     files = {
         f"{producer}/{path}": content for path, content in producer_files.items()
     }
@@ -1755,7 +2573,9 @@ def _publishing_stage_a_function(
         receipts,
         events,
         before_first=before_first,
-        after_result=lambda arm: runs.files.update(publications[arm]),
+        after_result=lambda arm, receipt: _publish_stage_a_result(
+            publications[arm], receipt, runs
+        ),
     )
     return function, receipts
 
@@ -1800,13 +2620,40 @@ def _stage_a_summary(
     training: dict[str, dict[str, object]],
     selection: dict[str, dict[str, object]],
 ) -> dict[str, object]:
+    receipt_matrix = [
+        *(training[job.arm] for job in plan.jobs),
+        *(selection[job.arm] for job in plan.jobs),
+    ]
+    first = receipt_matrix[0]
     payload: dict[str, object] = {
         "schema_version": 1,
         "stage": "stage-a",
         "run_id": plan.run_id,
+        "plan_digest": plan.plan_digest,
+        "stage_a_action_digest": first["stage_a_action_digest"],
+        "stage_a_resume": first["stage_a_resume"],
+        "smoke_receipt_artifact_id": first["smoke_receipt_artifact_id"],
+        "model_cache_artifact_id": first["model_cache_artifact_id"],
+        "receipt_approval_history": modal_artifacts._receipt_approval_history(
+            receipt_matrix
+        ),
         "training_receipt_ids": [training[job.arm]["artifact_id"] for job in plan.jobs],
         "selection_receipt_ids": [selection[job.arm]["artifact_id"] for job in plan.jobs],
         "behavior_gate_checked_artifact_ids": [],
+        "elapsed_gpu_seconds": {
+            "training": sum(
+                float(training[job.arm]["elapsed_seconds"]) for job in plan.jobs
+            ),
+            "selection": sum(
+                float(selection[job.arm]["elapsed_seconds"]) for job in plan.jobs
+            ),
+            "total": sum(
+                float(receipts[job.arm]["elapsed_seconds"])
+                for receipts in (training, selection)
+                for job in plan.jobs
+            ),
+        },
+        "finalizer_provenance": _adapter_execution_provenance("finalizer"),
         "next_command": "./.venv/bin/python -m phase_marker.behavior run",
         "stopped_before_behavior": True,
     }
@@ -1862,7 +2709,7 @@ def test_stage_a_validates_all_training_before_selection_and_stops(
     monkeypatch.setattr(
         imported_adapter,
         "apply_approved_app_tags",
-        lambda approved: events.append(("tags", approved.run_id)),
+        lambda approved, **_: events.append(("tags", approved.run_id)),
     )
 
     summary = imported_adapter.run_stage_a_local(
@@ -1874,12 +2721,13 @@ def test_stage_a_validates_all_training_before_selection_and_stops(
         selection_function=selection,
         finalizer_function=finalizer,
         runs_client=runs,
+        **_stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False),
     )
 
     assert len(training.calls) == 6
     assert len(selection.calls) == 6
     assert len(finalizer.calls) == 1
-    assert runs.reload_count == 2
+    assert runs.reload_count == 3
     assert summary["stopped_before_behavior"] is True
     assert summary == finalizer.summary
     first_gpu = min(index for index, event in enumerate(events) if event[0] in {"train", "selection"})
@@ -1923,11 +2771,15 @@ def test_stage_a_post_reload_canonical_failure_aborts_before_next_stage(
         )
     training = StageAMapFunction(
         "train", training_results, events,
-        after_result=lambda arm: runs.files.update(training_files[arm]),
+        after_result=lambda arm, receipt: _publish_stage_a_result(
+            training_files[arm], receipt, runs
+        ),
     )
     selection = StageAMapFunction(
         "selection", selection_results, events,
-        after_result=lambda arm: runs.files.update(selection_files[arm]),
+        after_result=lambda arm, receipt: _publish_stage_a_result(
+            selection_files[arm], receipt, runs
+        ),
     )
     finalizer = StageAFinalizer(
         _stage_a_summary(plan, training_results, selection_results), events
@@ -1935,7 +2787,9 @@ def test_stage_a_post_reload_canonical_failure_aborts_before_next_stage(
     monkeypatch.setattr(
         imported_adapter, "validate_canonical_job_semantics", lambda **_: None
     )
-    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", lambda _: None)
+    monkeypatch.setattr(
+        imported_adapter, "apply_approved_app_tags", lambda _plan, **_: None
+    )
 
     with pytest.raises(ValueError, match="canonical|receipt|artifact|output"):
         imported_adapter.run_stage_a_local(
@@ -1947,6 +2801,7 @@ def test_stage_a_post_reload_canonical_failure_aborts_before_next_stage(
             selection_function=selection,
             finalizer_function=finalizer,
             runs_client=runs,
+            **_stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False),
         )
 
     if completed_stage == "train":
@@ -1971,6 +2826,7 @@ def test_training_failure_prevents_every_selection(
         job.arm: _stage_a_receipt(plan, job, "selection") for job in plan.jobs
     }
     events: list[tuple[object, ...]] = []
+    runs = StageARunsClient({}, events)
     training = StageAMapFunction("train", training_results, events)
     selection = StageAMapFunction("selection", selection_results, events)
     finalizer = StageAFinalizer(
@@ -1983,7 +2839,7 @@ def test_training_failure_prevents_every_selection(
     )
 
     monkeypatch.setattr(
-        imported_adapter, "apply_approved_app_tags", lambda approved: None
+        imported_adapter, "apply_approved_app_tags", lambda approved, **_: None
     )
     with pytest.raises(RuntimeError, match="dot"):
         imported_adapter.run_stage_a_local(
@@ -1994,7 +2850,8 @@ def test_training_failure_prevents_every_selection(
             training_function=training,
             selection_function=selection,
             finalizer_function=finalizer,
-            runs_client=EmptyStageARunsClient(events),
+            runs_client=runs,
+            **_stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False),
         )
     assert selection.calls == []
     assert finalizer.calls == []
@@ -2019,10 +2876,14 @@ def test_selection_failure_prevents_cpu_finalization(
         "selection",
         selection_results,
         events,
-        after_result=lambda arm: runs.files.update(selection_files[arm]),
+        after_result=lambda arm, receipt: _publish_stage_a_result(
+            selection_files[arm], receipt, runs
+        ),
     )
     finalizer = StageAFinalizer({}, events)
-    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", lambda _: None)
+    monkeypatch.setattr(
+        imported_adapter, "apply_approved_app_tags", lambda _plan, **_: None
+    )
     monkeypatch.setattr(
         imported_adapter, "validate_canonical_job_semantics", lambda **_: None
     )
@@ -2037,6 +2898,7 @@ def test_selection_failure_prevents_cpu_finalization(
             selection_function=selection,
             finalizer_function=finalizer,
             runs_client=runs,
+            **_stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False),
         )
     assert len(training.calls) == 6
     assert finalizer.calls == []
@@ -2054,7 +2916,11 @@ def test_stage_a_mismatched_run_id_aborts_before_preflight_tags_or_remote_calls(
     selection = StageAMapFunction("selection", {}, events)
     finalizer = StageAFinalizer({}, events)
     tags: list[object] = []
-    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tags.append)
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda plan, **_: tags.append(plan),
+    )
 
     with pytest.raises(ValueError, match="full approved run ID"):
         imported_adapter.run_stage_a_local(
@@ -2095,13 +2961,17 @@ def test_explicit_resume_revalidates_existing_and_schedules_only_missing_arms(
         "train",
         training_results,
         events,
-        after_result=lambda arm: runs.files.update(training_files[arm]),
+        after_result=lambda arm, receipt: _publish_stage_a_result(
+            training_files[arm], receipt, runs
+        ),
     )
     selection = StageAMapFunction(
         "selection",
         selection_results,
         events,
-        after_result=lambda arm: runs.files.update(selection_files[arm]),
+        after_result=lambda arm, receipt: _publish_stage_a_result(
+            selection_files[arm], receipt, runs
+        ),
     )
     finalizer = StageAFinalizer(
         _stage_a_summary(plan, training_results, selection_results), events
@@ -2124,7 +2994,7 @@ def test_explicit_resume_revalidates_existing_and_schedules_only_missing_arms(
     monkeypatch.setattr(
         imported_adapter,
         "apply_approved_app_tags",
-        lambda approved: events.append(("tags", approved.run_id)),
+        lambda approved, **_: events.append(("tags", approved.run_id)),
     )
 
     summary = imported_adapter.run_stage_a_local(
@@ -2136,6 +3006,7 @@ def test_explicit_resume_revalidates_existing_and_schedules_only_missing_arms(
         selection_function=selection,
         finalizer_function=finalizer,
         runs_client=runs,
+        **_stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=True),
     )
 
     assert [payload["job"]["arm"] for payload in training.calls] == [
@@ -2152,10 +3023,56 @@ def test_explicit_resume_revalidates_existing_and_schedules_only_missing_arms(
     ]
     printed = json.loads(capsys.readouterr().out)
     assert printed["resume"] is True
-    assert printed["missing_training_arms"] == ["dot", "random", "direct", "filler"]
+    assert [item["arm"] for item in printed["missing_training"]] == [
+        "dot", "random", "direct", "filler"
+    ]
     assert summary["stopped_before_behavior"] is True
     assert all(runs.files[path] == content for path, content in original_files.items())
     assert runs.files[failed_attempt] == original_files[failed_attempt]
+
+
+def test_explicit_resume_returns_existing_complete_summary_without_remote_calls(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a post-finalizer client crash forced a conflicting re-finalization."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    runs, _training_receipts, _selection_receipts = _complete_status_volume(plan)
+    summary = json.loads(
+        runs.files[f"/runs/{plan.run_id}/stage-a-summary.json"]
+    )
+    events: list[tuple[object, ...]] = []
+    training = StageAMapFunction("train", {}, events)
+    selection = StageAMapFunction("selection", {}, events)
+    finalizer = StageAFinalizer({}, events)
+    tags: list[object] = []
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda approved, **_: tags.append(approved),
+    )
+    monkeypatch.setattr(
+        imported_adapter, "validate_canonical_job_semantics", lambda **_: None
+    )
+
+    result = imported_adapter.run_stage_a_local(
+        plan,
+        approved_run_id=plan.run_id,
+        budget_acknowledged=True,
+        resume=True,
+        training_function=training,
+        selection_function=selection,
+        finalizer_function=finalizer,
+        runs_client=runs,
+        **_stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=True),
+    )
+
+    assert result == summary
+    assert training.calls == []
+    assert selection.calls == []
+    assert finalizer.calls == []
+    assert tags == []
 
 
 @pytest.mark.parametrize("corruption", ("receipt", "manifest"))
@@ -2179,8 +3096,13 @@ def test_resume_corrupt_canonical_output_aborts_before_tags_or_remote_calls(
     training = StageAMapFunction("train", {}, events)
     selection = StageAMapFunction("selection", {}, events)
     finalizer = StageAFinalizer({}, events)
+    runs = StageARunsClient(files, events)
     tags: list[object] = []
-    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tags.append)
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda plan, **_: tags.append(plan),
+    )
 
     with pytest.raises(ValueError, match="receipt|manifest|canonical"):
         imported_adapter.run_stage_a_local(
@@ -2191,12 +3113,376 @@ def test_resume_corrupt_canonical_output_aborts_before_tags_or_remote_calls(
             training_function=training,
             selection_function=selection,
             finalizer_function=finalizer,
-            runs_client=StageARunsClient(files, events),
+            runs_client=runs,
+            **_stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=True),
         )
     assert tags == []
     assert training.calls == []
     assert selection.calls == []
     assert finalizer.calls == []
+
+
+def _stage_a_promotion_lease(
+    receipt_payload: dict[str, object],
+) -> tuple[bytes, dict[str, object], datetime, dict[str, object]]:
+    receipt = modal_artifacts.load_attempt_receipt_payload(receipt_payload)
+    owner_started = datetime.now().astimezone() - timedelta(hours=6)
+    receipt = replace(
+        receipt,
+        attempt_id=str(uuid.uuid4()),
+        started_at=owner_started.isoformat(timespec="microseconds"),
+        finished_at=(owner_started + timedelta(minutes=1)).isoformat(
+            timespec="microseconds"
+        ),
+        artifact_id="",
+    )
+    receipt = replace(receipt, artifact_id=receipt.recomputed_artifact_id())
+    normalized_receipt = asdict(receipt)
+    normalized_receipt["expected_outputs"] = list(receipt.expected_outputs)
+    normalized_receipt["output_hashes"] = list(receipt.output_hashes)
+    normalized_receipt["materialization_artifact_ids"] = list(
+        receipt.materialization_artifact_ids
+    )
+    normalized_receipt["runtime_versions"] = [
+        {"module": module, "version": version}
+        for module, version in receipt.runtime_versions
+    ]
+    created_at = owner_started + timedelta(seconds=1)
+    lease = modal_artifacts._promotion_lease_payload(
+        receipt, created_at=created_at
+    )
+    expired_at = datetime.fromisoformat(str(lease["recover_after"])) + timedelta(
+        microseconds=1
+    )
+    return (
+        (canonical_json(lease) + "\n").encode("utf-8"),
+        lease,
+        expired_at,
+        normalized_receipt,
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_error", "move_producer", "canonical_complete"),
+    (
+        ("live-lease", "live promotion lease", None, False),
+        ("malformed-lease", "promotion lease", None, False),
+        ("producer-without-lease", "authenticated expired lease", None, False),
+        ("expired-producer", None, True, False),
+        ("expired-lease-only", None, False, False),
+        ("expired-complete", None, False, True),
+    ),
+)
+def test_resume_promotion_lease_state_matrix(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    state: str,
+    expected_error: str | None,
+    move_producer: bool | None,
+    canonical_complete: bool,
+) -> None:
+    """Would fail if resume guessed ownership or recovered a live promotion."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    job = plan.jobs[0]
+    files, receipt = _canonical_stage_a_files(plan, job, "train")
+    receipt_path = next(path for path in files if "/receipts/canonical/" in path)
+    producer = imported_adapter._volume_producer_path(plan.run_id, "train", job.arm)
+    lock = imported_adapter._volume_promotion_lock_path(plan.run_id, "train", job.arm)
+    lease_bytes, lease, expired_at, receipt = _stage_a_promotion_lease(receipt)
+    files[receipt_path] = (canonical_json(receipt) + "\n").encode("utf-8")
+    observed_at = expired_at
+    if not canonical_complete:
+        files.pop(receipt_path)
+    if state == "expired-lease-only":
+        files = {
+            path: content
+            for path, content in files.items()
+            if not path.startswith(producer.rstrip("/") + "/")
+        }
+    if state != "producer-without-lease":
+        files[lock] = b"{}\n" if state == "malformed-lease" else lease_bytes
+    if state == "live-lease":
+        observed_at = datetime.fromisoformat(str(lease["lease_created_at"]))
+    runs = StageARunsClient(files, [])
+
+    if expected_error is not None:
+        with pytest.raises((FileExistsError, ValueError), match=expected_error):
+            imported_adapter._preflight_stage_a_outputs(
+                plan, resume=True, runs_client=runs, now=observed_at
+            )
+        return
+
+    preflight = imported_adapter._preflight_stage_a_outputs(
+        plan, resume=True, runs_client=runs, now=observed_at
+    )
+
+    assert len(preflight.recoveries) == 1
+    recovery = preflight.recoveries[0]
+    assert recovery["stage"] == "train"
+    assert recovery["arm"] == job.arm
+    assert recovery["producer_path"] == producer
+    assert recovery["lock_path"] == lock
+    assert recovery["quarantine_root"].startswith(
+        f"/runs/{plan.run_id}/attempts/orphan-recovery-"
+    )
+    assert recovery["move_producer"] is move_producer
+    assert recovery["lock_artifact_id"] == lease["artifact_id"]
+    assert (job.arm in preflight.training) is canonical_complete
+
+
+def test_direct_orphan_recovery_rejects_live_authenticated_lease(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """Would fail if the remote trust boundary relied on local expiry preflight."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    job = plan.jobs[0]
+    receipt_payload = _stage_a_receipt(plan, job, "train")
+    started = datetime.now().astimezone()
+    receipt_payload.update(
+        attempt_id=str(uuid.uuid4()),
+        started_at=started.isoformat(timespec="microseconds"),
+        finished_at=started.isoformat(timespec="microseconds"),
+    )
+    receipt_payload.pop("artifact_id")
+    receipt_payload["artifact_id"] = modal_artifacts.sha256_json(receipt_payload)
+    receipt = modal_artifacts.load_attempt_receipt_payload(receipt_payload)
+    lease = modal_artifacts._promotion_lease_payload(
+        receipt, created_at=started + timedelta(microseconds=1)
+    )
+    spec = imported_adapter._stage_a_orphan_recovery_spec(
+        plan,
+        stage="train",
+        arm=job.arm,
+        producer_present=False,
+        receipt_present=False,
+        lock_present=True,
+        move_producer=False,
+        lease=lease,
+    )
+    mount = tmp_path / "runs-mount"
+    local_lock = mount.joinpath(
+        *PurePosixPath(str(spec["lock_path"])).parts[1:]
+    )
+    local_lock.parent.mkdir(parents=True)
+    local_lock.write_text(canonical_json(lease) + "\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="live promotion lease"):
+        imported_adapter._recover_stage_a_orphans(
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            recoveries=[spec],
+            input_root=pilot_repo,
+            run_mount_root=mount,
+        )
+
+    quarantine = mount.joinpath(
+        *PurePosixPath(str(spec["quarantine_root"])).parts[1:]
+    )
+    assert local_lock.is_file()
+    assert not quarantine.exists()
+
+
+def test_direct_orphan_recovery_rejects_inconsistent_move_state(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """Would fail if a direct call could remove the lease but retain its orphan."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    job = plan.jobs[0]
+    files, receipt_payload = _canonical_stage_a_files(plan, job, "train")
+    receipt_path = next(path for path in files if "/receipts/canonical/" in path)
+    files.pop(receipt_path)
+    lease_bytes, lease, _expired_at, _receipt = _stage_a_promotion_lease(
+        receipt_payload
+    )
+    lock = imported_adapter._volume_promotion_lock_path(
+        plan.run_id, "train", job.arm
+    )
+    files[lock] = lease_bytes
+    spec = imported_adapter._stage_a_orphan_recovery_spec(
+        plan,
+        stage="train",
+        arm=job.arm,
+        producer_present=True,
+        receipt_present=False,
+        lock_present=True,
+        move_producer=True,
+        lease=lease,
+    )
+    spec["move_producer"] = False
+    mount = tmp_path / "runs-mount"
+    for remote_path, content in files.items():
+        local = mount.joinpath(*PurePosixPath(remote_path).parts[1:])
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(content)
+    producer = mount.joinpath(
+        *PurePosixPath(str(spec["producer_path"])).parts[1:]
+    )
+    local_lock = mount.joinpath(*PurePosixPath(lock).parts[1:])
+
+    with pytest.raises(ValueError, match="recovery record identity"):
+        imported_adapter._recover_stage_a_orphans(
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            recoveries=[spec],
+            input_root=pilot_repo,
+            run_mount_root=mount,
+        )
+
+    assert producer.is_dir()
+    assert local_lock.is_file()
+
+
+def test_orphan_quarantine_hard_crash_preserves_first_move_and_retries_uniquely(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a hard crash rolled back, reused, deleted, or adopted residue."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    job = plan.jobs[0]
+    files, _receipt = _canonical_stage_a_files(plan, job, "train")
+    receipt_path = next(path for path in files if "/receipts/canonical/" in path)
+    receipt = json.loads(files[receipt_path])
+    files.pop(receipt_path)
+    producer = imported_adapter._volume_producer_path(plan.run_id, "train", job.arm)
+    lock = imported_adapter._volume_promotion_lock_path(plan.run_id, "train", job.arm)
+    lease_bytes, _lease, expired_at, _receipt = _stage_a_promotion_lease(receipt)
+    files[lock] = lease_bytes
+    preflight = imported_adapter._preflight_stage_a_outputs(
+        plan, resume=True, runs_client=StageARunsClient(files, []), now=expired_at
+    )
+    first = preflight.recoveries[0]
+    mount = tmp_path / "runs-mount"
+    for remote_path, content in files.items():
+        local = mount.joinpath(*PurePosixPath(remote_path).parts[1:])
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(content)
+
+    real_rename = imported_adapter.os.rename
+    rename_calls = 0
+
+    def crash_after_producer(
+        source: object, destination: object, *args: object, **kwargs: object,
+    ) -> None:
+        nonlocal rename_calls
+        rename_calls += 1
+        if rename_calls == 2:
+            raise KeyboardInterrupt("simulated hard crash")
+        real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(imported_adapter.os, "rename", crash_after_producer)
+    with pytest.raises(KeyboardInterrupt, match="hard crash"):
+        imported_adapter._recover_stage_a_orphans(
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            recoveries=[first],
+            input_root=pilot_repo,
+            run_mount_root=mount,
+        )
+
+    first_quarantine = mount.joinpath(
+        *PurePosixPath(str(first["quarantine_root"])).parts[1:]
+    )
+    local_producer = mount.joinpath(*PurePosixPath(producer).parts[1:])
+    local_lock = mount.joinpath(*PurePosixPath(lock).parts[1:])
+    assert (first_quarantine / "producer").is_dir()
+    assert not local_producer.exists()
+    assert local_lock.is_file()
+
+    monkeypatch.setattr(imported_adapter.os, "rename", real_rename)
+    mounted_files = {
+        "/" + path.relative_to(mount).as_posix(): path.read_bytes()
+        for path in mount.rglob("*")
+        if path.is_file()
+    }
+    retry_preflight = imported_adapter._preflight_stage_a_outputs(
+        plan,
+        resume=True,
+        runs_client=StageARunsClient(mounted_files, []),
+        now=expired_at,
+    )
+    assert len(retry_preflight.recoveries) == 1
+    second = retry_preflight.recoveries[0]
+    assert second["quarantine_root"] != first["quarantine_root"]
+    result = imported_adapter._recover_stage_a_orphans(
+        plan_payload=modal_plan.pilot_plan_payload(plan),
+        recoveries=[second],
+        input_root=pilot_repo,
+        run_mount_root=mount,
+    )
+    second_quarantine = mount.joinpath(
+        *PurePosixPath(str(second["quarantine_root"])).parts[1:]
+    )
+    assert result["quarantined"] == [second]
+    assert (first_quarantine / "producer").is_dir()
+    assert (second_quarantine / "promotion.lock").is_file()
+    assert not local_lock.exists()
+
+
+def test_orphan_quarantine_detects_source_inode_swap_without_deleting_residue(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a checked path could be swapped before its quarantine rename."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    job = plan.jobs[0]
+    files, receipt = _canonical_stage_a_files(plan, job, "train")
+    receipt_path = next(path for path in files if "/receipts/canonical/" in path)
+    files.pop(receipt_path)
+    producer = imported_adapter._volume_producer_path(plan.run_id, "train", job.arm)
+    lock = imported_adapter._volume_promotion_lock_path(plan.run_id, "train", job.arm)
+    lease_bytes, _lease, expired_at, _receipt = _stage_a_promotion_lease(receipt)
+    files[lock] = lease_bytes
+    recovery = imported_adapter._preflight_stage_a_outputs(
+        plan,
+        resume=True,
+        runs_client=StageARunsClient(files, []),
+        now=expired_at,
+    ).recoveries[0]
+    mount = tmp_path / "runs-mount"
+    for remote_path, content in files.items():
+        local = mount.joinpath(*PurePosixPath(remote_path).parts[1:])
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(content)
+    local_producer = mount.joinpath(*PurePosixPath(producer).parts[1:])
+    attacker = local_producer.parent / ".attacker-swap"
+    attacker.mkdir()
+    (attacker / "unvalidated.txt").write_text("attacker", encoding="utf-8")
+    parked = local_producer.parent / ".validated-original"
+    real_rename = imported_adapter.os.rename
+    swapped = False
+
+    def swap_before_rename(
+        source: object, destination: object, *args: object, **kwargs: object,
+    ) -> None:
+        nonlocal swapped
+        if not swapped and source == job.arm and destination == "producer":
+            swapped = True
+            source_fd = int(kwargs["src_dir_fd"])
+            real_rename(job.arm, parked.name, src_dir_fd=source_fd, dst_dir_fd=source_fd)
+            real_rename(attacker.name, job.arm, src_dir_fd=source_fd, dst_dir_fd=source_fd)
+        real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(imported_adapter.os, "rename", swap_before_rename)
+    with pytest.raises(OSError, match="identity changed"):
+        imported_adapter._recover_stage_a_orphans(
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            recoveries=[recovery],
+            input_root=pilot_repo,
+            run_mount_root=mount,
+        )
+
+    quarantine = mount.joinpath(
+        *PurePosixPath(str(recovery["quarantine_root"])).parts[1:]
+    )
+    assert swapped is True
+    assert parked.is_dir()
+    assert (quarantine / "producer" / "unvalidated.txt").read_text() == "attacker"
+    assert mount.joinpath(*PurePosixPath(lock).parts[1:]).is_file()
 
 
 def test_resume_semantically_invalid_self_consistent_training_aborts_before_remote_calls(
@@ -2224,7 +3510,12 @@ def test_resume_semantically_invalid_self_consistent_training_aborts_before_remo
     selection = StageAMapFunction("selection", {}, events)
     finalizer = StageAFinalizer({}, events)
     tags: list[object] = []
-    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tags.append)
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda plan, **_: tags.append(plan),
+    )
+    runs = StageARunsClient(files, events)
 
     with pytest.raises(ValueError, match="training|completion|semantic"):
         imported_adapter.run_stage_a_local(
@@ -2235,7 +3526,8 @@ def test_resume_semantically_invalid_self_consistent_training_aborts_before_remo
             training_function=training,
             selection_function=selection,
             finalizer_function=finalizer,
-            runs_client=StageARunsClient(files, events),
+            runs_client=runs,
+            **_stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=True),
         )
     assert tags == []
     assert training.calls == [] and selection.calls == [] and finalizer.calls == []
@@ -2254,7 +3546,12 @@ def test_initial_stage_a_refuses_existing_output_before_tags_or_remote_calls(
     selection = StageAMapFunction("selection", {}, events)
     finalizer = StageAFinalizer({}, events)
     tags: list[object] = []
-    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tags.append)
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda plan, **_: tags.append(plan),
+    )
+    runs = StageARunsClient(files, events)
 
     with pytest.raises(FileExistsError, match="use --resume"):
         imported_adapter.run_stage_a_local(
@@ -2265,7 +3562,8 @@ def test_initial_stage_a_refuses_existing_output_before_tags_or_remote_calls(
             training_function=training,
             selection_function=selection,
             finalizer_function=finalizer,
-            runs_client=StageARunsClient(files, events),
+            runs_client=runs,
+            **_stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False),
         )
     assert tags == []
     assert training.calls == [] and selection.calls == [] and finalizer.calls == []
@@ -2292,7 +3590,12 @@ def test_initial_stage_a_refuses_summary_or_unexpected_canonical_namespace(
     selection = StageAMapFunction("selection", {}, events)
     finalizer = StageAFinalizer({}, events)
     tags: list[object] = []
-    monkeypatch.setattr(imported_adapter, "apply_approved_app_tags", tags.append)
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda plan, **_: tags.append(plan),
+    )
+    runs = StageARunsClient(files, events)
 
     with pytest.raises((FileExistsError, ValueError), match="canonical|summary"):
         imported_adapter.run_stage_a_local(
@@ -2303,7 +3606,8 @@ def test_initial_stage_a_refuses_summary_or_unexpected_canonical_namespace(
             training_function=training,
             selection_function=selection,
             finalizer_function=finalizer,
-            runs_client=StageARunsClient(files, events),
+            runs_client=runs,
+            **_stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False),
         )
     assert tags == []
     assert training.calls == [] and selection.calls == [] and finalizer.calls == []
@@ -2324,6 +3628,11 @@ def _complete_status_volume(
     summary = _stage_a_summary(plan, training, selection)
     files[f"/runs/{plan.run_id}/stage-a-summary.json"] = (
         canonical_json(summary) + "\n"
+    ).encode("utf-8")
+    _cache_files, _cache_manifest, smoke = _stage_a_test_dependency_evidence(plan)
+    smoke_id = str(smoke["artifact_id"])
+    files[f"/runs/{plan.run_id}/receipts/smoke/{smoke_id}.json"] = (
+        canonical_json(smoke) + "\n"
     ).encode("utf-8")
     return StageARunsClient(files, events), training, selection
 
@@ -2347,6 +3656,70 @@ def test_status_reads_validated_receipts_and_producer_manifests_without_mutation
     assert not any(event[0] in {"batch_upload", "commit", "reload"} for event in volume.events)
 
 
+def test_status_validates_mixed_fresh_and_resume_receipt_approval_history(
+    imported_adapter: ModuleType, pilot_repo: Path,
+) -> None:
+    """Would fail if status flattened a legitimate resumed Stage A lineage."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, training, selection = _complete_status_volume(plan)
+    first = training[plan.jobs[0].arm]
+    resumed_approval = modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=True,
+        smoke_receipt_artifact_id=str(first["smoke_receipt_artifact_id"]),
+        model_cache_artifact_id=str(first["model_cache_artifact_id"]),
+    )
+    for job in plan.jobs[3:]:
+        receipt = dict(selection[job.arm])
+        receipt["stage_a_action_digest"] = resumed_approval["approval_digest"]
+        receipt["stage_a_resume"] = True
+        unsigned = dict(receipt)
+        unsigned.pop("artifact_id")
+        receipt["artifact_id"] = modal_artifacts.sha256_json(unsigned)
+        selection[job.arm] = receipt
+        volume.files[
+            f"/runs/{plan.run_id}/receipts/canonical/selection/{job.arm}.json"
+        ] = (canonical_json(receipt) + "\n").encode("utf-8")
+    summary = _stage_a_summary(plan, training, selection)
+    summary["stage_a_action_digest"] = resumed_approval["approval_digest"]
+    summary["stage_a_resume"] = True
+    summary.pop("artifact_id")
+    summary["artifact_id"] = modal_artifacts.sha256_json(summary)
+    volume.files[f"/runs/{plan.run_id}/stage-a-summary.json"] = (
+        canonical_json(summary) + "\n"
+    ).encode("utf-8")
+
+    result = imported_adapter.status_local(volume, run_id=plan.run_id)
+
+    assert result["valid"] is True
+    assert result["summary"] == "complete"
+    assert len(summary["receipt_approval_history"]) == 2
+    assert {
+        item["stage_a_resume"] for item in summary["receipt_approval_history"]
+    } == {False, True}
+
+
+def test_status_rejects_self_hashed_incomplete_receipt_approval_history(
+    imported_adapter: ModuleType, pilot_repo: Path,
+) -> None:
+    """Would fail if summary approval history could omit a canonical receipt."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    summary_path = f"/runs/{plan.run_id}/stage-a-summary.json"
+    summary = json.loads(volume.files[summary_path])
+    summary["receipt_approval_history"][0]["receipt_artifact_ids"].pop()
+    summary.pop("artifact_id")
+    summary["artifact_id"] = modal_artifacts.sha256_json(summary)
+    volume.files[summary_path] = (canonical_json(summary) + "\n").encode("utf-8")
+
+    result = imported_adapter.status_local(volume, run_id=plan.run_id)
+
+    assert result["summary"] == "invalid"
+    assert result["valid"] is False
+    assert any("summary" in error for error in result["errors"])
+
+
 def test_status_reports_partial_failed_and_invalid_evidence_without_completion(
     imported_adapter: ModuleType, pilot_repo: Path,
 ) -> None:
@@ -2367,6 +3740,7 @@ def test_status_reports_partial_failed_and_invalid_evidence_without_completion(
         validated=False,
         promoted=False,
         failure_reason="RuntimeError: producer crashed",
+        failure_stage="command",
     )
     unsigned = dict(failed)
     unsigned.pop("artifact_id")
@@ -2396,7 +3770,10 @@ def test_status_rejects_unknown_or_unsafe_run_identity(
     with pytest.raises(ValueError, match="unknown run"):
         imported_adapter.status_local(
             RecordingVolume(),
-            run_id="pilot-s42-cfg-11111111-split-22222222-src-333333333333",
+            run_id=(
+                "pilot-s42-cfg-11111111-split-22222222-src-333333333333-"
+                f"plan-{'4' * 64}"
+            ),
         )
 
 
@@ -2541,6 +3918,7 @@ def _failed_attempt_payload(
         validated=False,
         promoted=False,
         failure_reason="RuntimeError: failed attempt",
+        failure_stage="command",
     )
     unsigned = dict(receipt)
     unsigned.pop("artifact_id")
@@ -2730,6 +4108,44 @@ class MutatingDownloadVolume(StageARunsClient):
         return content
 
 
+class RelistMutatingDownloadVolume(StageARunsClient):
+    def __init__(self, files: dict[str, bytes], run_root: str) -> None:
+        super().__init__(files, [])
+        self.run_root = run_root
+        self.run_root_lists = 0
+
+    def listdir(self, path: str, *, recursive: bool = False) -> list[SimpleNamespace]:
+        entries = super().listdir(path, recursive=recursive)
+        if path == self.run_root:
+            self.run_root_lists += 1
+            if self.run_root_lists >= 3:
+                entries.append(
+                    SimpleNamespace(
+                        path=f"{self.run_root}/receipts/attempts/{'f' * 64}.json",
+                        type="file",
+                    )
+                )
+        return entries
+
+
+class LateDestinationDownloadVolume(StageARunsClient):
+    def __init__(
+        self, files: dict[str, bytes], run_root: str, destination: Path,
+    ) -> None:
+        super().__init__(files, [])
+        self.run_root = run_root
+        self.destination = destination
+        self.run_root_lists = 0
+
+    def listdir(self, path: str, *, recursive: bool = False) -> list[SimpleNamespace]:
+        entries = super().listdir(path, recursive=recursive)
+        if path == self.run_root:
+            self.run_root_lists += 1
+            if self.run_root_lists == 3:
+                self.destination.mkdir()
+        return entries
+
+
 def test_download_rereads_every_advertised_producer_byte_after_status(
     imported_adapter: ModuleType, pilot_repo: Path, tmp_path: Path,
 ) -> None:
@@ -2751,33 +4167,83 @@ def test_download_rereads_every_advertised_producer_byte_after_status(
     assert not destination.exists()
 
 
+def test_download_rejects_dangling_symlink_destination_without_replacing_it(
+    imported_adapter: ModuleType, pilot_repo: Path, tmp_path: Path,
+) -> None:
+    """Would fail if exists() treated a dangling destination symlink as absent."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    destination = tmp_path / "evidence"
+    missing = tmp_path / "missing-target"
+    destination.symlink_to(missing, target_is_directory=True)
+
+    with pytest.raises(FileExistsError, match="destination already exists"):
+        imported_adapter.download_evidence_local(
+            volume, run_id=plan.run_id, destination=destination,
+        )
+
+    assert destination.is_symlink()
+    assert destination.readlink() == missing
+    assert not missing.exists()
+
+
+def test_download_atomic_publish_refuses_late_created_empty_destination(
+    imported_adapter: ModuleType, pilot_repo: Path, tmp_path: Path,
+) -> None:
+    """Would fail if final publication replaced a concurrently created directory."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    destination = tmp_path / "evidence"
+    run_root = f"/runs/{plan.run_id}"
+    late = LateDestinationDownloadVolume(volume.files, run_root, destination)
+
+    with pytest.raises(FileExistsError, match="destination already exists"):
+        imported_adapter.download_evidence_local(
+            late, run_id=plan.run_id, destination=destination,
+        )
+
+    assert late.run_root_lists == 3
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
+
+
+def test_download_relists_complete_allowlist_immediately_before_publication(
+    imported_adapter: ModuleType, pilot_repo: Path, tmp_path: Path,
+) -> None:
+    """Would fail if a late allowlisted file escaped the validated snapshot."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, _training, _selection = _complete_status_volume(plan)
+    run_root = f"/runs/{plan.run_id}"
+    mutating = RelistMutatingDownloadVolume(volume.files, run_root)
+    destination = tmp_path / "evidence"
+
+    with pytest.raises(ValueError, match="allowlist changed during download"):
+        imported_adapter.download_evidence_local(
+            mutating, run_id=plan.run_id, destination=destination,
+        )
+
+    assert mutating.run_root_lists >= 3
+    assert not destination.exists()
+
+
 def test_download_rejects_self_hashed_smoke_receipt_with_extra_schema(
     imported_adapter: ModuleType, pilot_repo: Path, tmp_path: Path,
 ) -> None:
     """Would fail if arbitrary self-hashed JSON were accepted as a smoke receipt."""
     plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
     volume, training, _selection = _complete_status_volume(plan)
-    smoke: dict[str, object] = {
-        "schema_version": 1,
-        "stage": "smoke",
-        "hardware": "CPU",
-        "run_id": plan.run_id,
-        "source_hash": plan.source_hash,
-        "dependency_lock_hash": plan.dependency_lock_hash,
-        "bundle_id": plan.bundle_id,
-        "model_revision": plan.model_revision,
-        "model_cache_artifact_id": training[plan.jobs[0].arm]["model_cache_artifact_id"],
-        "imports": [],
-        "validated": True,
-        "failure_reason": None,
-        "arbitrary": "must not export",
-    }
+    _files, _manifest, smoke = _stage_a_test_dependency_evidence(plan)
+    referenced_id = str(
+        training[plan.jobs[0].arm]["smoke_receipt_artifact_id"]
+    )
+    smoke["arbitrary"] = "must not export"
+    smoke.pop("artifact_id")
     smoke["artifact_id"] = modal_artifacts.sha256_json(smoke)
     volume.files[
-        f"/runs/{plan.run_id}/receipts/smoke/{smoke['artifact_id']}.json"
+        f"/runs/{plan.run_id}/receipts/smoke/{referenced_id}.json"
     ] = (canonical_json(smoke) + "\n").encode("utf-8")
 
-    with pytest.raises(ValueError, match="smoke receipt"):
+    with pytest.raises(ValueError, match="validated complete Stage A evidence"):
         imported_adapter.download_evidence_local(
             volume, run_id=plan.run_id, destination=tmp_path / "evidence",
         )
@@ -2807,28 +4273,18 @@ def test_download_rejects_smoke_receipt_without_exact_locked_imports(
         imports.append(dict(imports[-1]))
     else:
         imports[-1] = {"module": "unapproved_runtime", "version": "1.0"}
-    smoke: dict[str, object] = {
-        "schema_version": 1,
-        "stage": "smoke",
-        "hardware": "CPU",
-        "run_id": plan.run_id,
-        "source_hash": plan.source_hash,
-        "dependency_lock_hash": plan.dependency_lock_hash,
-        "bundle_id": plan.bundle_id,
-        "model_revision": plan.model_revision,
-        "model_cache_artifact_id": training[plan.jobs[0].arm][
-            "model_cache_artifact_id"
-        ],
-        "imports": imports,
-        "validated": True,
-        "failure_reason": None,
-    }
+    _files, _manifest, smoke = _stage_a_test_dependency_evidence(plan)
+    referenced_id = str(
+        training[plan.jobs[0].arm]["smoke_receipt_artifact_id"]
+    )
+    smoke["imports"] = imports
+    smoke.pop("artifact_id")
     smoke["artifact_id"] = modal_artifacts.sha256_json(smoke)
     volume.files[
-        f"/runs/{plan.run_id}/receipts/smoke/{smoke['artifact_id']}.json"
+        f"/runs/{plan.run_id}/receipts/smoke/{referenced_id}.json"
     ] = (canonical_json(smoke) + "\n").encode("utf-8")
 
-    with pytest.raises(ValueError, match="smoke receipt"):
+    with pytest.raises(ValueError, match="validated complete Stage A evidence"):
         imported_adapter.download_evidence_local(
             volume, run_id=plan.run_id, destination=tmp_path / "evidence",
         )
@@ -2870,7 +4326,7 @@ def test_download_evidence_is_atomic_and_strictly_allowlisted(
     )
 
     assert destination.is_dir()
-    assert len(downloaded) == 61
+    assert len(downloaded) == 62
     relative = {path.relative_to(destination).as_posix() for path in downloaded}
     assert "stage-a-summary.json" in relative
     assert sum(path.endswith("run-manifest.json") for path in relative) == 6
@@ -2883,10 +4339,44 @@ def test_download_evidence_is_atomic_and_strictly_allowlisted(
     assert sum(path.endswith(".log") for path in relative) == 12
     assert sum(path.startswith("receipts/canonical/") for path in relative) == 12
     assert sum(path.startswith("receipts/attempts/") for path in relative) == 12
+    assert sum(path.startswith("receipts/smoke/") for path in relative) == 1
     assert not any("adapter_model" in path or "model-cache" in path for path in relative)
     assert ".modal.toml" not in relative
     assert "arbitrary.bin" not in relative
     assert all(path.is_file() for path in downloaded)
+
+
+def test_download_exports_only_summary_referenced_successful_smoke_receipt(
+    imported_adapter: ModuleType, pilot_repo: Path, tmp_path: Path,
+) -> None:
+    """Would fail if unrelated smoke history polluted the evidence export."""
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    volume, training, _selection = _complete_status_volume(plan)
+    _files, _manifest, unrelated = _stage_a_test_dependency_evidence(plan)
+    unrelated["validated"] = False
+    unrelated["failure_reason"] = "RuntimeError: unrelated failed smoke"
+    unrelated.pop("artifact_id")
+    unrelated["artifact_id"] = modal_artifacts.sha256_json(unrelated)
+    unrelated_id = str(unrelated["artifact_id"])
+    volume.files[
+        f"/runs/{plan.run_id}/receipts/smoke/{unrelated_id}.json"
+    ] = (canonical_json(unrelated) + "\n").encode("utf-8")
+
+    destination = tmp_path / "evidence"
+    downloaded = imported_adapter.download_evidence_local(
+        volume, run_id=plan.run_id, destination=destination,
+    )
+
+    referenced_id = str(
+        training[plan.jobs[0].arm]["smoke_receipt_artifact_id"]
+    )
+    exported_smoke = {
+        path.relative_to(destination).as_posix()
+        for path in downloaded
+        if path.relative_to(destination).as_posix().startswith("receipts/smoke/")
+    }
+    assert exported_smoke == {f"receipts/smoke/{referenced_id}.json"}
+    assert not (destination / f"receipts/smoke/{unrelated_id}.json").exists()
 
 
 def test_download_evidence_rejects_an_unreceipted_log_escape(
