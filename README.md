@@ -120,7 +120,7 @@ After an authorized action, inspection remains separate:
 modal run --env main modal_phase_marker_inspect.py::status --run-id "$PHASE_MARKER_RUN_ID"
 
 # Explicit local write of compact allowlisted evidence after successful status.
-modal run --env main modal_phase_marker_inspect.py::download-evidence --run-id "$PHASE_MARKER_RUN_ID" --destination phase-marker-stage-a-evidence
+modal run --env main modal_phase_marker_inspect.py::download_evidence --run-id "$PHASE_MARKER_RUN_ID" --destination phase-marker-stage-a-evidence
 ```
 
 Stage A requests one H100 per job, permits Modal's automatic H200-compatible

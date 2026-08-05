@@ -383,12 +383,12 @@ def approval_action_manifest(plan: PilotPlan) -> dict[str, object]:
         "external_actions": {
             "stage_inputs": _modal_action_command(
                 plan,
-                entrypoint="stage-inputs",
+                entrypoint="stage_inputs",
                 approval=action_approval_payload(plan, action="stage-inputs"),
             ),
             "cache_model": _modal_action_command(
                 plan,
-                entrypoint="cache-model",
+                entrypoint="cache_model",
                 approval=action_approval_payload(plan, action="cache-model"),
             ),
             "smoke": _modal_action_command(
@@ -466,7 +466,7 @@ def approved_stage_a_action_manifest(
         },
         "external_action": _modal_action_command(
             plan,
-            entrypoint="run-stage-a",
+            entrypoint="run_stage_a",
             approval=approval,
             extra_arguments=extra,
         ),

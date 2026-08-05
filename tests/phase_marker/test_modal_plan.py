@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import FrozenInstanceError, replace
 import json
 from pathlib import Path
+import re
 import shutil
 import shlex
 from typing import Callable
@@ -280,8 +282,8 @@ def test_approval_action_manifest_contains_only_inert_approved_boundaries(
     assert isinstance(actions, dict)
     assert set(actions) == {"stage_inputs", "cache_model", "smoke"}
     for key, action, entrypoint in (
-        ("stage_inputs", "stage-inputs", "stage-inputs"),
-        ("cache_model", "cache-model", "cache-model"),
+        ("stage_inputs", "stage-inputs", "stage_inputs"),
+        ("cache_model", "cache-model", "cache_model"),
         ("smoke", "smoke", "smoke"),
     ):
         approval = modal_plan.action_approval_payload(plan, action=action)
@@ -312,7 +314,7 @@ def test_approval_action_manifest_contains_only_inert_approved_boundaries(
         }
     }
     serialized = canonical_json(manifest)
-    assert "modal_phase_marker.py::run-stage-a" not in serialized
+    assert "modal_phase_marker.py::run_stage_a" not in serialized
     assert "phase_marker.behavior run" not in serialized
     assert "phase_marker.activations" not in serialized
     assert "phase_marker.interventions" not in serialized
@@ -375,7 +377,7 @@ def test_stage_a_action_is_derived_only_from_reviewed_dependency_ids(
     assert payload["model_cache_artifact_id"] == cache_id
     command = shlex.split(payload["external_action"])
     assert command[:5] == [
-        "modal", "run", "--env", "main", "modal_phase_marker.py::run-stage-a"
+        "modal", "run", "--env", "main", "modal_phase_marker.py::run_stage_a"
     ]
     assert command[command.index("--approved-plan-digest") + 1] == payload[
         "plan_digest"
@@ -390,12 +392,40 @@ def test_stage_a_action_is_derived_only_from_reviewed_dependency_ids(
 
 def test_checked_in_operator_surfaces_withhold_executable_stage_a_command() -> None:
     """Would fail if the H100 boundary reappeared before reviewed dependencies."""
-    forbidden = "modal run modal_phase_marker.py::run-stage-a"
+    forbidden = "modal run modal_phase_marker.py::run_stage_a"
     for relative in (
         "README.md",
         "docs/superpowers/plans/2026-08-05-phase-marker-modal-pilot.md",
     ):
         assert forbidden not in (REPO_ROOT / relative).read_text(encoding="utf-8")
+
+
+def test_checked_in_modal_run_targets_are_real_python_symbols() -> None:
+    """Would fail when an operator command uses an app label after ``::``."""
+    command_pattern = re.compile(
+        r"modal run --env main (?P<module>[a-z_]+\.py)::(?P<symbol>[a-z_-]+)"
+    )
+    commands: list[tuple[str, str]] = []
+    for relative in (
+        "README.md",
+        "docs/superpowers/plans/2026-08-05-phase-marker-modal-pilot.md",
+    ):
+        commands.extend(
+            (match["module"], match["symbol"])
+            for match in command_pattern.finditer(
+                (REPO_ROOT / relative).read_text(encoding="utf-8")
+            )
+        )
+
+    assert commands
+    for module, symbol in commands:
+        tree = ast.parse((REPO_ROOT / module).read_text(encoding="utf-8"))
+        top_level_functions = {
+            node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+        }
+        assert symbol in top_level_functions, (
+            f"Modal target {module}::{symbol} is not a Python entrypoint symbol"
+        )
 
 
 def test_machine_namespace_binds_the_full_canonical_plan_digest(

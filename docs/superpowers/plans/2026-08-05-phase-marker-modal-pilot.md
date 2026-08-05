@@ -1149,7 +1149,7 @@ modal run --env main modal_phase_marker_inspect.py::status --run-id "$PHASE_MARK
 
 # Explicit local evidence materialization through the standalone zero-compute
 # inspector. The destination must not already exist.
-modal run --env main modal_phase_marker_inspect.py::download-evidence \
+modal run --env main modal_phase_marker_inspect.py::download_evidence \
   --run-id "$PHASE_MARKER_RUN_ID" \
   --destination artifacts/phase-marker-evidence/"$PHASE_MARKER_RUN_ID"
 ```
