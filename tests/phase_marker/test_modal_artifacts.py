@@ -1019,6 +1019,10 @@ def test_untracked_approved_artifacts_are_ignored() -> None:
     require_clean_tracked_status("?? artifacts/\n")
 
 
+def test_untracked_nonbundle_worktrees_are_ignored() -> None:
+    require_clean_tracked_status("?? model_cards/\n?? paper/\n")
+
+
 def test_source_hash_includes_only_approved_python_sources(tmp_path: Path) -> None:
     (tmp_path / "phase_marker").mkdir()
     included = tmp_path / "phase_marker/planner.py"

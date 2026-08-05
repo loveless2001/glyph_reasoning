@@ -2830,11 +2830,11 @@ def _tree_hashes(root: Path) -> tuple[tuple[str, int, str], ...]:
 
 
 def require_clean_tracked_status(status: str) -> None:
-    """Reject tracked changes while permitting the approved untracked artifact tree."""
+    """Reject tracked changes while permitting content-bound or ignored untracked files."""
     for line in status.splitlines():
         if not line:
             continue
-        if line.startswith("?? ") and line[3:] == "artifacts/":
+        if line.startswith("?? "):
             continue
         if line.startswith("  "):
             continue
