@@ -516,6 +516,50 @@ def test_cache_publication_does_not_require_hard_links(
     assert Path(str(result["manifest_path"])).is_file()
 
 
+def test_exclusive_bytes_write_failure_removes_partial_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if a caught short-write error could become durable evidence."""
+    destination = tmp_path / "provenance.json"
+    real_write = os.write
+    calls = 0
+
+    def fail_second_write(descriptor: int, content: bytes) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(descriptor, content[:3])
+        raise OSError("injected write failure")
+
+    monkeypatch.setattr(os, "write", fail_second_write)
+
+    with pytest.raises(OSError, match="injected write failure"):
+        modal_artifacts._write_bytes_exclusive_or_equal(
+            destination, b"complete provenance"
+        )
+
+    assert not destination.exists()
+
+
+def test_exclusive_bytes_fsync_failure_removes_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if unsynced evidence remained visible after publication failed."""
+    destination = tmp_path / "receipt.json"
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError("injected fsync failure")
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+
+    with pytest.raises(OSError, match="injected fsync failure"):
+        modal_artifacts._write_bytes_exclusive_or_equal(
+            destination, b"complete receipt"
+        )
+
+    assert not destination.exists()
+
+
 @pytest.mark.parametrize(
     "failure_stage",
     ("during-manifest-publication", "after-publication", "during-final-validation"),

@@ -1910,7 +1910,11 @@ def test_cpu_smoke_persists_content_addressed_failure_and_reraises(
             raise ImportError("simulated locked import failure")
         return SimpleNamespace(__version__="locked-test-version")
 
+    def reject_hard_link(*args: object, **kwargs: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
     monkeypatch.setattr(importlib, "import_module", fail_import)
+    monkeypatch.setattr(os, "link", reject_hard_link)
     monkeypatch.setattr(imported_adapter, "CODE_ROOT", pilot_repo)
     monkeypatch.setattr(imported_adapter, "INPUT_MOUNT_ROOT", input_root)
     monkeypatch.setattr(imported_adapter, "MODEL_MOUNT_ROOT", model_root)
@@ -1936,6 +1940,73 @@ def test_cpu_smoke_persists_content_addressed_failure_and_reraises(
     assert "ImportError" in receipt["failure_reason"]
     assert receipts[0].stem == receipt["artifact_id"]
     assert run_volume.commit_count == 1
+
+
+def test_cpu_smoke_refuses_commit_if_partial_evidence_cleanup_fails(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if smoke could commit after partial evidence cleanup failed."""
+    plan, input_root, model_root, run_root = _prepare_smoke_roots(pilot_repo, tmp_path)
+
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda _name: SimpleNamespace(__version__="locked-test-version"),
+    )
+    monkeypatch.setattr(imported_adapter, "CODE_ROOT", pilot_repo)
+    monkeypatch.setattr(imported_adapter, "INPUT_MOUNT_ROOT", input_root)
+    monkeypatch.setattr(imported_adapter, "MODEL_MOUNT_ROOT", model_root)
+    monkeypatch.setattr(imported_adapter, "RUN_MOUNT_ROOT", run_root)
+    run_volume = CommitOnlyVolume()
+    monkeypatch.setattr(imported_adapter, "smoke_runs_volume", run_volume)
+    monkeypatch.setattr(
+        imported_adapter,
+        "_collect_modal_execution_provenance",
+        lambda _name: _adapter_execution_provenance("smoke"),
+    )
+
+    real_write = os.write
+    write_calls = 0
+
+    def fail_second_write(descriptor: int, content: bytes) -> int:
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 1:
+            return real_write(descriptor, content[:3])
+        if write_calls == 2:
+            raise OSError("injected evidence write failure")
+        return real_write(descriptor, content)
+
+    real_unlink = os.unlink
+    cleanup_attempted = False
+
+    def fail_provenance_cleanup(
+        path: object, *args: object, **kwargs: object,
+    ) -> None:
+        nonlocal cleanup_attempted
+        if (
+            path == "input-bundle-manifest.json"
+            and kwargs.get("dir_fd") is not None
+        ):
+            cleanup_attempted = True
+            raise OSError("injected evidence cleanup failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "write", fail_second_write)
+    monkeypatch.setattr(os, "unlink", fail_provenance_cleanup)
+
+    with pytest.raises(RuntimeError, match="evidence cleanup failed"):
+        imported_adapter.smoke_remote.local({
+            "plan": modal_plan.pilot_plan_payload(plan),
+            "approval": modal_plan.action_approval_payload(plan, action="smoke"),
+        })
+
+    assert cleanup_attempted is True
+    assert run_volume.commit_count == 0
+    assert not list((run_root / f"runs/{plan.run_id}/receipts/smoke").glob("*.json"))
 
 
 def test_operator_entrypoints_print_exact_envelopes_tag_then_cross_one_boundary(

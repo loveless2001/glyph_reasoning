@@ -188,6 +188,10 @@ class _JobPublicationRollbackError(RuntimeError):
     """A visible job publication could not be restored to its attempt."""
 
 
+class _EvidencePublicationCleanupError(RuntimeError):
+    """A partially written evidence path could not be removed safely."""
+
+
 @dataclass(frozen=True)
 class BundleFile:
     path: str
@@ -528,14 +532,42 @@ def _write_bytes_exclusive_at(
     directory_fd: int, name: str, content: bytes,
 ) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-    descriptor = os.open(name, flags, 0o644, dir_fd=directory_fd)
+    descriptor: int | None = os.open(name, flags, 0o644, dir_fd=directory_fd)
     try:
         offset = 0
         while offset < len(content):
             offset += os.write(descriptor, content[offset:])
         os.fsync(descriptor)
-    finally:
         os.close(descriptor)
+        descriptor = None
+    except BaseException as error:
+        cleanup_failures: list[str] = []
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as close_error:
+                cleanup_failures.append(
+                    f"close failed: {type(close_error).__name__}: {close_error}"
+                )
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as unlink_error:
+            cleanup_failures.append(
+                f"unlink failed: {type(unlink_error).__name__}: {unlink_error}"
+            )
+        if cleanup_failures:
+            compound = _EvidencePublicationCleanupError(
+                "immutable evidence cleanup failed; refusing durable commit"
+            )
+            compound.add_note(
+                f"original failure: {type(error).__name__}: {error}"
+            )
+            for failure in cleanup_failures:
+                compound.add_note(failure)
+            raise compound from error
+        raise
 
 
 def _read_regular_file_at_fd(directory_fd: int, name: str, *, label: str) -> bytes:
@@ -3865,6 +3897,8 @@ def run_cpu_smoke(
             "receipt_path": str(receipt_path),
         }
     except Exception as error:
+        if isinstance(error, _EvidencePublicationCleanupError):
+            raise
         receipt = _cpu_smoke_receipt_payload(
             plan_payload=plan_payload,
             imported=imported,
