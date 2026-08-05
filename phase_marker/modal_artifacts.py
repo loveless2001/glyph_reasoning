@@ -478,6 +478,22 @@ def _renameat2_noreplace(
     error_number = ctypes.get_errno()
     if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
         raise FileExistsError(error_number, "destination already exists", destination_name)
+    if error_number in {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+        try:
+            os.stat(
+                destination_name,
+                dir_fd=destination_parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            os.rename(
+                source_name,
+                destination_name,
+                src_dir_fd=source_parent_fd,
+                dst_dir_fd=destination_parent_fd,
+            )
+            return
+        raise FileExistsError(error_number, "destination already exists", destination_name)
     raise OSError(error_number, os.strerror(error_number), destination_name)
 
 
