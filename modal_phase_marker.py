@@ -1305,7 +1305,7 @@ def _revalidate_completed_stage_outputs(
     runs_client: VolumeClient,
     expected: Mapping[str, Mapping[str, object]],
 ) -> dict[str, dict[str, object]]:
-    """Read every completed arm from the reloaded volume and bind its receipt."""
+    """Read every completed arm through fresh Volume RPCs and bind its receipt."""
     if stage not in {"train", "selection"}:
         raise ValueError("completed Stage A stage is invalid")
     _require_complete_receipt_matrix(expected, plan, stage)
@@ -1318,7 +1318,7 @@ def _revalidate_completed_stage_outputs(
         entries = _list_volume_files_optional(runs_client, producer_path)
         if receipt is None or not entries:
             raise ValueError(
-                f"canonical output is missing after {stage} reload for {job.arm}"
+                f"canonical output is missing after {stage} publication for {job.arm}"
             )
         current = _validate_volume_canonical_output(
             plan_payload=plan_payload,

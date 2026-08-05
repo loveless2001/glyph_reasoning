@@ -2614,7 +2614,9 @@ def _publish_stage_a_result(
         if receipt_paths:
             receipt_path = receipt_paths[0]
             persisted = json.loads(published[receipt_path])
-            if not str(persisted.get("attempt_id", "")).startswith("post-reload-"):
+            if not str(persisted.get("attempt_id", "")).startswith(
+                "post-publication-"
+            ):
                 published[receipt_path] = (
                     canonical_json(receipt) + "\n"
                 ).encode("utf-8")
@@ -3354,7 +3356,7 @@ def _damage_stage_a_publication(
         return
     if fault == "mismatched":
         persisted = dict(receipts[arm])
-        persisted["attempt_id"] = f"post-reload-{stage}-{arm}"
+        persisted["attempt_id"] = f"post-publication-{stage}-{arm}"
         unsigned = dict(persisted)
         unsigned.pop("artifact_id")
         persisted["artifact_id"] = modal_artifacts.sha256_json(unsigned)
@@ -3549,7 +3551,7 @@ def test_stage_a_flushes_complete_plan_before_first_tag_or_remote_call(
 
 @pytest.mark.parametrize("completed_stage", ("train", "selection"))
 @pytest.mark.parametrize("fault", ("missing", "corrupt", "mismatched"))
-def test_stage_a_post_reload_canonical_failure_aborts_before_next_stage(
+def test_stage_a_post_publication_failure_aborts_before_next_stage(
     imported_adapter: ModuleType,
     pilot_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
