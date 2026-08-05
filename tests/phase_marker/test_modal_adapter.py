@@ -1856,7 +1856,11 @@ def test_cpu_smoke_validates_imports_source_bundle_and_cache_without_loading_mod
         imported.append(name)
         return ImportProbe()
 
+    def reject_hard_link(*args: object, **kwargs: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
     monkeypatch.setattr(importlib, "import_module", import_module)
+    monkeypatch.setattr(os, "link", reject_hard_link)
     monkeypatch.setattr(imported_adapter, "CODE_ROOT", pilot_repo)
     monkeypatch.setattr(imported_adapter, "INPUT_MOUNT_ROOT", input_root)
     monkeypatch.setattr(imported_adapter, "MODEL_MOUNT_ROOT", model_root)

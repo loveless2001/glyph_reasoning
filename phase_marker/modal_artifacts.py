@@ -520,10 +520,16 @@ def _atomic_rename_directory_noreplace_at(
 def _write_canonical_json_exclusive_at(
     directory_fd: int, name: str, payload: Mapping[str, object],
 ) -> None:
+    content = (canonical_json(dict(payload)) + "\n").encode("utf-8")
+    _write_bytes_exclusive_at(directory_fd, name, content)
+
+
+def _write_bytes_exclusive_at(
+    directory_fd: int, name: str, content: bytes,
+) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
     descriptor = os.open(name, flags, 0o644, dir_fd=directory_fd)
     try:
-        content = (canonical_json(dict(payload)) + "\n").encode("utf-8")
         offset = 0
         while offset < len(content):
             offset += os.write(descriptor, content[offset:])
@@ -3926,21 +3932,15 @@ def _write_bytes_exclusive_or_equal(path: Path, content: bytes) -> Path:
     """Create immutable provenance bytes, accepting only an identical retry."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile("wb", dir=destination.parent, delete=False) as handle:
-            temporary = Path(handle.name)
-            handle.write(content)
-        os.link(temporary, destination)
+        with _open_directory_path_nofollow(destination.parent) as parent_fd:
+            _write_bytes_exclusive_at(parent_fd, destination.name, content)
     except FileExistsError:
         existing = _read_regular_file_at(
             destination.parent, destination.name, label="immutable provenance file"
         )
         if existing != content:
             raise FileExistsError("immutable provenance file conflicts with existing bytes")
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
     return destination
 
 
@@ -3961,20 +3961,14 @@ def _write_content_addressed_receipt(
         if path.read_text(encoding="utf-8") != content:
             raise FileExistsError("content-addressed receipt conflicts with existing bytes")
         return path
-    temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=root, delete=False
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(content)
-        os.link(temporary, path)
+        with _open_directory_path_nofollow(root) as parent_fd:
+            _write_bytes_exclusive_at(
+                parent_fd, path.name, content.encode("utf-8")
+            )
     except FileExistsError:
         if not path.is_file() or path.read_text(encoding="utf-8") != content:
             raise FileExistsError("content-addressed receipt conflicts with existing bytes")
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
     return path
 
 
