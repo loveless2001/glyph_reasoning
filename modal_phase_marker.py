@@ -87,6 +87,9 @@ MODEL_CACHE_TIMEOUT_SECONDS = 7_200
 SMOKE_CPU = 2.0
 SMOKE_MEMORY_MIB = 8_192
 SMOKE_TIMEOUT_SECONDS = 900
+STAGE_A_PREFLIGHT_CPU = 2.0
+STAGE_A_PREFLIGHT_MEMORY_MIB = 8_192
+STAGE_A_PREFLIGHT_TIMEOUT_SECONDS = 7_200
 VOLUME_NAMES = (
     "phase-marker-pilot-inputs-v1",
     "phase-marker-pilot-model-cache-v1",
@@ -246,6 +249,11 @@ GPU_VOLUMES = {
     "/model-cache": model_volume.read_only(),
     "/runs": runs_volume,
 }
+PREFLIGHT_VOLUMES = {
+    "/inputs": inputs_volume.read_only(),
+    "/model-cache": model_volume.read_only(),
+    "/runs": runs_volume.read_only(),
+}
 FINALIZER_VOLUMES = {
     "/inputs": inputs_volume.read_only(),
     "/model-cache": model_volume.read_only(),
@@ -329,6 +337,48 @@ def smoke_remote(remote_payload: dict[str, object]) -> dict[str, object]:
         runtime_imports=LOCKED_RUNTIME_IMPORTS,
         execution_provenance=_collect_modal_execution_provenance("smoke_remote"),
     )
+
+
+@app.function(
+    image=cpu_image,
+    cpu=STAGE_A_PREFLIGHT_CPU,
+    memory=STAGE_A_PREFLIGHT_MEMORY_MIB,
+    timeout=STAGE_A_PREFLIGHT_TIMEOUT_SECONDS,
+    retries=0,
+    volumes=PREFLIGHT_VOLUMES,
+)
+def preflight_stage_a_remote(
+    remote_payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate Stage A dependencies and return compact identity evidence."""
+    if not isinstance(remote_payload, Mapping) or set(remote_payload) != {
+        "plan", "approval"
+    }:
+        raise ValueError("remote Stage A preflight payload fields are invalid")
+    plan_payload = remote_payload["plan"]
+    approval_payload = remote_payload["approval"]
+    if not isinstance(plan_payload, Mapping) or not isinstance(
+        approval_payload, Mapping
+    ):
+        raise ValueError("remote Stage A preflight payload values are invalid")
+    bundle, manifest, smoke = validate_stage_a_remote_dependencies(
+        plan_payload=plan_payload,
+        approval_payload=approval_payload,
+        input_root=JOB_INPUT_MOUNT_ROOT,
+        model_root=JOB_MODEL_MOUNT_ROOT,
+        run_root=JOB_RUN_MOUNT_ROOT,
+    )
+    return {
+        "schema_version": 1,
+        "run_id": plan_payload["run_id"],
+        "bundle_id": bundle.bundle_id,
+        "bundle_manifest_artifact_id": plan_payload[
+            "bundle_manifest_artifact_id"
+        ],
+        "model_cache_artifact_id": manifest.artifact_id,
+        "smoke_receipt_artifact_id": smoke["artifact_id"],
+        "smoke_receipt": smoke,
+    }
 
 
 @app.function(

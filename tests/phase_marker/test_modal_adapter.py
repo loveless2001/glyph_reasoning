@@ -668,6 +668,7 @@ def test_modal_graph_is_dedicated_and_bounded(imported_adapter: ModuleType) -> N
     assert smoke_options["volumes"]["/mnt/runs"] is imported_adapter.smoke_runs_volume
 
     assert set(imported_adapter.app.remote_functions) == {
+        "preflight_stage_a_remote",
         "run_training_job",
         "run_selection_job",
         "finalize_stage_a_remote",
@@ -715,6 +716,7 @@ def test_bootstrap_apps_initialize_in_order_from_an_empty_volume_namespace(
     assert existing == set(imported_adapter.VOLUME_NAMES)
     assert imported_adapter.app.local_entrypoints == ["run_stage_a"]
     assert set(imported_adapter.app.remote_functions) == {
+        "preflight_stage_a_remote",
         "run_training_job",
         "run_selection_job",
         "finalize_stage_a_remote",
@@ -1088,6 +1090,16 @@ def test_stage_a_job_resources_and_mount_permissions_are_exact(
     assert finalizer["volumes"]["/model-cache"].read_only is True
     assert finalizer["volumes"]["/runs"] is imported_adapter.runs_volume
 
+    preflight = declarations["preflight_stage_a_remote"]
+    assert "gpu" not in preflight
+    assert preflight["cpu"] == 2.0
+    assert preflight["memory"] == 8_192
+    assert preflight["timeout"] == 7_200
+    assert preflight["retries"] == 0
+    assert preflight["volumes"]["/inputs"].read_only is True
+    assert preflight["volumes"]["/model-cache"].read_only is True
+    assert preflight["volumes"]["/runs"].read_only is True
+
 
 def test_gpu_job_wrappers_forward_one_approved_payload_to_the_exact_stage(
     imported_adapter: ModuleType,
@@ -1208,6 +1220,65 @@ def test_cpu_finalizer_wrapper_forwards_receipts_without_loading_weights(
                 "stage_a_approval": approval,
             }
     ]
+
+
+def test_cpu_dependency_preflight_wrapper_returns_compact_evidence(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if the preflight changed validated dependency evidence."""
+    plan = _build_plan(
+        pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name)
+    )
+    plan_payload = modal_plan.pilot_plan_payload(plan)
+    _files, manifest_payload, smoke = _stage_a_test_dependency_evidence(plan)
+    manifest = modal_artifacts.parse_model_cache_manifest_payload(manifest_payload)
+    bundle = build_input_bundle(pilot_repo)
+    approval = modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=False,
+        smoke_receipt_artifact_id=str(smoke["artifact_id"]),
+        model_cache_artifact_id=manifest.artifact_id,
+    )
+    calls: list[dict[str, object]] = []
+
+    def validate(**kwargs: object) -> tuple[object, object, dict[str, object]]:
+        calls.append(dict(kwargs))
+        return bundle, manifest, dict(smoke)
+
+    monkeypatch.setattr(
+        imported_adapter, "validate_stage_a_remote_dependencies", validate
+    )
+
+    result = imported_adapter.preflight_stage_a_remote.local(
+        {"plan": plan_payload, "approval": approval}
+    )
+
+    assert set(result) == {
+        "schema_version",
+        "run_id",
+        "bundle_id",
+        "bundle_manifest_artifact_id",
+        "model_cache_artifact_id",
+        "smoke_receipt_artifact_id",
+        "smoke_receipt",
+    }
+    assert result["schema_version"] == 1
+    assert result["run_id"] == plan.run_id
+    assert result["bundle_id"] == plan.bundle_id
+    assert result["bundle_manifest_artifact_id"] == plan.bundle_manifest_artifact_id
+    assert result["model_cache_artifact_id"] == manifest.artifact_id
+    assert result["smoke_receipt_artifact_id"] == smoke["artifact_id"]
+    assert result["smoke_receipt"] == smoke
+    assert calls == [{
+        "plan_payload": plan_payload,
+        "approval_payload": approval,
+        "input_root": Path("/inputs"),
+        "model_root": Path("/model-cache"),
+        "run_root": Path("/runs"),
+    }]
 
 
 def test_apply_approved_app_tags_validates_before_the_client_rpc(
