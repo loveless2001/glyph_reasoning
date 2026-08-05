@@ -398,6 +398,11 @@ def test_real_pinned_qwen_model_cache_is_valid_when_full_offline_snapshot_exists
         isinstance(name, str) and (snapshot / name).is_file() for name in shards
     ):
         pytest.skip("all four pinned Qwen model shards are not locally cached")
+    if not all(
+        (snapshot / name).is_file()
+        for name in modal_artifacts._MODEL_CACHE_REQUIRED_FILES
+    ):
+        pytest.skip("full pinned Qwen model metadata is not locally cached")
 
     manifest = build_model_cache_manifest(snapshot)
 
@@ -1009,7 +1014,17 @@ def test_bundle_rejects_extra_and_unsafe_file_entries(repo_fixture: Path) -> Non
         )
 
 
-@pytest.mark.parametrize("status", [" M phase_marker/modal_plan.py\n", "D  README.md\n"])
+@pytest.mark.parametrize(
+    "status",
+    [
+        " M phase_marker/modal_plan.py\n",
+        "D  README.md\n",
+        "A  phase_marker/new.py\n",
+        "R  old.py -> phase_marker/new.py\n",
+        "UU phase_marker/conflict.py\n",
+        "?? paper/\n M phase_marker/modal_plan.py\n",
+    ],
+)
 def test_tracked_dirty_status_is_rejected(status: str) -> None:
     with pytest.raises(ValueError, match="tracked source changes"):
         require_clean_tracked_status(status)

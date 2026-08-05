@@ -2445,7 +2445,7 @@ def preflight_inputs_local(
 
     try:
         entries = volume.listdir(bundle_root, recursive=True)
-    except FileNotFoundError:
+    except (FileNotFoundError, modal.exception.NotFoundError):
         entries = []
     existing_paths = _listed_file_paths(entries, bundle_root, set(upload_bytes))
     if existing_paths:
@@ -2509,15 +2509,14 @@ def stage_inputs(
         approved_action_digest=approved_action_digest,
     )
     writable_volume: object | None = None
-    try:
-        staging_plan = preflight_inputs_local(
-            bundle,
-            inputs_volume,
-            approved_run_id=approved_run_id,
-            plan=plan,
-            budget_acknowledged=budget_acknowledged,
-        )
-    except modal.exception.NotFoundError:
+    staging_plan = preflight_inputs_local(
+        bundle,
+        inputs_volume,
+        approved_run_id=approved_run_id,
+        plan=plan,
+        budget_acknowledged=budget_acknowledged,
+    )
+    if staging_plan.upload_required:
         writable_volume = _create_authorized_volume(
             VOLUME_NAMES[0],
             plan_payload=pilot_plan_payload(plan),
@@ -2535,13 +2534,7 @@ def stage_inputs(
     if not staging_plan.upload_required:
         print(canonical_json({"bundle_id": bundle.bundle_id, "uploaded": False}))
         return
-    if writable_volume is None:
-        writable_volume = _create_authorized_volume(
-            VOLUME_NAMES[0],
-            plan_payload=pilot_plan_payload(plan),
-            approval_payload=approval,
-            action="stage-inputs",
-        )
+    assert writable_volume is not None
     apply_approved_app_tags(
         plan, approval_payload=approval, action="stage-inputs"
     )
@@ -2703,7 +2696,7 @@ def run_stage_a(
 def _build_operator_context(repo_root: Path) -> tuple[InputBundle, PilotPlan]:
     root = Path(repo_root).resolve()
     status_result = subprocess.run(
-        ["git", "status", "--short", "--untracked-files=normal"],
+        ["git", "status", "--porcelain=v1", "--untracked-files=normal"],
         cwd=root,
         check=True,
         capture_output=True,

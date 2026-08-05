@@ -1198,6 +1198,34 @@ def test_apply_approved_app_tags_validates_before_the_client_rpc(
     assert imported_adapter.stage_inputs_app.tags == expected_tags
 
 
+def test_operator_context_uses_config_independent_porcelain_status(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if local Git color/config could corrupt the clean-tree gate."""
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(args: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append((args, kwargs))
+        return SimpleNamespace(stdout="?? model_cards/\n?? paper/\n")
+
+    monkeypatch.setattr(imported_adapter.subprocess, "run", run)
+    imported_adapter._build_operator_context(pilot_repo)
+
+    assert calls == [
+        (
+            ["git", "status", "--porcelain=v1", "--untracked-files=normal"],
+            {
+                "cwd": pilot_repo.resolve(),
+                "check": True,
+                "capture_output": True,
+                "text": True,
+            },
+        )
+    ]
+
+
 def test_pure_python_plan_cli_does_not_import_or_call_modal(
     pilot_repo: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1322,6 +1350,35 @@ def test_stage_inputs_uploads_only_allowlisted_bundle(
     assert [call.remote_path for call in volume.put_calls] == [
         f"/bundles/{bundle.bundle_id}/{item.path}" for item in bundle.files
     ] + [f"/bundles/{bundle.bundle_id}/bundle-manifest.json"]
+    assert result == {"bundle_id": bundle.bundle_id, "uploaded": True}
+    assert volume.files == _bundle_volume_files(bundle, pilot_repo)
+
+
+def test_stage_inputs_treats_modal_missing_bundle_root_as_empty(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+) -> None:
+    """Would fail if Modal's empty-directory NotFound aborted first upload."""
+    bundle = build_input_bundle(pilot_repo)
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+
+    class EmptyModalVolume(RecordingVolume):
+        def listdir(
+            self, path: str, *, recursive: bool = False,
+        ) -> list[SimpleNamespace]:
+            assert recursive is True
+            self.events.append(("listdir", path))
+            raise FakeModalNotFoundError("No such file or directory")
+
+    volume = EmptyModalVolume()
+    result = imported_adapter.stage_inputs_local(
+        bundle,
+        volume,
+        approved_run_id=plan.run_id,
+        plan=plan,
+        budget_acknowledged=True,
+    )
+
     assert result == {"bundle_id": bundle.bundle_id, "uploaded": True}
     assert volume.files == _bundle_volume_files(bundle, pilot_repo)
 
@@ -1577,7 +1634,9 @@ def test_stage_entrypoint_tags_only_after_read_only_preflight_then_narrow_apply(
         **_operator_approval_kwargs(plan, action="stage-inputs"),
     )
 
-    assert [event[0] for event in volume.events] == ["listdir", "tags", "batch_upload"]
+    assert [event[0] for event in volume.events] == [
+        "listdir", "listdir", "tags", "batch_upload",
+    ]
     output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert output[0]["action"] == "upload"
     assert output[0]["remote_files"] == [
@@ -1591,7 +1650,7 @@ def test_stage_entrypoint_tags_only_after_read_only_preflight_then_narrow_apply(
     assert output[1] == {"bundle_id": bundle.bundle_id, "uploaded": True}
 
 
-def test_stage_entrypoint_resolves_its_authorized_volume_before_remote_preflight(
+def test_stage_entrypoint_repreflights_authorized_volume_after_missing_read(
     imported_adapter: ModuleType,
     pilot_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
