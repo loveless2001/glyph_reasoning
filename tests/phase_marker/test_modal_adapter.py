@@ -2737,6 +2737,33 @@ class StageARunsClient(RecordingVolume):
         raise AssertionError("local Volume batch clients cannot reload mounts")
 
 
+class DirectoryListingStageARunsClient(StageARunsClient):
+    """Stage A client that includes explicit Modal-style directory entries."""
+
+    def __init__(
+        self,
+        files: dict[str, bytes],
+        events: list[tuple[object, ...]],
+        *,
+        directory_paths: tuple[str, ...],
+    ) -> None:
+        super().__init__(files, events)
+        self.directory_paths = directory_paths
+
+    def listdir(self, path: str, *, recursive: bool = False) -> list[SimpleNamespace]:
+        file_entries = super().listdir(path, recursive=recursive)
+        prefix = path.rstrip("/") + "/"
+        directory_entries = [
+            SimpleNamespace(path=remote_path, type="directory")
+            for remote_path in self.directory_paths
+            if remote_path == path or remote_path.startswith(prefix)
+        ]
+        return sorted(
+            [*directory_entries, *file_entries],
+            key=lambda entry: (entry.path, entry.type),
+        )
+
+
 def _stage_a_dependency_kwargs(
     plan: modal_plan.PilotPlan,
     pilot_repo: Path,
@@ -4699,6 +4726,60 @@ def test_initial_stage_a_refuses_summary_or_unexpected_canonical_namespace(
         )
     assert tags == []
     assert training.calls == [] and selection.calls == [] and finalizer.calls == []
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "attempts",
+        "attempts/train-attempt",
+        "receipts/attempts",
+        "receipts/attempts/train-attempt.json",
+        "receipts/smoke",
+        "receipts/smoke/archive",
+    ),
+)
+def test_stage_a_namespace_accepts_approved_modal_directory_entries(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    relative_path: str,
+) -> None:
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    run_root = f"/runs/{plan.run_id}"
+    _cache_files, _cache_manifest, smoke = _stage_a_test_dependency_evidence(plan)
+    smoke_path = f"{run_root}/receipts/smoke/{smoke['artifact_id']}.json"
+    runs = DirectoryListingStageARunsClient(
+        {smoke_path: (canonical_json(smoke) + "\n").encode("utf-8")},
+        [],
+        directory_paths=(f"{run_root}/{relative_path}",),
+    )
+
+    assert imported_adapter._preflight_stage_a_namespace(
+        plan, resume=False, runs_client=runs
+    ) is None
+
+
+@pytest.mark.parametrize("relative_path", ("receipts/unexpected", "unexpected"))
+def test_stage_a_namespace_rejects_unapproved_modal_directory_entries(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    relative_path: str,
+) -> None:
+    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
+    run_root = f"/runs/{plan.run_id}"
+    runs = DirectoryListingStageARunsClient(
+        {},
+        [],
+        directory_paths=(f"{run_root}/{relative_path}",),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"unexpected canonical Stage A path: .*/{re.escape(relative_path)}$",
+    ):
+        imported_adapter._preflight_stage_a_namespace(
+            plan, resume=False, runs_client=runs
+        )
 
 
 def _status_dependency_files(plan: modal_plan.PilotPlan) -> dict[str, bytes]:

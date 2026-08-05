@@ -1220,10 +1220,10 @@ def _preflight_stage_a_namespace(
         *producer_roots, *receipt_paths, *promotion_locks, summary_path,
         provenance_path,
     }
-    ignored_prefixes = (
-        f"{run_root}/attempts/",
-        f"{run_root}/receipts/attempts/",
-        f"{run_root}/receipts/smoke/",
+    ignored_roots = (
+        f"{run_root}/attempts",
+        f"{run_root}/receipts/attempts",
+        f"{run_root}/receipts/smoke",
     )
     summary_seen = False
     for entry in entries:
@@ -1231,7 +1231,10 @@ def _preflight_stage_a_namespace(
         if not isinstance(raw_path, str):
             raise ValueError("Stage A namespace contains an invalid path")
         path = "/" + raw_path.lstrip("/")
-        if path == run_root or any(path.startswith(prefix) for prefix in ignored_prefixes):
+        if path == run_root or any(
+            path == root or path.startswith(root + "/")
+            for root in ignored_roots
+        ):
             continue
         if path == summary_path:
             summary_seen = True
