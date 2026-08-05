@@ -1528,8 +1528,14 @@ def test_failed_attempt_never_promotes(tmp_path: Path) -> None:
     assert not (tmp_path / "canonical/glyph").exists()
 
 
-def test_receipt_and_log_are_outside_hashed_output(tmp_path: Path) -> None:
-    """Would fail if receipt persistence were mixed into a checkpoint output tree."""
+def test_receipt_and_log_are_outside_hashed_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if receipt persistence required Modal-incompatible hard links."""
+    def reject_hard_link(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", reject_hard_link)
     receipt_path = write_attempt_receipt(tmp_path / "runs", receipt_fixture())
     assert "/receipts/" in receipt_path.as_posix()
     assert "/checkpoints/" not in receipt_path.as_posix()
@@ -1540,6 +1546,22 @@ def test_receipt_rejects_stale_artifact_id(tmp_path: Path) -> None:
     receipt = receipt_fixture(artifact_id="0" * 64)
     with pytest.raises(ValueError, match="artifact ID"):
         write_attempt_receipt(tmp_path / "runs", receipt)
+
+
+def test_canonical_receipt_copy_rejects_changed_attempt_bytes(tmp_path: Path) -> None:
+    """Would fail if canonical receipt bytes could diverge from the validated receipt."""
+    receipt = receipt_fixture()
+    run_root = tmp_path / "runs"
+    attempt = run_root / "receipts/attempts" / f"{receipt.attempt_id}.json"
+    attempt.parent.mkdir(parents=True)
+    attempt.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="attempt receipt bytes"):
+        modal_artifacts._link_canonical_receipt(run_root, receipt, attempt)
+
+    assert not (
+        run_root / "receipts/canonical" / receipt.stage / f"{receipt.arm}.json"
+    ).exists()
 
 
 def test_promotion_copies_attempt_bytes_once_and_refuses_existing_canonical(tmp_path: Path) -> None:
@@ -2128,6 +2150,11 @@ def test_execute_jobs_use_exact_commands_offline_env_and_promote_only_producers(
 
     monkeypatch.setattr(subprocess, "run", fake_subprocess)
 
+    def reject_hard_link(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", reject_hard_link)
+
     def fake_filesystem_device(path: Path) -> int:
         resolved = Path(path).resolve()
         device_paths.append(resolved)
@@ -2577,6 +2604,82 @@ def test_job_lease_durability_failure_aborts_before_promotion_and_records_failur
     assert not (failed_attempt / "workspace").exists()
     assert not list(failed_attempt.rglob("bundle-manifest.json"))
     assert volume.commit_count == 2
+
+
+def test_job_receipt_cleanup_uncertainty_refuses_quarantine_and_commit(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if uncertain evidence cleanup could be hidden by a later commit."""
+    code_root = Path(__file__).resolve().parents[2]
+    input_root = tmp_path / "inputs"
+    model_root = tmp_path / "model-cache"
+    run_root = tmp_path / "runs"
+    ephemeral_root = tmp_path / "ephemeral"
+    ephemeral_root.mkdir()
+    bundle = _stage_job_inputs(repo_fixture, input_root)
+    _stage_job_model(qwen_snapshot, model_root)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    job = plan.jobs[5]
+
+    def fake_subprocess(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[0] == "nvidia-smi":
+            return SimpleNamespace(returncode=0, stdout="NVIDIA H100 80GB HBM3\n")
+        workspace = Path(str(kwargs["cwd"]))
+        output = workspace / argv[argv.index("--output-dir") + 1]
+        output.mkdir(parents=True)
+        (output / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+        (output / "adapter_model.safetensors").write_bytes(b"adapter")
+        (output / "run-manifest.json").write_text("{}\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0)
+
+    def fail_receipt_publication(*_args: object, **_kwargs: object) -> None:
+        raise modal_artifacts._EvidencePublicationCleanupError(
+            "immutable evidence cleanup failed; refusing durable commit"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess)
+    monkeypatch.setattr(
+        modal_artifacts,
+        "_write_attempt_receipt_in_namespace",
+        fail_receipt_publication,
+    )
+    volume = CommitVolume()
+
+    with pytest.raises(
+        modal_artifacts._EvidencePublicationCleanupError,
+        match="refusing durable commit",
+    ):
+        modal_artifacts.execute_pilot_job(
+            stage="train",
+            plan_payload=modal_plan.pilot_plan_payload(plan),
+            job_payload=asdict(job),
+            code_root=code_root,
+            input_root=input_root,
+            model_root=model_root,
+            run_root=run_root,
+            volume=volume,
+            stage_a_approval=_stage_a_approval_for_model(plan, model_root),
+            execution_provenance=_execution_provenance(
+                "train", "receipt-cleanup-fail"
+            ),
+            ephemeral_root=ephemeral_root,
+            environ={"CUDA_VISIBLE_DEVICES": "0"},
+            producer_validator=lambda *_: None,
+            bf16_probe=lambda: True,
+        )
+
+    run = run_root / "runs" / plan.run_id
+    canonical = run / "artifacts/phase-marker/checkpoints/pilot/seed-42/filler"
+    lease = canonical.parent / f".{canonical.name}.promotion.lock"
+    assert canonical.is_dir()
+    assert lease.is_file()
+    assert not list((run / "attempts").glob("*/failed-publication"))
+    assert not list((run / "receipts/attempts").glob("*.json"))
+    assert not (run / "receipts/canonical/train/filler.json").exists()
+    assert volume.commit_count == 1
 
 
 def test_job_post_promotion_mismatch_quarantines_and_commits_failure_receipt(
@@ -3111,6 +3214,11 @@ def test_cpu_finalizer_runs_read_only_gate_and_publishes_inert_stop_summary(
     monkeypatch.setenv("HF_HUB_CACHE", "before-cache")
     monkeypatch.setenv("HF_HUB_OFFLINE", "before-hub")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "before-transformers")
+
+    def reject_hard_link(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", reject_hard_link)
 
     def gate(**kwargs: object) -> dict[str, object]:
         assert os.environ["HF_HUB_CACHE"] == str(snapshot.parents[2])

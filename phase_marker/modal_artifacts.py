@@ -408,24 +408,16 @@ def write_attempt_receipt(run_root: Path, receipt: AttemptReceipt) -> Path:
     _validate_receipt(receipt)
     root = Path(run_root).resolve()
     receipt_path = root / "receipts" / f"{receipt.attempt_id}.json"
-    receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    if receipt_path.exists():
-        raise FileExistsError("attempt receipt already exists")
-    payload = canonical_json(_receipt_payload(receipt, include_artifact_id=True)) + "\n"
-    temporary: Path | None = None
+    payload = (
+        canonical_json(_receipt_payload(receipt, include_artifact_id=True)) + "\n"
+    ).encode("utf-8")
     try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=receipt_path.parent, delete=False
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(payload)
-        # link(2) is an atomic create-if-absent operation, preserving receipts forever.
-        os.link(temporary, receipt_path)
+        with _open_directory_path_nofollow(
+            receipt_path.parent, create=True
+        ) as parent_fd:
+            _write_bytes_exclusive_at(parent_fd, receipt_path.name, payload)
     except FileExistsError as error:
         raise FileExistsError("attempt receipt already exists") from error
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
     return receipt_path
 
 
@@ -1202,7 +1194,10 @@ def execute_pilot_job(
                         failed_records = ()
                 raise
     except Exception as error:
-        if isinstance(error, _JobPublicationRollbackError):
+        if isinstance(
+            error,
+            (_JobPublicationRollbackError, _EvidencePublicationCleanupError),
+        ):
             _append_failure_log(log_path, error)
             raise
         if durably_published:
@@ -1882,21 +1877,14 @@ def _offline_model_cache(cache_root: Path) -> object:
 def _write_attempt_receipt_in_namespace(run_root: Path, receipt: AttemptReceipt) -> Path:
     _validate_receipt(receipt)
     path = Path(run_root) / "receipts" / "attempts" / f"{receipt.attempt_id}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    content = canonical_json(_receipt_payload(receipt, include_artifact_id=True)) + "\n"
-    temporary: Path | None = None
+    content = (
+        canonical_json(_receipt_payload(receipt, include_artifact_id=True)) + "\n"
+    ).encode("utf-8")
     try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=path.parent, delete=False
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(content)
-        os.link(temporary, path)
+        with _open_directory_path_nofollow(path.parent, create=True) as parent_fd:
+            _write_bytes_exclusive_at(parent_fd, path.name, content)
     except FileExistsError as error:
         raise FileExistsError("attempt receipt already exists") from error
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
     return path
 
 
@@ -1906,9 +1894,19 @@ def _link_canonical_receipt(
     path = (
         Path(run_root) / "receipts" / "canonical" / receipt.stage / f"{receipt.arm}.json"
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
+    content = _read_regular_file_at(
+        attempt_receipt.parent,
+        attempt_receipt.name,
+        label="attempt receipt",
+    )
+    expected = (
+        canonical_json(_receipt_payload(receipt, include_artifact_id=True)) + "\n"
+    ).encode("utf-8")
+    if content != expected:
+        raise ValueError("attempt receipt bytes do not match validated receipt")
     try:
-        os.link(attempt_receipt, path)
+        with _open_directory_path_nofollow(path.parent, create=True) as parent_fd:
+            _write_bytes_exclusive_at(parent_fd, path.name, content)
     except FileExistsError as error:
         raise FileExistsError("canonical receipt already exists") from error
     return path
@@ -2429,20 +2427,13 @@ def _write_canonical_json_exclusive(
     path: Path, payload: Mapping[str, object]
 ) -> Path:
     destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=destination.parent, delete=False
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(canonical_json(payload) + "\n")
-        os.link(temporary, destination)
+        with _open_directory_path_nofollow(
+            destination.parent, create=True
+        ) as parent_fd:
+            _write_canonical_json_exclusive_at(parent_fd, destination.name, payload)
     except FileExistsError as error:
         raise FileExistsError("immutable JSON destination already exists") from error
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
     return destination
 
 
