@@ -36,7 +36,6 @@ from phase_marker.modal_artifacts import (
     hash_source_tree,
     load_promotion_lease_payload,
     load_attempt_receipt_payload,
-    parse_model_cache_manifest_payload,
     read_bundle_files_at_root,
     read_regular_file_at,
     require_clean_tracked_status,
@@ -653,10 +652,9 @@ def run_stage_a_local(
     training_function: RemoteFunction,
     selection_function: RemoteFunction,
     finalizer_function: RemoteFunction,
+    dependency_function: RemoteFunction,
     recovery_function: RemoteFunction | None = None,
     runs_client: VolumeClient,
-    inputs_client: VolumeClient | None = None,
-    model_client: VolumeClient | None = None,
     smoke_receipt_artifact_id: str | None = None,
     model_cache_artifact_id: str | None = None,
     approval_payload: Mapping[str, object] | None = None,
@@ -669,27 +667,22 @@ def run_stage_a_local(
     )
     if not isinstance(resume, bool):
         raise TypeError("resume must be an explicit boolean")
-    if (
-        inputs_client is None
-        or model_client is None
-        or not isinstance(approval_payload, Mapping)
-    ):
-        raise ValueError("Stage A requires validated dependency clients and approval")
-    dependency_evidence = preflight_stage_a_dependencies(
-        plan,
-        inputs_client=inputs_client,
-        model_client=model_client,
-        runs_client=runs_client,
-        smoke_receipt_artifact_id=str(smoke_receipt_artifact_id),
-        model_cache_artifact_id=str(model_cache_artifact_id),
-    )
+    if not isinstance(approval_payload, Mapping):
+        raise ValueError("Stage A requires validated approval")
+    plan_payload = pilot_plan_payload(plan)
     validated_approval = validate_action_approval_payload(
-        plan_payload=pilot_plan_payload(plan),
+        plan_payload=plan_payload,
         approval_payload=approval_payload,
         action="run-stage-a",
         resume=resume,
-        smoke_receipt_artifact_id=dependency_evidence.smoke_receipt_artifact_id,
-        model_cache_artifact_id=dependency_evidence.model_cache_artifact_id,
+        smoke_receipt_artifact_id=str(smoke_receipt_artifact_id),
+        model_cache_artifact_id=str(model_cache_artifact_id),
+    )
+    dependency_result = dependency_function.remote(
+        {"plan": plan_payload, "approval": validated_approval}
+    )
+    dependency_evidence = _validate_stage_a_dependency_evidence(
+        plan, validated_approval, dependency_result
     )
     existing = _preflight_stage_a_outputs(plan, resume=resume, runs_client=runs_client)
     if existing.recoveries and recovery_function is None:
@@ -705,7 +698,6 @@ def run_stage_a_local(
         raise ValueError(
             "completed Stage A summary does not bind the approved dependencies"
         )
-    plan_payload = pilot_plan_payload(plan)
     missing_training = tuple(job for job in plan.jobs if job.arm not in existing.training)
     print(
         canonical_json(
@@ -879,97 +871,51 @@ def _remote_job_payload(
     return {"plan": plan_payload, "job": payload, "approval": dict(approval_payload)}
 
 
-def preflight_stage_a_dependencies(
+def _validate_stage_a_dependency_evidence(
     plan: PilotPlan,
-    *,
-    inputs_client: VolumeClient,
-    model_client: VolumeClient,
-    runs_client: VolumeClient,
-    smoke_receipt_artifact_id: str,
-    model_cache_artifact_id: str,
+    approval_payload: Mapping[str, object],
+    payload: object,
 ) -> StageADependencyEvidence:
-    """Revalidate staged inputs, cache manifest, and exact successful smoke."""
-    _validate_tag_plan(plan)
-    if not _is_sha256(smoke_receipt_artifact_id) or not _is_sha256(
-        model_cache_artifact_id
-    ):
-        raise ValueError("Stage A dependency artifact identities are invalid")
-    bundle = build_input_bundle(_plan_repo_root(plan))
-    staging = preflight_inputs_local(
-        bundle,
-        inputs_client,
-        approved_run_id=plan.run_id,
-        plan=plan,
-        budget_acknowledged=True,
-    )
-    if staging.upload_required:
-        raise ValueError("Stage A requires the exact staged input bundle")
-
-    snapshot_root = (
-        "/canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots/"
-        f"{plan.model_revision}"
-    )
-    manifest_path = (
-        "/canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots/"
-        f"{plan.model_revision}.manifest.json"
-    )
-    manifest_bytes = _read_volume_file_optional(model_client, manifest_path)
-    if manifest_bytes is None:
-        raise ValueError("Stage A model-cache manifest is missing")
-    manifest_payload = _decode_json_object(manifest_bytes, "model-cache manifest")
-    manifest = parse_model_cache_manifest_payload(manifest_payload)
-    if manifest.artifact_id != model_cache_artifact_id:
-        raise ValueError("Stage A model-cache artifact identity is invalid")
-    expected_model_paths = {
-        f"{snapshot_root}/{item.path}" for item in manifest.files
+    """Validate the untrusted compact result of the CPU dependency preflight."""
+    expected_fields = {
+        "schema_version",
+        "run_id",
+        "bundle_id",
+        "bundle_manifest_artifact_id",
+        "model_cache_artifact_id",
+        "smoke_receipt_artifact_id",
+        "smoke_receipt",
     }
-    listed_model_paths = _normalized_listed_paths(
-        _list_volume_files_optional(model_client, snapshot_root), snapshot_root
-    )
-    if listed_model_paths != expected_model_paths:
-        raise ValueError("Stage A model-cache file set does not match its manifest")
-    for item in manifest.files:
-        remote_path = f"{snapshot_root}/{item.path}"
-        content = _read_volume_file_optional(model_client, remote_path)
-        if (
-            content is None
-            or len(content) != item.size
-            or _sha256_bytes(content) != item.sha256
-        ):
-            raise ValueError(f"Stage A model-cache file hash mismatch: {item.path}")
-
-    smoke_path = (
-        f"/runs/{plan.run_id}/receipts/smoke/"
-        f"{smoke_receipt_artifact_id}.json"
-    )
-    smoke_bytes = _read_volume_file_optional(runs_client, smoke_path)
-    if smoke_bytes is None:
-        raise ValueError("Stage A smoke receipt is missing")
-    smoke = _decode_json_object(smoke_bytes, "smoke receipt")
-    _validate_successful_smoke_receipt(
+    if not isinstance(payload, Mapping) or set(payload) != expected_fields:
+        raise ValueError("Stage A dependency preflight result is invalid")
+    smoke = payload["smoke_receipt"]
+    if not isinstance(smoke, Mapping):
+        raise ValueError("Stage A dependency preflight result is invalid")
+    if (
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != 1
+        or payload["run_id"] != plan.run_id
+        or payload["bundle_id"] != plan.bundle_id
+        or payload["bundle_manifest_artifact_id"]
+        != plan.bundle_manifest_artifact_id
+        or payload["model_cache_artifact_id"]
+        != approval_payload["model_cache_artifact_id"]
+        or payload["smoke_receipt_artifact_id"]
+        != approval_payload["smoke_receipt_artifact_id"]
+    ):
+        raise ValueError("Stage A dependency preflight identity is invalid")
+    validated_smoke = _validate_successful_smoke_receipt(
         smoke,
         plan=plan,
-        artifact_id=smoke_receipt_artifact_id,
-        model_cache_artifact_id=model_cache_artifact_id,
+        artifact_id=str(payload["smoke_receipt_artifact_id"]),
+        model_cache_artifact_id=str(payload["model_cache_artifact_id"]),
     )
-    provenance_path = (
-        f"/runs/{plan.run_id}/provenance/input-bundle-manifest.json"
-    )
-    provenance_bytes = _read_volume_file_optional(runs_client, provenance_path)
-    expected_manifest = (canonical_json(asdict(bundle)) + "\n").encode("utf-8")
-    if (
-        provenance_bytes != expected_manifest
-        or _sha256_bytes(expected_manifest) != plan.bundle_manifest_artifact_id
-        or smoke.get("bundle_manifest_artifact_id")
-        != plan.bundle_manifest_artifact_id
-    ):
-        raise ValueError("Stage A input bundle provenance is invalid")
     return StageADependencyEvidence(
-        bundle_id=bundle.bundle_id,
-        model_cache_artifact_id=model_cache_artifact_id,
-        smoke_receipt_artifact_id=smoke_receipt_artifact_id,
+        bundle_id=plan.bundle_id,
+        model_cache_artifact_id=str(payload["model_cache_artifact_id"]),
+        smoke_receipt_artifact_id=str(payload["smoke_receipt_artifact_id"]),
         bundle_manifest_artifact_id=plan.bundle_manifest_artifact_id,
-        smoke_receipt=smoke,
+        smoke_receipt=validated_smoke,
     )
 
 
@@ -979,7 +925,7 @@ def _validate_successful_smoke_receipt(
     plan: PilotPlan,
     artifact_id: str,
     model_cache_artifact_id: str,
-) -> None:
+) -> dict[str, object]:
     unsigned = dict(smoke)
     receipt_artifact_id = unsigned.pop("artifact_id", None)
     imports = smoke.get("imports")
@@ -1046,6 +992,7 @@ def _validate_successful_smoke_receipt(
         )
     ):
         raise ValueError("Stage A smoke receipt identity is invalid")
+    return dict(smoke)
 
 
 def _preflight_stage_a_outputs(
@@ -2723,10 +2670,9 @@ def run_stage_a(
         training_function=run_training_job,
         selection_function=run_selection_job,
         finalizer_function=finalize_stage_a_remote,
+        dependency_function=preflight_stage_a_remote,
         recovery_function=recover_stage_a_orphans_remote,
         runs_client=runs_volume,
-        inputs_client=inputs_volume,
-        model_client=model_volume,
         smoke_receipt_artifact_id=smoke_receipt_artifact_id,
         model_cache_artifact_id=model_cache_artifact_id,
         approval_payload=approval,

@@ -2384,12 +2384,11 @@ def test_run_stage_a_entrypoint_forwards_explicit_resume_and_prints_summary(
             "budget_acknowledged": True,
             "resume": True,
             "training_function": imported_adapter.run_training_job,
-                "selection_function": imported_adapter.run_selection_job,
-                "finalizer_function": imported_adapter.finalize_stage_a_remote,
-                "recovery_function": imported_adapter.recover_stage_a_orphans_remote,
-                "runs_client": imported_adapter.runs_volume,
-            "inputs_client": imported_adapter.inputs_volume,
-            "model_client": imported_adapter.model_volume,
+            "selection_function": imported_adapter.run_selection_job,
+            "finalizer_function": imported_adapter.finalize_stage_a_remote,
+            "recovery_function": imported_adapter.recover_stage_a_orphans_remote,
+            "runs_client": imported_adapter.runs_volume,
+            "dependency_function": imported_adapter.preflight_stage_a_remote,
             "smoke_receipt_artifact_id": smoke_id,
             "model_cache_artifact_id": cache_id,
             "approval_payload": approval,
@@ -2674,6 +2673,22 @@ class StageAFinalizer:
         return summary
 
 
+class StageADependencyFunction:
+    def __init__(
+        self, result: object, events: list[tuple[object, ...]] | None = None
+    ) -> None:
+        self.result = result
+        self.events = events if events is not None else []
+        self.calls: list[object] = []
+
+    def remote(self, payload: object) -> object:
+        self.calls.append(payload)
+        self.events.append(("dependency-preflight",))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
 def _publish_stage_a_result(
     files: dict[str, bytes], receipt: object, runs: StageARunsClient,
 ) -> None:
@@ -2730,22 +2745,8 @@ def _stage_a_dependency_kwargs(
     resume: bool,
 ) -> dict[str, object]:
     bundle = build_input_bundle(pilot_repo)
-    inputs = LocalBatchVolume(_bundle_volume_files(bundle, pilot_repo))
-    file_contents, manifest, smoke = _stage_a_test_dependency_evidence(plan)
+    _file_contents, manifest, smoke = _stage_a_test_dependency_evidence(plan)
     model_cache_artifact_id = str(manifest["artifact_id"])
-    snapshot_root = (
-        "/canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots/"
-        f"{plan.model_revision}"
-    )
-    model_files = {
-        f"{snapshot_root}/{path}": content
-        for path, content in file_contents.items()
-    }
-    model_files[
-        "/canonical/models--Qwen--Qwen2.5-7B-Instruct/snapshots/"
-        f"{plan.model_revision}.manifest.json"
-    ] = (canonical_json(manifest) + "\n").encode("utf-8")
-    model = LocalBatchVolume(model_files)
     smoke_id = str(smoke["artifact_id"])
     bundle_manifest = (canonical_json(asdict(bundle)) + "\n").encode("utf-8")
     runs.files[
@@ -2761,91 +2762,170 @@ def _stage_a_dependency_kwargs(
         smoke_receipt_artifact_id=smoke_id,
         model_cache_artifact_id=model_cache_artifact_id,
     )
+    result = {
+        "schema_version": 1,
+        "run_id": plan.run_id,
+        "bundle_id": plan.bundle_id,
+        "bundle_manifest_artifact_id": plan.bundle_manifest_artifact_id,
+        "model_cache_artifact_id": model_cache_artifact_id,
+        "smoke_receipt_artifact_id": smoke_id,
+        "smoke_receipt": smoke,
+    }
     return {
-        "inputs_client": inputs,
-        "model_client": model,
+        "dependency_function": StageADependencyFunction(result),
         "smoke_receipt_artifact_id": smoke_id,
         "model_cache_artifact_id": model_cache_artifact_id,
         "approval_payload": approval,
     }
 
 
-def test_stage_a_dependency_preflight_binds_exact_bundle_cache_and_smoke(
+def test_stage_a_cpu_preflight_completes_before_tags_or_gpu(
     imported_adapter: ModuleType,
     pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Would fail if H100 approval could name unreviewed staged evidence."""
-    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
-    runs = LocalBatchVolume()
+    """Would fail if CPU dependency evidence were checked after GPU scheduling."""
+    plan = _build_plan(
+        pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name)
+    )
+    events: list[tuple[object, ...]] = []
+    runs = StageARunsClient({}, events)
     kwargs = _stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False)
+    dependency = kwargs["dependency_function"]
+    assert isinstance(dependency, StageADependencyFunction)
+    dependency.events = events
+    training, training_results = _publishing_stage_a_function(
+        plan, "train", events, runs
+    )
+    selection, selection_results = _publishing_stage_a_function(
+        plan, "selection", events, runs
+    )
+    finalizer = StageAFinalizer(
+        _stage_a_summary(plan, training_results, selection_results), events
+    )
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda *_args, **_kwargs: events.append(("tags",)),
+    )
+    monkeypatch.setattr(
+        imported_adapter, "validate_canonical_job_semantics", lambda **_: None
+    )
 
-    evidence = imported_adapter.preflight_stage_a_dependencies(
+    imported_adapter.run_stage_a_local(
         plan,
-        inputs_client=kwargs["inputs_client"],
-        model_client=kwargs["model_client"],
+        approved_run_id=plan.run_id,
+        budget_acknowledged=True,
+        resume=False,
+        training_function=training,
+        selection_function=selection,
+        finalizer_function=finalizer,
         runs_client=runs,
-        smoke_receipt_artifact_id=kwargs["smoke_receipt_artifact_id"],
-        model_cache_artifact_id=kwargs["model_cache_artifact_id"],
+        **kwargs,
     )
 
-    assert evidence.bundle_id == plan.bundle_id
-    assert evidence.model_cache_artifact_id == kwargs["model_cache_artifact_id"]
-    assert evidence.smoke_receipt_artifact_id == kwargs["smoke_receipt_artifact_id"]
-    with pytest.raises(ValueError, match="model-cache artifact"):
-        imported_adapter.preflight_stage_a_dependencies(
-            plan,
-            inputs_client=kwargs["inputs_client"],
-            model_client=kwargs["model_client"],
-            runs_client=runs,
-            smoke_receipt_artifact_id=kwargs["smoke_receipt_artifact_id"],
-            model_cache_artifact_id="0" * 64,
-        )
-
-    model = kwargs["model_client"]
-    assert isinstance(model, RecordingVolume)
-    snapshot_file = next(
-        path for path in model.files if path.endswith("/config.json")
+    assert events.index(("dependency-preflight",)) < events.index(("tags",))
+    assert events.index(("dependency-preflight",)) < events.index(
+        ("train", plan.jobs[0].arm)
     )
-    model.files[snapshot_file] = b"tampered-but-still-listed"
-    with pytest.raises(ValueError, match="model-cache file"):
-        imported_adapter.preflight_stage_a_dependencies(
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "exception",
+        "extra-field",
+        "wrong-schema-type",
+        "wrong-run",
+        "wrong-bundle",
+        "wrong-model",
+        "wrong-smoke",
+    ),
+)
+def test_stage_a_rejects_invalid_cpu_preflight_evidence(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    """Would fail if malformed CPU evidence could authorize tags or GPU work."""
+    plan = _build_plan(
+        pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name)
+    )
+    events: list[tuple[object, ...]] = []
+    runs = StageARunsClient({}, events)
+    kwargs = _stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False)
+    original = kwargs["dependency_function"]
+    assert isinstance(original, StageADependencyFunction)
+    result: object
+    if fault == "exception":
+        result = RuntimeError("CPU preflight failed")
+    else:
+        assert isinstance(original.result, dict)
+        result = dict(original.result)
+        if fault == "extra-field":
+            result["unexpected"] = True
+        elif fault == "wrong-schema-type":
+            result["schema_version"] = True
+        elif fault == "wrong-run":
+            result["run_id"] = "wrong-run"
+        elif fault == "wrong-bundle":
+            result["bundle_id"] = "0" * 64
+        elif fault == "wrong-model":
+            result["model_cache_artifact_id"] = "0" * 64
+        else:
+            result["smoke_receipt_artifact_id"] = "0" * 64
+    dependency = StageADependencyFunction(result, events)
+    kwargs["dependency_function"] = dependency
+    training = StageAMapFunction("train", {}, events)
+    selection = StageAMapFunction("selection", {}, events)
+    finalizer = StageAFinalizer({}, events)
+    tags: list[object] = []
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda plan, **_: tags.append(plan),
+    )
+
+    with pytest.raises((RuntimeError, ValueError)):
+        imported_adapter.run_stage_a_local(
             plan,
-            inputs_client=kwargs["inputs_client"],
-            model_client=model,
+            approved_run_id=plan.run_id,
+            budget_acknowledged=True,
+            resume=False,
+            training_function=training,
+            selection_function=selection,
+            finalizer_function=finalizer,
             runs_client=runs,
-            smoke_receipt_artifact_id=kwargs["smoke_receipt_artifact_id"],
-            model_cache_artifact_id=kwargs["model_cache_artifact_id"],
+            **kwargs,
         )
 
+    assert len(dependency.calls) == 1
+    assert tags == []
+    assert training.calls == []
+    assert selection.calls == []
+    assert finalizer.calls == []
 
-def test_stage_a_dependency_preflight_rejects_self_hashed_extra_smoke_schema(
+
+def test_successful_smoke_receipt_validation_returns_a_copy(
     imported_adapter: ModuleType,
     pilot_repo: Path,
 ) -> None:
-    """Would fail if a self-hashed receipt could invent its own smoke schema."""
-    plan = _build_plan(pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name))
-    runs = RecordingVolume()
-    kwargs = _stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False)
-    original_id = str(kwargs["smoke_receipt_artifact_id"])
-    original_path = f"/runs/{plan.run_id}/receipts/smoke/{original_id}.json"
-    smoke = json.loads(runs.files.pop(original_path))
-    smoke["unapproved_extra"] = "self-hashed"
-    smoke.pop("artifact_id")
-    smoke["artifact_id"] = modal_artifacts.sha256_json(smoke)
-    changed_id = str(smoke["artifact_id"])
-    runs.files[f"/runs/{plan.run_id}/receipts/smoke/{changed_id}.json"] = (
-        canonical_json(smoke) + "\n"
-    ).encode("utf-8")
+    """Would fail if validated remote smoke evidence were returned by reference."""
+    plan = _build_plan(
+        pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name)
+    )
+    _files, manifest, smoke = _stage_a_test_dependency_evidence(plan)
 
-    with pytest.raises(ValueError, match="smoke receipt"):
-        imported_adapter.preflight_stage_a_dependencies(
-            plan,
-            inputs_client=kwargs["inputs_client"],
-            model_client=kwargs["model_client"],
-            runs_client=runs,
-            smoke_receipt_artifact_id=changed_id,
-            model_cache_artifact_id=kwargs["model_cache_artifact_id"],
-        )
+    validated = imported_adapter._validate_successful_smoke_receipt(
+        smoke,
+        plan=plan,
+        artifact_id=str(smoke["artifact_id"]),
+        model_cache_artifact_id=str(manifest["artifact_id"]),
+    )
+
+    assert validated == smoke
+    assert validated is not smoke
 
 
 def _canonical_stage_a_files(
@@ -3792,6 +3872,12 @@ def test_stage_a_mismatched_run_id_aborts_before_preflight_tags_or_remote_calls(
     training = StageAMapFunction("train", {}, events)
     selection = StageAMapFunction("selection", {}, events)
     finalizer = StageAFinalizer({}, events)
+    kwargs = _stage_a_dependency_kwargs(
+        plan, pilot_repo, StageARunsClient({}, events), resume=False
+    )
+    dependency = kwargs["dependency_function"]
+    assert isinstance(dependency, StageADependencyFunction)
+    dependency.events = events
     tags: list[object] = []
     monkeypatch.setattr(
         imported_adapter,
@@ -3809,10 +3895,60 @@ def test_stage_a_mismatched_run_id_aborts_before_preflight_tags_or_remote_calls(
             selection_function=selection,
             finalizer_function=finalizer,
             runs_client=EmptyStageARunsClient(events),
+            **kwargs,
         )
     assert events == []
     assert tags == []
     assert training.calls == [] and selection.calls == [] and finalizer.calls == []
+    assert dependency.calls == []
+
+
+def test_stage_a_invalid_approval_aborts_before_cpu_preflight(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail if an invalid local approval could trigger the CPU RPC."""
+    plan = _build_plan(
+        pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name)
+    )
+    events: list[tuple[object, ...]] = []
+    runs = StageARunsClient({}, events)
+    kwargs = _stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False)
+    dependency = kwargs["dependency_function"]
+    assert isinstance(dependency, StageADependencyFunction)
+    dependency.events = events
+    approval = kwargs["approval_payload"]
+    assert isinstance(approval, dict)
+    approval["approval_digest"] = "0" * 64
+    training = StageAMapFunction("train", {}, events)
+    selection = StageAMapFunction("selection", {}, events)
+    finalizer = StageAFinalizer({}, events)
+    tags: list[object] = []
+    monkeypatch.setattr(
+        imported_adapter,
+        "apply_approved_app_tags",
+        lambda plan, **_: tags.append(plan),
+    )
+
+    with pytest.raises(ValueError, match="approval"):
+        imported_adapter.run_stage_a_local(
+            plan,
+            approved_run_id=plan.run_id,
+            budget_acknowledged=True,
+            resume=False,
+            training_function=training,
+            selection_function=selection,
+            finalizer_function=finalizer,
+            runs_client=runs,
+            **kwargs,
+        )
+
+    assert dependency.calls == []
+    assert tags == []
+    assert training.calls == []
+    assert selection.calls == []
+    assert finalizer.calls == []
 
 
 def test_explicit_resume_revalidates_existing_and_schedules_only_missing_arms(
