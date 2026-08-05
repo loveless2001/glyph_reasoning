@@ -2891,7 +2891,11 @@ def _is_path_identity(value: object) -> bool:
 def _tree_hashes(root: Path) -> tuple[tuple[str, int, str], ...]:
     records: list[tuple[str, int, str]] = []
     for path in sorted(root.rglob("*"), key=lambda value: value.relative_to(root).as_posix()):
-        if path.is_symlink() or not path.is_file():
+        if path.is_symlink():
+            raise ValueError("attempt output must contain regular files only")
+        if path.is_dir():
+            continue
+        if not path.is_file():
             raise ValueError("attempt output must contain regular files only")
         records.append((path.relative_to(root).as_posix(), path.stat().st_size, _file_sha256(path)))
     return tuple(records)
