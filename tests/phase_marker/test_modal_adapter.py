@@ -1760,7 +1760,11 @@ def _write_smoke_model_cache(model_root: Path) -> tuple[Path, Path]:
         ),
         (
             "generation_config.json",
-            {"bos_token_id": 151643, "eos_token_id": 151645, "pad_token_id": 151643},
+            {
+                "bos_token_id": 151643,
+                "eos_token_id": [151645, 151643],
+                "pad_token_id": 151643,
+            },
         ),
         (
             "tokenizer.json",
@@ -2912,7 +2916,7 @@ def _write_direct_remote_mounts(
             "num_key_value_heads": 4, "vocab_size": 152064,
         },
         "generation_config.json": {
-            "bos_token_id": 151643, "eos_token_id": 151645,
+            "bos_token_id": 151643, "eos_token_id": [151645, 151643],
             "pad_token_id": 151643,
         },
         "tokenizer.json": {

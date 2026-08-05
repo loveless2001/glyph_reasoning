@@ -133,7 +133,11 @@ def qwen_snapshot(tmp_path: Path) -> Path:
         ("config.json", _pinned_qwen_model_config()),
         (
             "generation_config.json",
-            {"bos_token_id": 151643, "eos_token_id": 151645, "pad_token_id": 151643},
+            {
+                "bos_token_id": 151643,
+                "eos_token_id": [151645, 151643],
+                "pad_token_id": 151643,
+            },
         ),
         ("tokenizer.json", _pinned_qwen_tokenizer_json()),
         (
@@ -277,7 +281,7 @@ def test_model_cache_validation_rejects_changed_valid_generation_metadata(
         json.dumps(
             {
                 "bos_token_id": 151643,
-                "eos_token_id": 151645,
+                "eos_token_id": [151645, 151643],
                 "pad_token_id": 151643,
                 "additional_stable_note": "changed bytes",
             }

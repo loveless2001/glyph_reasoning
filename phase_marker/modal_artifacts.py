@@ -94,7 +94,7 @@ _PINNED_QWEN_MODEL_METADATA = {
 }
 _PINNED_QWEN_GENERATION_METADATA = {
     "bos_token_id": 151643,
-    "eos_token_id": 151645,
+    "eos_token_id": [151645, 151643],
     "pad_token_id": 151643,
 }
 _PLAN_PAYLOAD_FIELDS = frozenset(
