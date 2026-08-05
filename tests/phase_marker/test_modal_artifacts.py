@@ -2059,6 +2059,63 @@ def _stage_a_approval_for_model(
     )
 
 
+def test_stage_a_approval_rejects_boolean_schema_version(
+    repo_fixture: Path,
+) -> None:
+    """Would fail if a bool schema version crossed the shared approval boundary."""
+    bundle = build_input_bundle(repo_fixture)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    plan_payload = modal_plan.pilot_plan_payload(plan)
+    approval = _stage_a_approval(plan)
+    approval["schema_version"] = True
+
+    with pytest.raises(ValueError, match="approval envelope identity"):
+        modal_artifacts.validate_action_approval_payload(
+            plan_payload=plan_payload,
+            approval_payload=approval,
+            action="run-stage-a",
+            resume=False,
+            smoke_receipt_artifact_id=str(approval["smoke_receipt_artifact_id"]),
+            model_cache_artifact_id=str(approval["model_cache_artifact_id"]),
+        )
+
+
+def test_successful_smoke_rejects_boolean_schema_version(
+    repo_fixture: Path,
+) -> None:
+    """Would fail if a self-consistent bool schema crossed remote preflight."""
+    bundle = build_input_bundle(repo_fixture)
+    plan = _job_execution_plan(repo_fixture, bundle)
+    plan_payload = modal_plan.pilot_plan_payload(plan)
+    model_cache_artifact_id = "e" * 64
+    smoke = modal_artifacts._cpu_smoke_receipt_payload(
+        plan_payload=plan_payload,
+        imported=[
+            {"module": module, "version": "locked-test-version"}
+            for module in modal_artifacts.LOCKED_RUNTIME_MODULES
+        ],
+        model_cache_artifact_id=model_cache_artifact_id,
+        validated=True,
+        failure_reason=None,
+        provenance=_execution_provenance("smoke", "boolean-schema"),
+    )
+    smoke["schema_version"] = True
+    smoke.pop("artifact_id")
+    smoke["artifact_id"] = sha256_json(smoke)
+    approval = _stage_a_approval(
+        plan,
+        cache_artifact_id=model_cache_artifact_id,
+        smoke_receipt_artifact_id=str(smoke["artifact_id"]),
+    )
+
+    with pytest.raises(ValueError, match="smoke receipt identity"):
+        modal_artifacts.validate_successful_smoke_receipt_payload(
+            smoke,
+            plan_payload=plan_payload,
+            approval_payload=approval,
+        )
+
+
 def _execution_provenance(stage: str, suffix: str = "test") -> dict[str, object]:
     function = {
         "train": "run_training_job",

@@ -944,7 +944,8 @@ def _validate_successful_smoke_receipt(
         set(smoke) != _SMOKE_RECEIPT_FIELDS
         or receipt_artifact_id != artifact_id
         or receipt_artifact_id != sha256_json(unsigned)
-        or smoke.get("schema_version") != 1
+        or type(smoke["schema_version"]) is not int
+        or smoke["schema_version"] != 1
         or smoke.get("stage") != "smoke"
         or smoke.get("hardware") != "CPU"
         or smoke.get("run_id") != plan.run_id

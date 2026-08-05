@@ -1675,7 +1675,8 @@ def validate_successful_smoke_receipt_payload(
         or set(smoke) != _SMOKE_RECEIPT_FIELDS
         or artifact_id != approval["smoke_receipt_artifact_id"]
         or artifact_id != sha256_json(unsigned)
-        or smoke.get("schema_version") != 1
+        or type(smoke["schema_version"]) is not int
+        or smoke["schema_version"] != 1
         or smoke.get("stage") != "smoke"
         or smoke.get("hardware") != "CPU"
         or smoke.get("run_id") != plan_payload["run_id"]
@@ -3439,7 +3440,8 @@ def validate_action_approval_payload(
     if not isinstance(approval_payload, Mapping) or set(approval_payload) != expected_fields:
         raise ValueError("action approval envelope fields are invalid")
     if (
-        approval_payload["schema_version"] != 1
+        type(approval_payload["schema_version"]) is not int
+        or approval_payload["schema_version"] != 1
         or approval_payload["action"] != action
         or approval_payload["plan_digest"] != plan_payload["plan_digest"]
         or approval_payload["modal_environment"]

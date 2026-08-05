@@ -2928,6 +2928,75 @@ def test_successful_smoke_receipt_validation_returns_a_copy(
     assert validated is not smoke
 
 
+def test_stage_a_rejects_boolean_approval_schema_before_cpu_preflight(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+) -> None:
+    """Would fail if a bool approval schema reached the CPU dependency RPC."""
+    plan = _build_plan(
+        pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name)
+    )
+    events: list[tuple[object, ...]] = []
+    runs = StageARunsClient({}, events)
+    kwargs = _stage_a_dependency_kwargs(plan, pilot_repo, runs, resume=False)
+    approval = kwargs["approval_payload"]
+    assert isinstance(approval, dict)
+    approval["schema_version"] = True
+    dependency = StageADependencyFunction(RuntimeError("CPU RPC invoked"), events)
+    kwargs["dependency_function"] = dependency
+
+    with pytest.raises(ValueError, match="approval"):
+        imported_adapter.run_stage_a_local(
+            plan,
+            approved_run_id=plan.run_id,
+            budget_acknowledged=True,
+            resume=False,
+            training_function=StageAMapFunction("train", {}, events),
+            selection_function=StageAMapFunction("selection", {}, events),
+            finalizer_function=StageAFinalizer({}, events),
+            runs_client=runs,
+            **kwargs,
+        )
+
+    assert dependency.calls == []
+
+
+def test_stage_a_rejects_boolean_nested_smoke_schema(
+    imported_adapter: ModuleType,
+    pilot_repo: Path,
+) -> None:
+    """Would fail if local compact-evidence validation accepted bool smoke schema."""
+    plan = _build_plan(
+        pilot_repo, modal_plan._file_sha256(pilot_repo / LOCK_PATH.name)
+    )
+    events: list[tuple[object, ...]] = []
+    kwargs = _stage_a_dependency_kwargs(
+        plan, pilot_repo, StageARunsClient({}, events), resume=False
+    )
+    original = kwargs["dependency_function"]
+    assert isinstance(original, StageADependencyFunction)
+    assert isinstance(original.result, dict)
+    result = dict(original.result)
+    smoke = dict(result["smoke_receipt"])
+    smoke["schema_version"] = True
+    smoke.pop("artifact_id")
+    smoke["artifact_id"] = modal_artifacts.sha256_json(smoke)
+    result["smoke_receipt"] = smoke
+    result["smoke_receipt_artifact_id"] = smoke["artifact_id"]
+    approval = modal_plan.action_approval_payload(
+        plan,
+        action="run-stage-a",
+        resume=False,
+        smoke_receipt_artifact_id=str(smoke["artifact_id"]),
+        model_cache_artifact_id=str(result["model_cache_artifact_id"]),
+    )
+
+    with pytest.raises(ValueError, match="smoke receipt identity"):
+        imported_adapter._validate_stage_a_dependency_evidence(
+            plan, approval, result
+        )
+
+
 def _canonical_stage_a_files(
     plan: modal_plan.PilotPlan,
     job: modal_plan.PilotJob,
