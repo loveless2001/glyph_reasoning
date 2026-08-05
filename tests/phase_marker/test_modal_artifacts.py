@@ -491,6 +491,31 @@ def test_cache_model_downloads_pinned_revision_validates_then_promotes_once(
     ).artifact_id
 
 
+def test_cache_publication_does_not_require_hard_links(
+    repo_fixture: Path,
+    qwen_snapshot: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Would fail on Modal Volumes, which reject hard-link creation."""
+    cache_root = tmp_path / "model-cache"
+    _install_fake_snapshot_download(monkeypatch, qwen_snapshot, [])
+
+    def reject_hard_link(*args: object, **kwargs: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", reject_hard_link)
+
+    result = modal_artifacts.cache_model_to_volume(
+        plan_payload=_cache_plan_payload(repo_fixture),
+        cache_root=cache_root,
+        volume=CommitVolume(),
+    )
+
+    assert result["cached"] is True
+    assert Path(str(result["manifest_path"])).is_file()
+
+
 @pytest.mark.parametrize(
     "failure_stage",
     ("during-manifest-publication", "after-publication", "during-final-validation"),

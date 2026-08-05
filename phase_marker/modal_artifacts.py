@@ -3087,7 +3087,10 @@ def _write_quarantined_model_cache_manifest(
             temporary_manifest=temporary,
             manifest_path=manifest_path,
         )
-        os.link(temporary, manifest_path)
+        with _open_directory_path_nofollow(manifest_path.parent) as parent_fd:
+            _write_canonical_json_exclusive_at(
+                parent_fd, manifest_path.name, asdict(manifest)
+            )
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
