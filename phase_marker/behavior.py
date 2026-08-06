@@ -213,13 +213,15 @@ class VLLMGenerationBackend:
             if request.decoding["adapter_seed"] != self._adapter_seed:
                 raise ValueError("vLLM request must match backend adapter seed")
         from vllm import SamplingParams
+        from vllm import TokensPrompt
+
         llm = self._ensure_llm()
         lora_request = self._lora_request()
 
         outputs: list[GenerationOutput] = []
         for request in requests:
             results = llm.generate(
-                prompt_token_ids=[list(request.prompt_token_ids)],
+                TokensPrompt(prompt_token_ids=list(request.prompt_token_ids)),
                 sampling_params=SamplingParams(**_vllm_sampling_parameters((request,))),
                 use_tqdm=False,
                 lora_request=lora_request,
@@ -280,6 +282,7 @@ class VLLMGenerationBackend:
         if len(requests) != len(gold_answers) or not requests:
             raise ValueError("gold-answer scoring requires one answer per request")
         from vllm import SamplingParams
+        from vllm import TokensPrompt
 
         llm = self._ensure_llm()
         lora_request = self._lora_request()
@@ -288,7 +291,7 @@ class VLLMGenerationBackend:
             suffix_ids = tuple(tokenize(f"\n{final_delimiter} {answer}"))
             prompt_ids = (*request.prompt_token_ids, *suffix_ids)
             results = llm.generate(
-                prompt_token_ids=[list(prompt_ids)],
+                TokensPrompt(prompt_token_ids=list(prompt_ids)),
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=1),
                 use_tqdm=False, lora_request=lora_request,
             )

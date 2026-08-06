@@ -437,11 +437,11 @@ def test_vllm_backend_loads_frozen_base_and_sends_exact_lora_request(
         def __init__(self, **kwargs: object) -> None:
             calls["llm"] = kwargs
 
-        def generate(self, **kwargs: object):
-            calls["generate"] = kwargs
+        def generate(self, prompts, **kwargs: object):
+            calls["generate"] = {"prompts": prompts, **kwargs}
             sampling = kwargs["sampling_params"]
             if sampling.kwargs.get("prompt_logprobs") == 1:
-                token_ids = kwargs["prompt_token_ids"][0]
+                token_ids = prompts["prompt_token_ids"]
                 prompt_logprobs = [None] + [
                     {token_id: SimpleNamespace(logprob=-0.25)}
                     for token_id in token_ids[1:]
@@ -463,6 +463,7 @@ def test_vllm_backend_loads_frozen_base_and_sends_exact_lora_request(
     vllm = ModuleType("vllm")
     vllm.LLM = FakeLLM  # type: ignore[attr-defined]
     vllm.SamplingParams = FakeSamplingParams  # type: ignore[attr-defined]
+    vllm.TokensPrompt = dict  # type: ignore[attr-defined]  # real one is a TypedDict
     request_module = ModuleType("vllm.lora.request")
     request_module.LoRARequest = FakeLoRARequest  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "vllm", vllm)
