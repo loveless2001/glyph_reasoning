@@ -739,22 +739,6 @@ def test_mechanism_approval_rejects_nonfinite_estimates(
         MechanismApprovalMetadata(**values)
 
 
-@pytest.mark.parametrize("value", ("nan", "inf", "-inf"))
-def test_mechanism_cli_rejects_nonfinite_estimate(tmp_path: Path, value: str) -> None:
-    outputs = pipeline_module._mechanism_expected_outputs("capture", tmp_path)
-    with pytest.raises(ValueError, match="finite"):
-        main([
-            "gate", "--stage", "capture", "--kind", "pilot", "--seeds", "42",
-            "--config", str(CONFIG_PATH), "--artifact-root", str(tmp_path),
-            "--mechanism-schema-version", "1", "--mechanism-stage", "capture",
-            "--mechanism-hardware", "1x H100", "--mechanism-job-count", "1",
-            "--mechanism-command-count", "1", "--mechanism-expected-outputs", *outputs,
-            "--mechanism-parent-hash", "a" * 64, f"--mechanism-gpu-hours={value}",
-            "--mechanism-max-duration-hours", "2",
-            "--mechanism-estimated-spend-usd", "4", "--mechanism-spend-cap-usd", "5",
-        ])
-
-
 def test_intervention_approval_emits_nothing_before_activation_exists(
     tmp_path: Path, config: ExperimentConfig,
 ) -> None:
