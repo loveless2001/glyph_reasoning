@@ -2076,8 +2076,8 @@ def _run_behavior_prerequisite_gate(
         raise ValueError(f"behavior prerequisite gate failed: {result.reason}")
     return {
         "passed": True,
-        "checked_artifact_ids": list(result.checked_artifact_ids),
-        "commands": list(result.commands),
+        "checked_artifact_ids": list(result.checked_hashes),
+        "commands": list(result.next_commands),
     }
 
 
