@@ -507,7 +507,7 @@ def build_generation_requests(
                 "tokenizer_revision": request_tokenizer_revision,
                 "split_artifact_id": split_artifact_id,
                 "split_parent_hashes": split_parent_hashes,
-                "max_tokens": 64,
+                "max_tokens": 1024,
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "n": 1,
@@ -534,7 +534,7 @@ def build_generation_requests(
                     ),
                     prompt=prompt,
                     prompt_token_ids=tuple(encoder(prompt)),
-                    max_new_tokens=64,
+                    max_new_tokens=1024,
                     decoding=decoding,
                 )
             )
