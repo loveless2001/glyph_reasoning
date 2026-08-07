@@ -1932,6 +1932,8 @@ def finalize_stage_a(
     ):
         raise ValueError("behavior prerequisite gate did not pass exactly once")
 
+    training_elapsed = _receipt_elapsed_seconds(training)
+    selection_elapsed = _receipt_elapsed_seconds(selection)
     summary: dict[str, object] = {
         "schema_version": 1,
         "stage": "stage-a",
@@ -1951,10 +1953,12 @@ def finalize_stage_a(
         "training_receipt_ids": [receipt["artifact_id"] for receipt in training],
         "selection_receipt_ids": [receipt["artifact_id"] for receipt in selection],
         "behavior_gate_checked_artifact_ids": list(checked),
+        # Totals must reproduce the validator's fsum-of-subtotals exactly;
+        # one fsum over all twelve receipts can differ by one ulp.
         "elapsed_gpu_seconds": {
-            "training": _receipt_elapsed_seconds(training),
-            "selection": _receipt_elapsed_seconds(selection),
-            "total": _receipt_elapsed_seconds((*training, *selection)),
+            "training": training_elapsed,
+            "selection": selection_elapsed,
+            "total": math.fsum((training_elapsed, selection_elapsed)),
         },
         "finalizer_provenance": provenance,
         "next_command": commands[0],
