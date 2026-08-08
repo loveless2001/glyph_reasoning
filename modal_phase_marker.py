@@ -455,6 +455,171 @@ def finalize_stage_a_remote(remote_payload: Mapping[str, object]) -> dict[str, o
     )
 
 
+@app.function(
+    image=gpu_image,
+    gpu="H100",
+    timeout=86_400,
+    startup_timeout=1_200,
+    max_containers=1,
+    retries=0,
+    volumes=GPU_VOLUMES,
+)
+def run_behavior_remote(remote_payload: Mapping[str, object]) -> dict[str, object]:
+    """Score the frozen held-out test set against a completed Stage A namespace.
+
+    Custody chain: the stage-a summary must hash-verify, its receipts must
+    match the summary's recorded ids, and every canonical producer tree must
+    byte-match its receipt before the summary's own next_command is executed.
+    """
+    import hashlib
+    import shlex
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+
+    from phase_marker.io import sha256_json
+
+    if not isinstance(remote_payload, Mapping) or set(remote_payload) != {
+        "run_id", "expected_summary_artifact_id",
+    }:
+        raise ValueError("remote behavior payload fields are invalid")
+    run_id = remote_payload["run_id"]
+    expected_summary = remote_payload["expected_summary_artifact_id"]
+    if not isinstance(run_id, str) or "/" in run_id or not run_id:
+        raise ValueError("behavior run id is invalid")
+
+    runs_volume.reload()
+    started = time.monotonic()
+    run_root = JOB_RUN_MOUNT_ROOT / "runs" / run_id
+    summary_path = run_root / "stage-a-summary.json"
+    summary = json.loads(summary_path.read_text())
+    unsigned = dict(summary)
+    summary_artifact_id = unsigned.pop("artifact_id")
+    if summary_artifact_id != sha256_json(unsigned):
+        raise ValueError("stage-a summary artifact id does not verify")
+    if expected_summary and summary_artifact_id != expected_summary:
+        raise ValueError("stage-a summary does not match the operator-pinned id")
+    if summary.get("stopped_before_behavior") is not True or summary.get("run_id") != run_id:
+        raise ValueError("stage-a summary stop contract is invalid")
+
+    arms = ("semantic", "glyph", "dot", "random", "direct", "filler")
+    bundle_id: str | None = None
+    for stage, expected_ids in (
+        ("train", summary["training_receipt_ids"]),
+        ("selection", summary["selection_receipt_ids"]),
+    ):
+        for arm, expected_id in zip(arms, expected_ids, strict=True):
+            receipt = json.loads(
+                (run_root / "receipts" / "canonical" / stage / f"{arm}.json").read_text()
+            )
+            if receipt["artifact_id"] != expected_id or receipt["arm"] != arm:
+                raise ValueError(f"canonical {stage}/{arm} receipt does not match the summary")
+            bundle_id = bundle_id or str(receipt["bundle_id"])
+            kind = "checkpoints" if stage == "train" else "checkpoint-selections"
+            producer = run_root / "artifacts" / "phase-marker" / kind / "pilot" / "seed-42" / arm
+            for relative, expected_hash in zip(
+                receipt["expected_outputs"], receipt["output_hashes"], strict=True
+            ):
+                digest = hashlib.sha256((producer / relative).read_bytes()).hexdigest()
+                if digest != expected_hash:
+                    raise ValueError(f"canonical bytes changed for {stage}/{arm}: {relative}")
+
+    next_command = summary["next_command"]
+    argv = shlex.split(next_command, posix=True)
+    if argv[:4] != ["./.venv/bin/python", "-m", "phase_marker.behavior", "run"]:
+        raise ValueError("stage-a summary next_command is not the behavior run")
+
+    os.environ["HF_HUB_CACHE"] = str(JOB_MODEL_MOUNT_ROOT / "canonical")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    bundle = JOB_INPUT_MOUNT_ROOT / "bundles" / str(bundle_id)
+    canonical = run_root / "artifacts" / "phase-marker"
+    behavior_target = canonical / "raw-generations"
+    receipt_target = run_root / "receipts" / "canonical" / "behavior.json"
+    if behavior_target.exists() or receipt_target.exists():
+        raise FileExistsError("behavior output already exists; refusing to overwrite")
+
+    with tempfile.TemporaryDirectory(prefix="phase-marker-behavior-") as temporary:
+        view = Path(temporary)
+        (view / "configs").mkdir(parents=True)
+        (view / "configs/phase-marker-qwen25-7b.toml").symlink_to(
+            bundle / "configs/phase-marker-qwen25-7b.toml"
+        )
+        artifacts = view / "artifacts/phase-marker"
+        artifacts.mkdir(parents=True)
+        for name, source in (
+            ("splits", bundle / "artifacts/phase-marker/splits"),
+            ("training-data", bundle / "artifacts/phase-marker/training-data"),
+            ("checkpoints", canonical / "checkpoints"),
+            ("checkpoint-selections", canonical / "checkpoint-selections"),
+        ):
+            if not source.is_dir():
+                raise ValueError(f"behavior source is missing: {name}")
+            (artifacts / name).symlink_to(source, target_is_directory=True)
+        (view / ".venv/bin").mkdir(parents=True)
+        (view / ".venv/bin/python").symlink_to(CODE_ROOT / ".venv/bin/python")
+        (view / "phase_marker").symlink_to(CODE_ROOT / "phase_marker", target_is_directory=True)
+
+        completed = subprocess.run(
+            argv, cwd=view, capture_output=True, text=True, timeout=82_800,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "behavior run failed with exit "
+                f"{completed.returncode}: {completed.stdout[-2000:]} {completed.stderr[-2000:]}"
+            )
+
+        produced = view / "artifacts/phase-marker/raw-generations"
+        if not produced.is_dir():
+            raise ValueError("behavior run produced no raw-generations output")
+        output_hashes: dict[str, str] = {}
+        for path in sorted(p for p in produced.rglob("*") if p.is_file()):
+            relative = path.relative_to(produced).as_posix()
+            output_hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        if not output_hashes:
+            raise ValueError("behavior run produced an empty output tree")
+        shutil.copytree(produced, behavior_target, symlinks=False)
+
+    receipt = {
+        "schema_version": 1,
+        "stage": "behavior",
+        "run_id": run_id,
+        "stage_a_summary_artifact_id": summary_artifact_id,
+        "command": next_command,
+        "elapsed_seconds": time.monotonic() - started,
+        "output_hashes": output_hashes,
+        "execution_provenance": _collect_modal_execution_provenance("run_behavior_remote"),
+        "stdout_tail": completed.stdout[-2000:],
+    }
+    receipt["artifact_id"] = sha256_json(receipt)
+    receipt_target.write_text(canonical_json(receipt))
+    runs_volume.commit()
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "behavior_receipt_artifact_id": receipt["artifact_id"],
+        "output_file_count": len(output_hashes),
+        "elapsed_seconds": receipt["elapsed_seconds"],
+    }
+
+
+@app.local_entrypoint(name="run-behavior")
+def run_behavior(
+    stage_a_run_id: str,
+    expected_summary_artifact_id: str = "",
+) -> None:
+    """Run held-out behavior scoring against a completed, verified Stage A run."""
+    result = run_behavior_remote.remote(
+        {
+            "run_id": stage_a_run_id,
+            "expected_summary_artifact_id": expected_summary_artifact_id,
+        }
+    )
+    print(canonical_json(result))
+
+
 def _validated_remote_action_payload(
     payload: object, *, action: str,
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -540,7 +705,7 @@ def _collect_modal_execution_provenance(function_name: str) -> dict[str, object]
     """Collect exact Modal invocation and locked runtime versions inside a call."""
     if function_name not in {
         "run_training_job", "run_selection_job", "smoke_remote",
-        "finalize_stage_a_remote",
+        "finalize_stage_a_remote", "run_behavior_remote",
     }:
         raise ValueError("Modal provenance function name is invalid")
     runtime_versions: list[dict[str, str]] = []
