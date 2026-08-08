@@ -439,16 +439,21 @@ def test_vllm_backend_loads_frozen_base_and_sends_exact_lora_request(
 
         def generate(self, prompts, **kwargs: object):
             calls["generate"] = {"prompts": prompts, **kwargs}
+            prompt_list = prompts if isinstance(prompts, list) else [prompts]
             sampling = kwargs["sampling_params"]
-            if sampling.kwargs.get("prompt_logprobs") == 1:
-                token_ids = prompts["prompt_token_ids"]
-                prompt_logprobs = [None] + [
-                    {token_id: SimpleNamespace(logprob=-0.25)}
-                    for token_id in token_ids[1:]
-                ]
-                return [SimpleNamespace(prompt_logprobs=prompt_logprobs, outputs=[])]
+            first_sampling = sampling[0] if isinstance(sampling, list) else sampling
+            if first_sampling.kwargs.get("prompt_logprobs") == 1:
+                results = []
+                for prompt in prompt_list:
+                    token_ids = prompt["prompt_token_ids"]
+                    prompt_logprobs = [None] + [
+                        {token_id: SimpleNamespace(logprob=-0.25)}
+                        for token_id in token_ids[1:]
+                    ]
+                    results.append(SimpleNamespace(prompt_logprobs=prompt_logprobs, outputs=[]))
+                return results
             candidate = SimpleNamespace(text="Final answer: 2", token_ids=(3,), logprobs=None)
-            return [SimpleNamespace(outputs=[candidate])]
+            return [SimpleNamespace(outputs=[candidate]) for _ in prompt_list]
 
     class FakeSamplingParams:
         def __init__(self, **kwargs: object) -> None:

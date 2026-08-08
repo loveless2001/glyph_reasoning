@@ -218,17 +218,24 @@ class VLLMGenerationBackend:
         llm = self._ensure_llm()
         lora_request = self._lora_request()
 
+        # One batched engine call; vLLM preserves input order, and per-request
+        # SamplingParams keep each request's frozen decoding settings and seed.
+        results = llm.generate(
+            [
+                TokensPrompt(prompt_token_ids=list(request.prompt_token_ids))
+                for request in requests
+            ],
+            sampling_params=[
+                SamplingParams(**_vllm_sampling_parameters((request,)))
+                for request in requests
+            ],
+            use_tqdm=False,
+            lora_request=lora_request,
+        )
+        if len(results) != len(requests):
+            raise ValueError("vLLM returned a missing output")
         outputs: list[GenerationOutput] = []
-        for request in requests:
-            results = llm.generate(
-                TokensPrompt(prompt_token_ids=list(request.prompt_token_ids)),
-                sampling_params=SamplingParams(**_vllm_sampling_parameters((request,))),
-                use_tqdm=False,
-                lora_request=lora_request,
-            )
-            if len(results) != 1:
-                raise ValueError("vLLM returned a missing output")
-            result = results[0]
+        for request, result in zip(requests, results, strict=True):
             candidate = result.outputs[0]
             outputs.append(
                 GenerationOutput(
@@ -286,16 +293,22 @@ class VLLMGenerationBackend:
 
         llm = self._ensure_llm()
         lora_request = self._lora_request()
-        result_rows = []
+        suffix_rows = []
         for request, answer in zip(requests, gold_answers, strict=True):
             suffix_ids = tuple(tokenize(f"\n{final_delimiter} {answer}"))
-            prompt_ids = (*request.prompt_token_ids, *suffix_ids)
-            results = llm.generate(
-                TokensPrompt(prompt_token_ids=list(prompt_ids)),
-                sampling_params=SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=1),
-                use_tqdm=False, lora_request=lora_request,
-            )
-            prompt_logprobs = getattr(results[0], "prompt_logprobs", None) if len(results) == 1 else None
+            suffix_rows.append((suffix_ids, (*request.prompt_token_ids, *suffix_ids)))
+        batched_results = llm.generate(
+            [TokensPrompt(prompt_token_ids=list(prompt_ids)) for _, prompt_ids in suffix_rows],
+            sampling_params=SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=1),
+            use_tqdm=False, lora_request=lora_request,
+        )
+        if len(batched_results) != len(requests):
+            raise ValueError("vLLM omitted teacher-forced gold-answer results")
+        result_rows = []
+        for request, (suffix_ids, prompt_ids), result in zip(
+            requests, suffix_rows, batched_results, strict=True
+        ):
+            prompt_logprobs = getattr(result, "prompt_logprobs", None)
             if not suffix_ids or not isinstance(prompt_logprobs, list) or len(prompt_logprobs) != len(prompt_ids):
                 raise ValueError("vLLM omitted teacher-forced gold-answer logprobs")
             values: list[float] = []
