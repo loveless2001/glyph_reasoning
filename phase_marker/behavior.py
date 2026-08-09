@@ -1240,7 +1240,10 @@ def _run_behavior(arguments: argparse.Namespace) -> int:
                     adapter_path=checkpoint,
                     adapter_seed=seed,
                 )
-                record_parents = (split_id, *split_parents, str(selection["artifact_id"]))
+                # The provenance envelope and statistics stage bind records to
+                # (split_id, *split_parents); selection lineage travels on each
+                # row's checkpoint_selection_artifact_id and in the manifest.
+                record_parents = (split_id, *split_parents)
             records = records_from_outputs(
                 cell,
                 examples,
