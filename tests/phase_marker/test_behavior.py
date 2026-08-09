@@ -721,9 +721,10 @@ def test_provenance_envelope_rejects_empty_or_mismatched_production_lineage(
         build_provenance_envelope(replace(record, seed=101), config, split_manifest)
 
 
-def test_run_cli_tiny_fixture_emits_versioned_plumbing_manifest(
-    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _build_tiny_fixture_run_inputs(
+    tmp_path: Path, config: ExperimentConfig
+) -> tuple[Path, Path, Path, list[str]]:
+    """Build a complete tiny-fixture behavior run input set for CLI tests."""
     config_path = Path("configs/phase-marker-qwen25-7b.toml")
     config_hash = sha256_json(asdict(config))
     split_path = tmp_path / "split-manifest.json"
@@ -813,6 +814,15 @@ def test_run_cli_tiny_fixture_emits_versioned_plumbing_manifest(
         selection_path = tmp_path / f"{arm}.selection.json"
         selection_path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
         selections.append(str(selection_path))
+    return config_path, split_path, examples_path, selections
+
+
+def test_run_cli_tiny_fixture_emits_versioned_plumbing_manifest(
+    tmp_path: Path, config: ExperimentConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, split_path, examples_path, selections = (
+        _build_tiny_fixture_run_inputs(tmp_path, config)
+    )
     output_root = tmp_path / "behavior-output"
 
     assert behavior_main(
@@ -911,3 +921,44 @@ def test_run_cli_rejects_test_backend_without_explicit_flag(tmp_path: Path) -> N
             ]
         )
     assert not (tmp_path / "must-not-exist").exists()
+
+
+def test_run_cli_cell_slices_merge_to_identical_manifest(
+    tmp_path: Path, config: ExperimentConfig
+) -> None:
+    """Sliced per-cell runs merged together must reproduce the monolithic output."""
+    config_path, split_path, examples_path, selections = (
+        _build_tiny_fixture_run_inputs(tmp_path, config)
+    )
+    base = [
+        "--config", str(config_path), "--kind", "pilot", "--seeds", "42",
+        "--split-manifest", str(split_path), "--examples", str(examples_path),
+        "--checkpoint-manifests", *selections,
+        "--backend", "tiny-fixture", "--allow-test-backend",
+    ]
+    mono_root = tmp_path / "mono"
+    assert behavior_main(["run", *base, "--output-root", str(mono_root)]) == 0
+
+    total_cells = len(build_behavior_matrix(config, ArtifactManifest(
+        artifact_id="a" * 64, kind="phase_marker_splits", config_hash="b" * 64,
+        parent_hashes=(), row_count=1, metadata={},
+    )))
+    cell_roots = []
+    for index in range(total_cells):
+        root = tmp_path / f"cell-{index:02d}"
+        assert behavior_main(
+            ["run", *base, "--output-root", str(root), "--cell-indices", str(index)]
+        ) == 0
+        cell_roots.append(str(root))
+
+    merged_root = tmp_path / "merged"
+    assert behavior_main(
+        ["merge", *base, "--cell-roots", *cell_roots, "--output-root", str(merged_root)]
+    ) == 0
+
+    mono = json.loads((mono_root / "manifest.json").read_text(encoding="utf-8"))
+    merged = json.loads((merged_root / "manifest.json").read_text(encoding="utf-8"))
+    assert merged["artifact_id"] == mono["artifact_id"]
+    assert (merged_root / "records.jsonl").read_bytes() == (
+        mono_root / "records.jsonl"
+    ).read_bytes()

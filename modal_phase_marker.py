@@ -458,18 +458,20 @@ def finalize_stage_a_remote(remote_payload: Mapping[str, object]) -> dict[str, o
 @app.function(
     image=gpu_image,
     gpu="H100",
-    timeout=86_400,
+    timeout=14_400,
     startup_timeout=1_200,
-    max_containers=1,
+    max_containers=2,
     retries=0,
     volumes=GPU_VOLUMES,
 )
 def run_behavior_remote(remote_payload: Mapping[str, object]) -> dict[str, object]:
-    """Score the frozen held-out test set against a completed Stage A namespace.
+    """Score one durable slice (or merge) of the held-out behavior matrix.
 
     Custody chain: the stage-a summary must hash-verify, its receipts must
     match the summary's recorded ids, and every canonical producer tree must
     byte-match its receipt before the summary's own next_command is executed.
+    Each cell publishes its slice never-overwrite so interruptions cost one
+    cell, not the run; "merge" reassembles the frozen single output tree.
     """
     import hashlib
     import shlex
@@ -481,13 +483,19 @@ def run_behavior_remote(remote_payload: Mapping[str, object]) -> dict[str, objec
     from phase_marker.io import sha256_json
 
     if not isinstance(remote_payload, Mapping) or set(remote_payload) != {
-        "run_id", "expected_summary_artifact_id",
+        "run_id", "expected_summary_artifact_id", "action", "cell_index",
     }:
         raise ValueError("remote behavior payload fields are invalid")
     run_id = remote_payload["run_id"]
     expected_summary = remote_payload["expected_summary_artifact_id"]
+    action = remote_payload["action"]
+    cell_index = remote_payload["cell_index"]
     if not isinstance(run_id, str) or "/" in run_id or not run_id:
         raise ValueError("behavior run id is invalid")
+    if action not in {"cell", "merge"} or (
+        action == "cell" and not isinstance(cell_index, int)
+    ):
+        raise ValueError("behavior action is invalid")
 
     runs_volume.reload()
     started = time.monotonic()
@@ -529,6 +537,7 @@ def run_behavior_remote(remote_payload: Mapping[str, object]) -> dict[str, objec
     argv = shlex.split(next_command, posix=True)
     if argv[:4] != ["./.venv/bin/python", "-m", "phase_marker.behavior", "run"]:
         raise ValueError("stage-a summary next_command is not the behavior run")
+    output_root_position = argv.index("--output-root") + 1
 
     os.environ["HF_HUB_CACHE"] = str(JOB_MODEL_MOUNT_ROOT / "canonical")
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -536,10 +545,31 @@ def run_behavior_remote(remote_payload: Mapping[str, object]) -> dict[str, objec
 
     bundle = JOB_INPUT_MOUNT_ROOT / "bundles" / str(bundle_id)
     canonical = run_root / "artifacts" / "phase-marker"
-    behavior_target = canonical / "raw-generations"
+    cells_root = canonical / "behavior-cells"
+    behavior_target = canonical / "raw-generations" / "pilot"
     receipt_target = run_root / "receipts" / "canonical" / "behavior.json"
-    if behavior_target.exists() or receipt_target.exists():
-        raise FileExistsError("behavior output already exists; refusing to overwrite")
+
+    if action == "cell":
+        cell_target = cells_root / f"cell-{cell_index:02d}"
+        if cell_target.is_dir():
+            return {
+                "schema_version": 1, "run_id": run_id, "action": "cell",
+                "cell_index": cell_index, "skipped": True,
+            }
+        view_output = "artifacts/phase-marker/behavior-cells-staging"
+        argv = [*argv, "--cell-indices", str(cell_index)]
+        argv[output_root_position] = view_output
+    else:
+        if behavior_target.exists() or receipt_target.exists():
+            raise FileExistsError("behavior output already exists; refusing to overwrite")
+        cell_dirs = sorted(cells_root.glob("cell-*")) if cells_root.is_dir() else []
+        if not cell_dirs:
+            raise ValueError("behavior merge requires published cell slices")
+        view_output = "artifacts/phase-marker/raw-generations/pilot"
+        argv[0:4] = ["./.venv/bin/python", "-m", "phase_marker.behavior", "merge"]
+        argv = [item for item in argv if item != "--allow-test-backend"]
+        argv[argv.index("--output-root") + 1] = view_output
+        argv.extend(["--cell-roots", *(str(path) for path in cell_dirs)])
 
     with tempfile.TemporaryDirectory(prefix="phase-marker-behavior-") as temporary:
         view = Path(temporary)
@@ -562,62 +592,79 @@ def run_behavior_remote(remote_payload: Mapping[str, object]) -> dict[str, objec
         (view / ".venv/bin/python").symlink_to(CODE_ROOT / ".venv/bin/python")
         (view / "phase_marker").symlink_to(CODE_ROOT / "phase_marker", target_is_directory=True)
 
-        completed = subprocess.run(
-            argv, cwd=view, capture_output=True, text=True, timeout=82_800,
-        )
+        completed = subprocess.run(argv, cwd=view, timeout=13_500)
         if completed.returncode != 0:
             raise RuntimeError(
-                "behavior run failed with exit "
-                f"{completed.returncode}: {completed.stdout[-2000:]} {completed.stderr[-2000:]}"
+                f"behavior {action} failed with exit {completed.returncode}"
             )
 
-        produced = view / "artifacts/phase-marker/raw-generations"
+        produced = view / view_output
         if not produced.is_dir():
-            raise ValueError("behavior run produced no raw-generations output")
+            raise ValueError(f"behavior {action} produced no output tree")
         output_hashes: dict[str, str] = {}
         for path in sorted(p for p in produced.rglob("*") if p.is_file()):
             relative = path.relative_to(produced).as_posix()
             output_hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
         if not output_hashes:
-            raise ValueError("behavior run produced an empty output tree")
-        shutil.copytree(produced, behavior_target, symlinks=False)
+            raise ValueError(f"behavior {action} produced an empty output tree")
+        target = cell_target if action == "cell" else behavior_target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(produced, target, symlinks=False)
 
-    receipt = {
-        "schema_version": 1,
-        "stage": "behavior",
-        "run_id": run_id,
-        "stage_a_summary_artifact_id": summary_artifact_id,
-        "command": next_command,
-        "elapsed_seconds": time.monotonic() - started,
-        "output_hashes": output_hashes,
-        "execution_provenance": _collect_modal_execution_provenance("run_behavior_remote"),
-        "stdout_tail": completed.stdout[-2000:],
-    }
-    receipt["artifact_id"] = sha256_json(receipt)
-    receipt_target.write_text(canonical_json(receipt))
-    runs_volume.commit()
-    return {
+    result: dict[str, object] = {
         "schema_version": 1,
         "run_id": run_id,
-        "behavior_receipt_artifact_id": receipt["artifact_id"],
+        "action": action,
+        "cell_index": cell_index,
         "output_file_count": len(output_hashes),
-        "elapsed_seconds": receipt["elapsed_seconds"],
+        "elapsed_seconds": time.monotonic() - started,
+        "skipped": False,
     }
+    if action == "merge":
+        receipt = {
+            "schema_version": 1,
+            "stage": "behavior",
+            "run_id": run_id,
+            "stage_a_summary_artifact_id": summary_artifact_id,
+            "command": shlex.join(argv),
+            "elapsed_seconds": result["elapsed_seconds"],
+            "output_hashes": output_hashes,
+            "execution_provenance": _collect_modal_execution_provenance(
+                "run_behavior_remote"
+            ),
+        }
+        receipt["artifact_id"] = sha256_json(receipt)
+        receipt_target.write_text(canonical_json(receipt))
+        result["behavior_receipt_artifact_id"] = receipt["artifact_id"]
+    runs_volume.commit()
+    return result
 
 
 @app.local_entrypoint(name="run-behavior")
 def run_behavior(
     stage_a_run_id: str,
     expected_summary_artifact_id: str = "",
+    total_cells: int = 26,
 ) -> None:
-    """Run held-out behavior scoring against a completed, verified Stage A run."""
-    result = run_behavior_remote.remote(
-        {
-            "run_id": stage_a_run_id,
-            "expected_summary_artifact_id": expected_summary_artifact_id,
-        }
+    """Run held-out behavior scoring cell by cell, then merge, resumably."""
+    base = {
+        "run_id": stage_a_run_id,
+        "expected_summary_artifact_id": expected_summary_artifact_id,
+    }
+    for result in run_behavior_remote.map(
+        [
+            {**base, "action": "cell", "cell_index": index}
+            for index in range(total_cells)
+        ]
+    ):
+        print(canonical_json(result))
+    print(
+        canonical_json(
+            run_behavior_remote.remote(
+                {**base, "action": "merge", "cell_index": None}
+            )
+        )
     )
-    print(canonical_json(result))
 
 
 def _validated_remote_action_payload(

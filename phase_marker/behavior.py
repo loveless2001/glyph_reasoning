@@ -839,6 +839,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument("--backend", choices=("vllm", "tiny-fixture"), required=True)
     run.add_argument("--allow-test-backend", action="store_true")
     run.add_argument("--output-root", type=Path, required=True)
+    run.add_argument("--cell-indices", type=int, nargs="+", default=None)
+    merge = subparsers.add_parser("merge")
+    merge.add_argument("--config", type=Path, required=True)
+    merge.add_argument("--kind", choices=("pilot", "confirmatory"), required=True)
+    merge.add_argument("--seeds", type=int, nargs="+", required=True)
+    merge.add_argument("--split-manifest", type=Path, required=True)
+    merge.add_argument("--examples", type=Path, required=True)
+    merge.add_argument("--checkpoint-manifests", type=Path, nargs="+", required=True)
+    merge.add_argument("--backend", choices=("vllm", "tiny-fixture"), required=True)
+    merge.add_argument("--allow-test-backend", action="store_true")
+    merge.add_argument("--cell-roots", type=Path, nargs="+", required=True)
+    merge.add_argument("--output-root", type=Path, required=True)
     select = subparsers.add_parser("select")
     select.add_argument("--config", type=Path, required=True)
     select.add_argument("--kind", choices=("pilot", "confirmatory"), required=True)
@@ -855,6 +867,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _dry_run(arguments)
     if arguments.command == "run":
         return _run_behavior(arguments)
+    if arguments.command == "merge":
+        return _merge_behavior_cells(arguments)
     if arguments.command == "select":
         return _run_selection(arguments)
     raise AssertionError("unreachable")
@@ -1171,8 +1185,26 @@ def _run_behavior(arguments: argparse.Namespace) -> int:
         metadata={"source_counts": split_payload.get("source_counts", {})},
     )
     rows: list[dict[str, object]] = []
+    requested = (
+        None if arguments.cell_indices is None else tuple(arguments.cell_indices)
+    )
+    total_cells = len(seeds) * len(build_behavior_matrix(config, split_manifest))
+    if requested is not None and (
+        not requested
+        or len(set(requested)) != len(requested)
+        or any(index < 0 or index >= total_cells for index in requested)
+    ):
+        raise ValueError(
+            f"cell indices must be unique and within 0..{total_cells - 1}"
+        )
+    if requested is not None:
+        requested = tuple(sorted(requested))  # rows are produced in cursor order
+    cell_cursor = -1
     for seed in seeds:
         for cell in build_behavior_matrix(config, split_manifest):
+            cell_cursor += 1
+            if requested is not None and cell_cursor not in requested:
+                continue
             selection = selections[(seed, cell.training_arm)]
             checkpoint = str(selection["selected_path"])
             if arguments.backend == "tiny-fixture":
@@ -1223,6 +1255,117 @@ def _run_behavior(arguments: argparse.Namespace) -> int:
                 row["checkpoint_selection_artifact_id"] = selection["artifact_id"]
                 rows.append(row)
 
+    if requested is not None:
+        _write_behavior_cell_output(arguments, config_hash, split_id, requested, rows)
+        return 0
+    _finalize_behavior_output(arguments, config_hash, split_id, selections, rows)
+    return 0
+
+
+def _write_behavior_cell_output(
+    arguments: argparse.Namespace,
+    config_hash: str,
+    split_id: str,
+    cell_indices: tuple[int, ...],
+    rows: list[dict[str, object]],
+) -> None:
+    """Write one durable, resumable slice of the frozen behavior matrix."""
+    arguments.output_root.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=arguments.output_root.parent, prefix=f".{arguments.output_root.name}-"
+    ) as temporary:
+        staging = Path(temporary)
+        records_path = staging / "records.jsonl"
+        write_jsonl_atomic(records_path, rows)
+        manifest = {
+            "schema_version": 1,
+            "kind": "phase_marker_behavior_cells",
+            "cell_indices": list(cell_indices),
+            "config_hash": config_hash,
+            "split_artifact_id": split_id,
+            "records_file": records_path.name,
+            "records_hash": _file_hash(records_path),
+            "row_count": len(rows),
+            "completed": True,
+        }
+        manifest["artifact_id"] = sha256_json(manifest)
+        (staging / "cell-manifest.json").write_text(
+            canonical_json(manifest) + "\n", encoding="utf-8"
+        )
+        staging.replace(arguments.output_root)
+    print(canonical_json(manifest))
+
+
+def _merge_behavior_cells(arguments: argparse.Namespace) -> int:
+    """Reassemble per-cell slices into the single frozen behavior output."""
+    if arguments.backend == "tiny-fixture" and not arguments.allow_test_backend:
+        raise SystemExit("--allow-test-backend is required for tiny-fixture")
+    config = ExperimentConfig.load(arguments.config)
+    seeds = tuple(arguments.seeds)
+    _require_frozen_run(config, arguments.kind, seeds)
+    split_payload = _load_json_object(arguments.split_manifest, "split manifest")
+    config_hash = sha256_json(asdict(config))
+    if split_payload.get("config_hash") != config_hash:
+        raise ValueError("split manifest config hash mismatch")
+    split_id = _required_hash(split_payload, "artifact_id", "split manifest")
+    split_manifest = ArtifactManifest(
+        artifact_id=split_id,
+        kind="phase_marker_splits",
+        config_hash=config_hash,
+        parent_hashes=_split_parent_hashes(split_payload),
+        row_count=0,
+        metadata={},
+    )
+    selections = _load_checkpoint_selections(
+        arguments.checkpoint_manifests, config, arguments.kind, seeds,
+        allow_test=arguments.backend == "tiny-fixture",
+    )
+    total_cells = len(seeds) * len(build_behavior_matrix(config, split_manifest))
+    if arguments.output_root.exists():
+        raise FileExistsError(f"refusing to overwrite behavior output: {arguments.output_root}")
+
+    covered: list[int] = []
+    rows: list[dict[str, object]] = []
+    ordered_roots = sorted(
+        (Path(root) for root in arguments.cell_roots),
+        key=lambda root: json.loads(
+            (root / "cell-manifest.json").read_text()
+        )["cell_indices"][0],
+    )
+    for root in ordered_roots:
+        manifest = _load_json_object(root / "cell-manifest.json", "behavior cell manifest")
+        if (
+            manifest.get("kind") != "phase_marker_behavior_cells"
+            or manifest.get("completed") is not True
+            or manifest.get("config_hash") != config_hash
+            or manifest.get("split_artifact_id") != split_id
+        ):
+            raise ValueError(f"behavior cell manifest is invalid: {root}")
+        records_path = root / str(manifest["records_file"])
+        if _file_hash(records_path) != manifest["records_hash"]:
+            raise ValueError(f"behavior cell records changed after publication: {root}")
+        cell_rows = list(read_jsonl(records_path))
+        if len(cell_rows) != manifest["row_count"]:
+            raise ValueError(f"behavior cell row count mismatch: {root}")
+        covered.extend(int(index) for index in manifest["cell_indices"])
+        rows.extend(cell_rows)
+    if covered != list(range(total_cells)):
+        raise ValueError(
+            f"behavior cells do not cover the frozen matrix exactly once in order: {covered}"
+        )
+    _finalize_behavior_output(arguments, config_hash, split_id, selections, rows)
+    return 0
+
+
+def _finalize_behavior_output(
+    arguments: argparse.Namespace,
+    config_hash: str,
+    split_id: str,
+    selections: Mapping[tuple[int, str], Mapping[str, object]],
+    rows: list[dict[str, object]],
+) -> None:
+    """Write the single frozen behavior output tree from fully ordered rows."""
+    seeds = tuple(arguments.seeds)
     arguments.output_root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         dir=arguments.output_root.parent, prefix=f".{arguments.output_root.name}-"
@@ -1280,7 +1423,6 @@ def _run_behavior(arguments: argparse.Namespace) -> int:
         )
         staging.replace(arguments.output_root)
     print(canonical_json(manifest))
-    return 0
 
 
 def _require_frozen_run(
