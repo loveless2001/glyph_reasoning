@@ -1,0 +1,168 @@
+\documentclass[11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[margin=1in]{geometry}
+\usepackage{caption}
+
+\newcommand{\arm}[1]{\textsc{#1}}
+
+\title{Glyphs Don't Compute:\\
+\large Structured-Prompt Benefits Compress into a Steerable Direction under Fine-Tuning}
+\author{Nam Nguyen}
+\date{August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Earlier experiments suggested that decorating reasoning traces with rare symbolic ``phase markers'' (four alchemical glyphs marking guideline, plan, step, and conclusion) improved mathematical reasoning in Qwen2.5-7B-Instruct.
+We tested this claim with a controlled six-arm study: matched fine-tuning data differing only in marker format, frozen train/validation/test splits, strict answer scoring, and preregistered contrasts.
+The claim fails.
+Glyph-trained models score \emph{below} models trained on the same reasoning without markers (29.4\% vs.\ 34.6\% held-out accuracy) and below models trained with meaningless dots (31.8\%).
+Prompting the \emph{untrained} model with structure genuinely helps ($+28$ to $+38$ points over an unstructured prompt), but dots outperform glyphs there too: the benefit is generic structure elicitation, not anything glyph-specific.
+Mechanistic follow-up explains why fine-tuning destroyed even that benefit: training compresses the structured-reasoning behavior into a single late-layer activation direction keyed to the glyphs' rare byte tokens.
+The direction can be injected directly---with no glyphs in the prompt---recovering and even exceeding natural glyph performance ($+14$ points over the matched prompt), while masking the glyph positions after prompt reading costs nothing.
+The symbols were never the mechanism; they were a lossy handle on a steerable direction.
+\end{abstract}
+
+\section{Background: the original observation}
+
+An earlier ablation found that prompting the untrained Qwen2.5-7B-Instruct with glyph-structured prompts scored 76.9\% on GSM8K versus 52.4\% for a natural-language prompt.
+Two problems later emerged with that measurement.
+First, its answer extractor simply took the \emph{last number} appearing anywhere in the output, and its logs show 80\% of natural-prompt outputs violating the expected structure---so free-form answers were frequently scored wrong for formatting reasons alone (raw completions were not saved, so re-scoring is impossible).
+Second, it never compared glyphs against equally arbitrary alternatives such as plain dots.
+The present study was designed to answer, under a leakage-checked and strictly scored protocol: \textbf{do phase markers do more than decorate a chain of thought?}
+
+\section{Experimental design}
+
+Six LoRA adapters were trained on byte-matched renderings of the same reasoning traces, differing only in output format (Table~\ref{tab:arms}).
+All arms share the base model (Qwen2.5-7B-Instruct), data order, and hyperparameters (rank~16, $\alpha=32$, one epoch, effective batch~16, lr $2\times10^{-4}$ cosine, BF16, max 2{,}048 tokens).
+Checkpoints were selected on validation accuracy only; the test set (7{,}319 problems from GSM8K, SVAMP, and MATH) was frozen before any training.
+Evaluation is greedy decoding with a 1{,}024-token budget and a strict parser requiring an exact final answer.
+
+\begin{table}[h]\centering\small
+\begin{tabular}{ll}
+\toprule
+Arm & Output format \\
+\midrule
+\arm{semantic} & the reasoning content, no markers \\
+\arm{glyph}    & same content + fixed glyphs at phase boundaries \\
+\arm{dot}      & same content + neutral dot delimiters \\
+\arm{random}   & glyph identities shuffled per example \\
+\arm{direct}   & final answer only \\
+\arm{filler}   & meaningless filler tokens, then the answer \\
+\bottomrule
+\end{tabular}
+\caption{The six matched training arms. Each isolates one explanation for a marker benefit.}
+\label{tab:arms}
+\end{table}
+
+\section{Behavioral results}
+
+\subsection{Trained arms on the held-out test set}
+
+Table~\ref{tab:main} shows strict accuracy for each training arm under each prompt format.
+On the matched-format diagonal---the preregistered comparison---\arm{glyph} (29.4\%) loses to \arm{semantic} (34.6\%) and to \arm{dot} (31.8\%).
+\arm{filler} (17.0\%) scored below \arm{direct} (21.3\%) on validation, ruling out hidden computation from extra token positions.
+Markers therefore provide no benefit over identical reasoning without them, and lose even to meaningless delimiters.
+
+\begin{table}[h]\centering\small
+\begin{tabular}{lcccc}
+\toprule
+Training arm & neutral & glyph & dot & headings \\
+\midrule
+\arm{semantic} & \textbf{.346} & .346 & .178 & .217 \\
+\arm{glyph}    & .314 & \textbf{.294} & .181 & .156 \\
+\arm{dot}      & \textbf{.408} & .280 & \textbf{.318} & .272 \\
+\arm{random}   & \textbf{.260} & .275 & .248 & .205 \\
+\bottomrule
+\end{tabular}
+\caption{Held-out strict accuracy, training arm $\times$ prompt format ($n=7{,}319$ per cell). Bold marks each arm's matched or best condition.}
+\label{tab:main}
+\end{table}
+
+\subsection{The untrained model: structure helps, glyphs are incidental}
+
+Evaluating the base model with no adapter under the same protocol (Table~\ref{tab:base}) shows a large, genuine benefit of structured prompting---but plain dots beat the glyphs.
+The near-zero neutral score largely reflects failure to produce the required answer format, mirroring (in reverse) the artifact in the original measurement.
+Critically, \emph{no trained arm beats the untrained model with a structured prompt}: the best trained cell (40.8\%) is below base-with-dots (43.4\%), and glyph training sits ten points below simply glyph-\emph{prompting} the base model.
+Fine-tuning added nothing and, for glyphs, destroyed value.
+
+\begin{table}[h]\centering\small
+\begin{tabular}{lcccc}
+\toprule
+ & neutral & glyph & dot & headings \\
+\midrule
+Untrained base model & .058 & .397 & \textbf{.434} & .338 \\
+\bottomrule
+\end{tabular}
+\caption{Untrained Qwen2.5-7B-Instruct under the frozen protocol ($n=7{,}319$ per condition).}
+\label{tab:base}
+\end{table}
+
+\subsection{Perturbations: identity matters, position does not}
+
+Perturbing the glyph-trained model's prompt (Table~\ref{tab:pert}) reveals a sharp asymmetry: removing or substituting the glyphs collapses accuracy, while scrambling their positions or order costs nothing.
+A model using markers as \emph{phase} structure should care about position; a model using them as a \emph{trigger} should care only about presence.
+The data say trigger.
+
+\begin{table}[h]\centering\small
+\begin{tabular}{lcc}
+\toprule
+Perturbation & Accuracy & $\Delta$ vs.\ matched (.294) \\
+\midrule
+delete all glyphs        & .148 & $-14.6$ \\
+replace with dots        & .176 & $-11.8$ \\
+replace with unseen symbols & .191 & $-10.3$ \\
+\midrule
+cluster at prompt start  & .309 & $+1.5$ \\
+displace into words      & .322 & $+2.7$ \\
+permute order            & .308 & $+1.4$ \\
+\bottomrule
+\end{tabular}
+\caption{Glyph-arm accuracy under prompt perturbations ($n=7{,}319$ each).}
+\label{tab:pert}
+\end{table}
+
+\section{Mechanism: a rare-token mode key}
+
+\paragraph{Tokenization.}
+Each glyph encodes as three byte-fallback tokens sharing a two-token prefix; the four glyphs differ only in their final byte.
+Every harmful perturbation removes these rare bytes; every harmless one preserves the exact bag of tokens.
+
+\paragraph{Dose--response.}
+Sufficiency tests on the glyph-trained model ($n=7{,}319$ each): four copies of a \emph{single} trained glyph nearly restore matched performance (27.2\% vs.\ 29.7\%); one lone glyph recovers most of the collapse (24.0\%); an untrained alchemical glyph sharing only the byte prefix gives partial credit (21.5\%); nothing gives 14.8\%.
+The distinct four-glyph ``phase vocabulary'' is worth at most 2.5 points.
+The trigger is graded rare-byte familiarity.
+
+\paragraph{Weights.}
+All six adapters have nearly equal update magnitude, but the \arm{glyph} and \arm{random} adapters share almost twice the subspace (mean principal-angle cosine 0.40) of any other pair (0.26--0.29): the two arms exposed to alchemical byte tokens learned the same distinct machinery, concentrated in late layers (peak 23--26 of 28).
+Notably, \arm{glyph} reached the \emph{lowest} training loss of the reasoning arms while generalizing worst---the easy-to-predict marker tokens flatter the loss while the model degrades on the mathematics.
+
+\paragraph{The key is a steerable direction.}
+Let $d_\ell$ be the mean difference in the layer-$\ell$ residual stream at the final prompt token between glyph-present and glyph-deleted prompts.
+Adding $d_{20}$ during generation on glyph-\emph{free} prompts lifts the glyph-trained model from 26.7\% to 38.7\% ($n=300$; matched-prompt reference 42.0\%).
+A layer sweep ($n=100$) shows the effect is flat through layer~12, rises from layer~14, and peaks at layers 22--26, where steering reaches \textbf{56\%---fourteen points above the matched-glyph prompt itself}.
+Masking the glyph positions from all attention \emph{after} prompt processing costs nothing (41\% vs.\ 42\%): the key is absorbed into the residual stream while the prompt is read and never re-read from the glyph tokens.
+
+\paragraph{Why the prompt benefit did not survive training.}
+The trained direction does nothing for the untrained base model (8.3\%, at baseline), and even the base model's own glyph-vs-neutral direction captures only a small fraction of its prompt effect ($+3.7$ of $\sim{+}30$ points).
+Prompting therefore works through rich, distributed in-context processing that no single direction summarizes, whereas fine-tuning \emph{compressed} that behavior into a low-dimensional switch keyed to rare tokens.
+The compression is where the capability went.
+
+\section{Conclusion}
+
+Under a controlled protocol, symbolic phase markers do not improve mathematical reasoning.
+Structured prompts genuinely elicit better-formatted, more systematic answers from the untrained model, but arbitrary dots do this at least as well as glyphs.
+Fine-tuning on glyph-formatted traces converts that free elicitation benefit into a brittle dependency: a single late-layer activation direction, triggered by rare byte tokens, that gates the trained behavior while overall capability degrades.
+The constructive corollary is that the direction itself is a better handle than the symbols ever were---injecting it directly outperforms glyph prompting by fourteen points.
+
+\paragraph{Limitations.}
+All results are from the excluded pilot seed (42); confirmatory seeds have not been run.
+The preregistered statistics stage (with its 300-item manual audit of the automatic parser) has not been executed, so no confidence intervals are reported.
+The mechanism experiments (steering, layer sweep, KV masking, weight analysis) are exploratory, run on 100--300-problem subsets, and were not preregistered.
+The untrained model's neutral-prompt score conflates reasoning failure with format noncompliance.
+
+\end{document}

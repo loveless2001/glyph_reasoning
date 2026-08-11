@@ -1,0 +1,314 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage[margin=1in]{geometry}
+\usepackage{caption}
+\usepackage{subcaption}
+
+\title{Symbolic Phase Markers as Training Scaffolds for Improved Mathematical Reasoning in Language Models}
+\author{Nam Nguyen}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Large language models (LLMs) exhibit strong performance on mathematical reasoning tasks when guided by structured prompts or chain-of-thought supervision, yet such approaches often rely on verbose natural language scaffolding and inference-time control. In this work, we investigate the use of non-semantic symbolic phase markers (``glyphs'') as lightweight structural signals for reasoning. We show that glyph-based prompting improves accuracy compared with XML-based and natural-language prompts, particularly for smaller models. Through supervised fine-tuning (SFT) with glyph-structured reasoning traces distilled from larger models, we demonstrate consistent accuracy gains that persist even when glyphs are absent at inference time under greedy decoding.
+
+We further present ablation experiments examining the robustness of learned glyph representations: (1)~shuffled glyph ordering, which reveals the model's sensitivity to trained sequence patterns, and (2)~emoji replacement, which tests whether common high-frequency symbols can substitute for rare alchemical glyphs. Our results show that SFT yields a +14.3 percentage point improvement on natural (glyph-free) prompting for Qwen2.5-7B, confirming that symbolic structure---distilled from stronger models---can be internalized to improve reasoning robustness. We further validate cross-architecture transfer by applying the same Glyph-SFT procedure to LLaMA~3.1-8B, observing +9.0pp on glyph and +24.8pp on XML prompting, though without the same natural prompting transfer. We contextualize these findings within the emerging Structure-of-Thought paradigm, showing that our distillation-based approach produces reasoning improvements that persist beyond inference-time scaffolding alone.
+\end{abstract}
+
+%==============================================================================
+\section{Introduction}
+%==============================================================================
+
+Mathematical reasoning remains a challenging capability for language models, particularly in settings requiring multi-step logical consistency and constraint tracking. Prior work has shown that structured prompting techniques, such as Chain-of-Thought (CoT)~\citep{wei2022chain}, can substantially improve reasoning performance. However, these methods often:
+
+\begin{itemize}
+    \item Increase token usage significantly
+    \item Depend heavily on prompt phrasing
+    \item Require inference-time scaffolding that does not transfer
+\end{itemize}
+
+In this paper, we explore an alternative approach: \textbf{symbolic phase markers}, implemented via glyph tokens that encode reasoning phases (planning, execution, conclusion) without semantic meaning. We study whether such symbols can act as structural control signals and whether models can internalize their effects through fine-tuning with traces distilled from larger models.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+    \item We introduce glyph-based phase markers as non-semantic reasoning scaffolds and compare them against natural language and XML-structured prompts across model sizes.
+    \item We show that Glyph-SFT (supervised fine-tuning on distilled traces) improves reasoning accuracy even without glyphs at inference, with a +14.3pp gain on natural prompting over 1{,}000 samples.
+    \item We present ablation experiments on glyph ordering and symbol substitution, demonstrating that SFT creates format-specialized but reasoning-improved models.
+    \item We validate cross-architecture generalization by applying Glyph-SFT to LLaMA~3.1-8B, demonstrating that the approach transfers across model families with architecture-dependent trade-offs.
+    \item We contextualize our findings within the Structure-of-Thought framework~\citep{t2sbench2025}, showing that distillation extends prompt-time scaffolding into persistent reasoning gains.
+\end{enumerate}
+
+%==============================================================================
+\section{Related Work}
+%==============================================================================
+
+\subsection{Chain-of-Thought and Reasoning Prompts}
+
+Chain-of-Thought prompting~\citep{wei2022chain} has been shown to unlock reasoning capabilities in LLMs. Subsequent work on self-consistency~\citep{wang2022self} and tree-of-thought~\citep{yao2023tree} extends this paradigm. Limitations include verbosity and reduced effectiveness for smaller models.
+
+\subsection{Structured Prompting and Control Tokens}
+
+XML-based schemas and tool-style prompts introduce structure but can be brittle and verbose. Control tokens have been used in instruction tuning, but typically carry semantic meaning. Recent work on Structure-of-Thought (SoT)~\citep{t2sbench2025} demonstrates that special token markers can serve as reasoning scaffolds during inference, improving structured output generation across model scales without fine-tuning.
+
+\subsection{Distillation and Scratchpad Learning}
+
+Prior work explores distilling reasoning traces into smaller models~\citep{magister2022teaching}. These approaches typically rely on natural language explanations rather than symbolic structure. Our work differs by isolating structure from semantics: the glyph tokens carry no inherent meaning, and the reasoning traces are distilled from larger models (GPT-4, Claude) into the target model via SFT.
+
+\textbf{Gap:} Existing methods do not simultaneously (a) isolate structure from semantics and (b) demonstrate that distilled structural patterns persist at inference time without the scaffolding tokens. Our work addresses this gap.
+
+%==============================================================================
+\section{Method}
+%==============================================================================
+
+\subsection{Glyph-Based Phase Markers}
+
+We define a fixed set of Unicode glyph tokens, each corresponding to a reasoning phase:
+
+\begin{table}[h]
+\centering
+\caption{Mapping of symbolic glyphs to reasoning phases.}
+\label{tab:glyphs}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Glyph} & \textbf{Name} & \textbf{Phase Role} \\
+\midrule
+\textsf{U+1F71E} & Crux & Planning / Setup \\
+\textsf{U+1F706} & Flux & Decomposition / Plan \\
+\textsf{U+1F702} & Ignis & Step-by-step Execution \\
+\textsf{U+1F703} & Terra & Conclusion / Takeaway \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+These glyphs are drawn from the Unicode Alchemical Symbols block---rarely occurring in pretraining corpora. They carry no inherent semantic meaning, are treated as atomic tokens, and serve only to partition reasoning stages. The glyphs originate from reasoning traces generated by larger models (GPT-4, Claude), where they were used as structural markers. This makes the training data a form of \textit{structural distillation}: the smaller model learns the reasoning patterns of stronger models, mediated through symbolic phase boundaries.
+
+\subsection{Prompt Conditions}
+
+We evaluate three primary prompting strategies, with two additional ablation conditions:
+
+\begin{enumerate}
+    \item \textbf{Natural Prompt:} Minimal structure (``Solve the problem carefully.'')
+    \item \textbf{XML Prompt:} Explicit tag-based structure (\texttt{<guideline>}, \texttt{<plan>}, \texttt{<step>}, \texttt{<takeaway>})
+    \item \textbf{Glyph Prompt:} Symbolic phase markers in trained order
+    \item \textbf{Glyph Shuffled} (ablation): Same glyphs, deliberately broken sequence
+    \item \textbf{Emoji} (ablation): Common emojis replacing alchemical glyphs
+\end{enumerate}
+
+All prompts convey equivalent task information; only the structural markers differ.
+
+\subsection{Glyph-SFT}
+
+We fine-tune base models using glyph-structured reasoning traces. The same training data and procedure are applied to two architecturally distinct model families to test generalization:
+
+\begin{itemize}
+    \item \textbf{Base models:} Qwen2.5-7B-Instruct, LLaMA~3.1-8B-Instruct
+    \item \textbf{Method:} LoRA-based supervised fine-tuning ($r{=}16$, $\alpha{=}32$, target modules: all attention and MLP projections)
+    \item \textbf{Training data:} 3{,}850 math problems with glyph-structured solutions, filtered for correctness and structural validity
+    \item \textbf{Data sources:} GSM8K (hardest 50\%), SVAMP, and MATH (7 categories)
+    \item \textbf{Trace generation:} Teacher model (Qwen2.5-7B-Instruct with glyph prompting) generates structured reasoning traces; these are filtered for answer correctness and glyph structure validity
+    \item \textbf{Latent training:} Training pairs use a neutral prompt (``Solve carefully, do not mention tags'') with the glyph-structured response, teaching the model to internalize the structure without explicit instruction
+    \item \textbf{Training:} 1 epoch, 241 steps, batch size 1 with 16 gradient accumulation steps, cosine LR schedule
+\end{itemize}
+
+Crucially, at inference time for our primary evaluations, glyphs are not required in the prompt---testing the model's internalized reasoning structure. Both models were trained with identical hyperparameters and data to enable direct comparison of architecture-dependent effects.
+
+%==============================================================================
+\section{Experiments}
+%==============================================================================
+
+\subsection{Experimental Setup}
+
+We deployed models on cloud GPU infrastructure (NVIDIA H100 80GB HBM3) using vLLM for batch inference. Evaluation conditions:
+
+\begin{itemize}
+    \item \textbf{Dataset:} 1{,}000 samples from the unified dataset (GSM8K hard, SVAMP, MATH)
+    \item \textbf{Decoding:} Greedy (temperature=0), max 1{,}024 tokens
+    \item \textbf{Models:} Base vs.\ Glyph-SFT for both Qwen2.5-7B-Instruct and LLaMA~3.1-8B-Instruct
+    \item \textbf{Inference:} vLLM batch inference with LoRA adapter loading
+    \item \textbf{Metrics:} Accuracy, structure violation rate, average reasoning/answer/total tokens
+\end{itemize}
+
+\subsection{Qwen2.5-7B Results}
+
+Table~\ref{tab:qwen_results} presents the Qwen2.5-7B comparison across all ablation conditions.
+
+\begin{table}[h]
+\centering
+\caption{Qwen2.5-7B ablation results on 1{,}000 samples. \textbf{Bold} indicates best per condition.}
+\label{tab:qwen_results}
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+\textbf{Model} & \textbf{Condition} & \textbf{Accuracy} & \textbf{Violation Rate} & \textbf{Avg Reasoning Tok.} & \textbf{Avg Total Tok.} \\
+\midrule
+\multirow{4}{*}{Base Qwen2.5-7B}
+    & Natural        & 0.524 & 0.797 & 384.6 & 409.1 \\
+    & Glyph          & 0.769 & 0.014 & 419.3 & 450.4 \\
+    & Glyph Shuffled & 0.722 & 0.027 & 390.9 & 439.1 \\
+    & Emoji          & 0.551 & 0.002 & 348.7 & 371.6 \\
+\midrule
+\multirow{4}{*}{Glyph-SFT Qwen}
+    & Natural        & \textbf{0.667} & 0.001 & 340.2 & 377.5 \\
+    & Glyph          & \textbf{0.799} & 0.001 & 393.7 & 614.5 \\
+    & Glyph Shuffled & 0.697 & 0.006 & 533.9 & 589.6 \\
+    & Emoji          & \textbf{0.820} & 1.000 & 472.9 & 475.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{LLaMA~3.1-8B Results}
+
+To test cross-architecture generalization, we applied the identical Glyph-SFT procedure to LLaMA~3.1-8B-Instruct. Table~\ref{tab:llama_results} presents the results.
+
+\begin{table}[h]
+\centering
+\caption{LLaMA~3.1-8B results on 1{,}000 samples (glyph, XML, natural conditions).}
+\label{tab:llama_results}
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+\textbf{Model} & \textbf{Condition} & \textbf{Accuracy} & \textbf{Violation Rate} & \textbf{Avg Reasoning Tok.} & \textbf{Avg Total Tok.} \\
+\midrule
+\multirow{3}{*}{Base LLaMA~3.1-8B}
+    & Natural & 0.353 & 0.780 & 356.7 & 371.7 \\
+    & Glyph   & 0.296 & 0.248 & 346.8 & 361.8 \\
+    & XML     & 0.264 & 0.231 & 345.0 & 357.7 \\
+\midrule
+\multirow{3}{*}{Glyph-SFT LLaMA}
+    & Natural & 0.343 & 0.069 & 344.3 & 377.2 \\
+    & Glyph   & \textbf{0.408} & \textbf{0.066} & 388.6 & 427.8 \\
+    & XML     & \textbf{0.512} & 0.113 & 363.9 & 389.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Key Findings}
+
+\paragraph{Finding 1: Glyph structure improves reasoning even without fine-tuning.}
+The base model improves from 0.524 (natural) to 0.769 (glyph), a +24.5pp gain from prompt structure alone. This confirms that symbolic phase markers provide effective reasoning scaffolding at inference time, consistent with the Structure-of-Thought findings~\citep{t2sbench2025}.
+
+\paragraph{Finding 2: SFT produces reasoning transfer beyond the trained format.}
+The Glyph-SFT model achieves 0.667 on natural prompting vs.\ 0.524 for the base model (+14.3pp), demonstrating that glyph-structured training transfers reasoning capability to unstructured settings. This is the key practical result: the model reasons better \textit{without} glyphs after training \textit{with} them.
+
+\paragraph{Finding 3: SFT increases order sensitivity.}
+Shuffling glyph order causes a -10.2pp drop for SFT (0.799$\to$0.697) vs.\ only -4.7pp for base (0.769$\to$0.722). The fine-tuned model learned a specific glyph \textit{sequence}, not just the presence of markers. This suggests the model internalized positional phase semantics.
+
+\paragraph{Finding 4: Emoji markers are ineffective for the base model.}
+Base model accuracy with emojis (0.551) is barely above natural (0.524), compared to glyphs (0.769). Common, high-frequency symbols fail to provide the scaffolding effect of rare alchemical glyphs. The SFT emoji result (0.820 accuracy, 1.000 violation rate) indicates the model ignores emoji structure entirely, defaulting to its internalized reasoning patterns---further evidence of successful latent learning.
+
+\paragraph{Finding 5: Glyph-SFT transfers across architectures, with different trade-offs.}
+Applying the same Glyph-SFT procedure to LLaMA~3.1-8B produces clear gains on structured prompting: +11.2pp on glyph (0.296$\to$0.408) and +24.8pp on XML (0.264$\to$0.512). However, unlike Qwen, the LLaMA SFT model does \textit{not} improve on natural prompting (0.353$\to$0.343, a slight decline). This suggests that the reasoning transfer effect is architecture-dependent: Qwen internalizes the structural pattern more deeply, while LLaMA benefits primarily when structural cues are present at inference time.
+
+Notably, the LLaMA SFT model's strongest condition is XML (+24.8pp), not glyph (+11.2pp), despite being trained exclusively on glyph traces. This indicates some degree of \textit{structural generalization}---the model learned ``use structured reasoning'' rather than ``use these specific glyphs,'' but only when some structural scaffolding is provided.
+
+The LLaMA base model is substantially weaker on math than Qwen (natural: 0.353 vs.\ 0.524), consistent with published benchmarks. The lower baseline may limit the ceiling for reasoning transfer via SFT.
+
+\subsection{Revision-as-Retrieval Under Interference}
+
+To investigate whether the internalized glyph structure acts as a robust routing mechanism, we designed a ``Revision-as-Retrieval'' probing task:
+
+\begin{enumerate}
+    \item \textbf{Commit:} The model defines a binding (e.g., \texttt{KEY = ZQ-17}).
+    \item \textbf{Bury:} $k$ unrelated turns (poetry, translation, arithmetic) fill the context.
+    \item \textbf{Revision:} A conflicting claim is introduced; the model must retrieve the original binding.
+\end{enumerate}
+
+\begin{table}[h]
+\centering
+\caption{Retrieval accuracy and logit margin under varying interference levels.}
+\label{tab:retrieval}
+\begin{tabular}{@{}ccccc@{}}
+\toprule
+\textbf{Distractors ($k$)} & \textbf{Base Acc.} & \textbf{SFT Acc.} & \textbf{Base $\Delta$} & \textbf{SFT $\Delta$} \\
+\midrule
+1 & 100\% & 100\% & -- & -- \\
+3 & 100\% & 100\% & -- & -- \\
+5 & 80\% & 80\% & 11.02 & 6.98 \\
+7 & 100\% & 80\% & 7.19 & 4.40 \\
+9 & 80\% & 40\% & 7.50 & 1.49 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At moderate interference ($k{=}5$), the SFT model exhibits smaller negative margins on failure cases ($\Delta_\text{SFT} \approx -3.47$ vs.\ $\Delta_\text{Base} \approx -5.53$), suggesting the glyph operator dampens hallucination confidence. However, at extreme interference ($k{=}9$), the SFT model degrades significantly (40\% vs.\ 80\%), indicating the learned routing mechanism has fragility at extended context lengths.
+
+%==============================================================================
+\section{Analysis and Discussion}
+%==============================================================================
+
+\subsection{Why Do Glyphs Work?}
+
+We hypothesize that glyphs enforce phase separation in reasoning, reducing attention interference between planning and execution. They act as low-entropy control signals that the model learns to associate with specific cognitive operations. The ablation results refine this hypothesis:
+
+\begin{itemize}
+    \item \textbf{Symbol identity matters:} The base model's large gap between glyph (0.769) and emoji (0.551) prompting suggests that rare, non-semantic tokens are more effective scaffolds than common, semantically-loaded ones. Common emojis may compete with existing token associations, while alchemical symbols occupy ``empty'' representation space.
+    \item \textbf{Order matters after training:} The doubled sensitivity to shuffled order in the SFT model indicates the model learned positional phase semantics---not just ``markers are present'' but ``this marker means we are in this phase.''
+    \item \textbf{Distillation is the mechanism:} The glyphs originate from reasoning traces generated by larger models. The SFT process distills the \textit{reasoning patterns} of stronger models into the target model, with glyphs serving as the structural medium for that transfer.
+\end{itemize}
+
+\subsection{Connection to Structure-of-Thought}
+
+Our work extends the Structure-of-Thought paradigm~\citep{t2sbench2025} in a key direction: while SoT demonstrates that special token markers improve structured reasoning at inference time, our approach shows that \textbf{distilling} structured traces into the model via SFT produces reasoning improvements that persist without the markers. The +14.3pp natural prompting gain represents capability transfer that prompt-only scaffolding cannot achieve.
+
+\subsection{Cross-Architecture Comparison}
+
+The divergent results between Qwen2.5-7B and LLaMA~3.1-8B under Glyph-SFT reveal that the depth of reasoning internalization depends on the base model's architecture and pretraining:
+
+\begin{itemize}
+    \item \textbf{Qwen:} Strong natural transfer (+14.3pp), modest glyph improvement (+3.0pp). The model deeply internalized the reasoning pattern.
+    \item \textbf{LLaMA:} No natural transfer ($-$1.0pp), but large structured gains (+11.2pp glyph, +24.8pp XML). The model learned to leverage structure when provided, but did not internalize it for unstructured use.
+\end{itemize}
+
+This difference may stem from Qwen's stronger math pretraining baseline (0.524 vs.\ 0.353 natural), which provides a richer substrate for the glyph traces to ``attach to.'' Alternatively, architectural differences in attention patterns or tokenization may affect how readily structural patterns are internalized.
+
+\subsection{Model Size Effects}
+
+Prior experiments with smaller models (Qwen2.5-0.5B, 1.5B) suggest that smaller models benefit disproportionately from glyph structure. This is consistent with the hypothesis that glyphs lower the effective reasoning bandwidth required to maintain phase coherence---a constraint that disproportionately affects smaller models. A systematic scaling study is left for future work.
+
+%==============================================================================
+\section{Limitations}
+%==============================================================================
+
+\begin{itemize}
+    \item \textbf{Sample size:} While our ablation experiments use 1{,}000 samples, statistical confidence intervals should be reported in future work.
+    \item \textbf{Model families:} While we now cover two architectures (Qwen2.5, LLaMA~3.1), generalization to additional families (Mistral, Gemma) remains to be verified.
+    \item \textbf{Ablation scope:} The emoji condition tested only one set of common emojis. Additional controls (arbitrary rare Unicode symbols, ASCII markers) would strengthen the low-frequency token hypothesis.
+    \item \textbf{Context fragility:} The Revision-as-Retrieval experiments indicate degradation at long context lengths ($k \geq 9$), possibly due to competing inference or quantization artifacts.
+    \item \textbf{Causal mechanism:} While we demonstrate that rare symbols outperform common ones, isolating the exact causal factor (token frequency, semantic load, visual salience) requires further controlled experiments.
+\end{itemize}
+
+%==============================================================================
+\section{Future Work}
+%==============================================================================
+
+\begin{itemize}
+    \item \textbf{Deeper cross-architecture analysis:} Investigate why Qwen internalizes glyph reasoning for natural prompting while LLaMA does not. Attention pattern analysis and probing experiments may reveal the mechanism.
+    \item \textbf{Shuffled-order training:} Train with randomized glyph orderings to test whether this produces more robust reasoning without sacrificing accuracy.
+    \item \textbf{Multi-symbol training:} Train on both glyphs and alternative markers to test structural generalization.
+    \item \textbf{Scaling study:} Systematic evaluation across model sizes (0.5B--70B) to quantify the interaction between model capacity and scaffolding benefit.
+    \item \textbf{Qualitative output inspection:} Side-by-side analysis of SFT outputs under natural, shuffled, and emoji conditions to characterize the model's actual generation patterns.
+\end{itemize}
+
+%==============================================================================
+\section{Conclusion}
+%==============================================================================
+
+We demonstrate that non-semantic symbolic phase markers can act as effective reasoning scaffolds for language models. Training with glyph-structured reasoning traces---distilled from larger models---improves mathematical accuracy and robustness, even when glyphs are absent at inference time and decoding is greedy. Our ablation experiments reveal that the specific alchemical glyph symbols outperform common emojis as scaffolds, and that fine-tuning creates order-sensitive representations while simultaneously improving general reasoning (+14.3pp on natural prompting for Qwen2.5-7B).
+
+Cross-architecture validation on LLaMA~3.1-8B confirms that Glyph-SFT transfers across model families, producing large gains on structured prompting (+24.8pp XML, +11.2pp glyph), though the depth of internalization varies---LLaMA benefits from structural scaffolding at inference time but does not exhibit the same natural prompting transfer as Qwen. This architecture-dependent effect represents an important direction for future investigation.
+
+These results suggest that \textbf{structure alone---independent of semantic content---can be learned and internalized by language models}, and that symbolic distillation from stronger models is an effective mechanism for transferring reasoning capability. The degree to which this transfer persists without inference-time scaffolding depends on the base model's architecture and pretraining, opening new directions for efficient reasoning supervision that go beyond prompt-time scaffolding.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
